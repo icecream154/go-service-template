@@ -283,6 +283,8 @@ RDS 实例按应用分配，业务库按服务划分。服务之间共用该应�
 
 对象计数、整数计量数量和时长统一采用有符号 `BIGINT`，业务状态和类型编码统一采用有符号 `INT`。这些场景不再按当前数值大小自行选择更小的整数类型，以减少设计分歧、Go 类型转换和后续扩容变更；业务取值范围仍须由应用层单独定义和校验。
 
+本节表格中的 Go 类型表示非空列的基础类型；可空列必须按 2.6 的统一映射处理。
+
 | 数据语义 | 默认或推荐类型 | 选择要求与理由 |
 | --- | --- | --- |
 | 内部主键、关联对象标识 | 有符号 `BIGINT` | 主键统一由应用通过雪花算法生成，与 Go `int64` 对齐；具体要求见 2.3，关联字段与被关联标识保持一致 |
@@ -290,20 +292,22 @@ RDS 实例按应用分配，业务库按服务划分。服务之间共用该应�
 | 业务状态、类型编码 | 有符号 `INT` | 统一映射 Go `int32`，减少枚举类型选择和扩展变更；明确定义各编码的含义及合法取值 |
 | 布尔值 | `TINYINT` | 应用层保证只写入 `0`、`1`，必填字段声明 `NOT NULL`；`TINYINT(1)` 本身不限制值域 |
 | 可按约定最小货币单位表达的结算金额 | 有符号 `BIGINT` | 默认用整数保存，注释明确单位和币种，例如 CNY 的分；明确最大金额及是否允许负数 |
-| 高精度单价、汇率、非整数计量数量、占比 | `DECIMAL(p,s)` | 显式确定总位数、小数位数、业务范围与舍入规则，避免二进制浮点误差 |
+| 高精度单价、汇率、非整数计量数量、占比 | `DECIMAL(p,s)` | 用于要求精确十进制表示的数值，Go 统一使用 `shopspring/decimal` 的 `decimal.Decimal`；显式确定总位数、小数位数、业务范围与舍入规则 |
+| 允许近似误差的测量值、算法评分等 | `DOUBLE` | Go 统一使用 `float64`，由应用明确单位、业务范围及允许的误差；不得用于要求精确的金额计算 |
 | 业务编号、名称、普通短文本 | `VARCHAR(n)` | 根据业务契约明确长度；外部编号即使只含数字，也应在需要保留前导零等语义时使用字符串 |
 | 确有定长语义的字符串 | `CHAR(n)` | 仅在长度固定且已明确补空格、读取时尾空格处理的情况下使用，其他场景默认 `VARCHAR(n)` |
 | 长文本 | 按容量选择 `TEXT` 系列 | 明确大小上限和读取场景；频繁查询的核心属性不能全部藏入长文本 |
 | 原始字节数据 | `VARBINARY(n)` 或按容量选择 `BLOB` 系列 | 与文字内容区分，明确字节长度；大附件默认存对象存储，数据库保存引用及必要元数据 |
 | 事件发生时间 | `DATETIME(3)` | 默认毫秒精度，所有值表示 UTC；需要微秒时明确采用 `DATETIME(6)`，禁止 `TIMESTAMP` 列类型 |
-| 纯日期 | `DATE` | 用于生日、账期日期等日历日期，不按事件时刻做时区转换 |
+| 纯日期 | `DATE` | 非空列使用 `time.Time`，可空列按 2.6 使用 `sql.NullTime`；均仅承载生日、账期日期等年月日，不按事件时刻做时区转换 |
 | 时长 | 有符号 `BIGINT` | 统一映射 Go `int64`，在名称及注释中明确单位，例如 `timeout_ms` |
 | 有明确结构的附属数据 | `JSON` | 限于适合整体保存的附属结构，必须定义内容、大小和读写契约，不能作为通用字段收纳箱 |
 
 **数值与精度**
 
 - 整数统一采用有符号类型，不声明 `UNSIGNED`。非负等业务取值要求由应用层校验，不因业务不允许负数而改用无符号类型，保持数据库与 Go 映射一致。整数范围参见 [MySQL 整数类型](https://dev.mysql.com/doc/refman/8.4/en/integer-types.html)。
-- 禁止使用 `FLOAT`、`DOUBLE` 保存要求精确计算的金额、单价、汇率和结算比例。近似测量值等确需浮点数的场景，应说明允许的误差。
+- 浮点字段统一使用 MySQL `DOUBLE` 对应 Go `float64`，不采用 `FLOAT` 或 `float32`，也不使用 `DOUBLE(M,D)` 声明小数位。允许近似误差的场景才可采用浮点数，参见 [MySQL 浮点类型说明](https://dev.mysql.com/doc/refman/8.4/en/floating-point-types.html)。
+- 禁止使用浮点数保存或计算要求精确的金额、单价、汇率和结算比例。按整数货币单位保存的金额继续使用 `BIGINT`、`int64`；需要精确小数的字段使用 `DECIMAL(p,s)`、`decimal.Decimal`。
 - `DECIMAL(p,s)` 的 `p` 为总位数，`s` 为小数位数。例如 `DECIMAL(12,2)` 可保存 10 位整数和 2 位小数；不能只写 `DECIMAL` 而省略设计精度。参见 [MySQL 定点类型](https://dev.mysql.com/doc/refman/8.4/en/fixed-point-types.html)。
 - 写入前必须校验数值范围并按业务约定处理精度。`DECIMAL` 精确存储不代表超出小数位的输入一定报错，严格模式下也可能发生舍入；不能依赖数据库替代业务精度校验。参见 [MySQL 舍入规则](https://dev.mysql.com/doc/refman/8.4/en/precision-math-rounding.html)。
 - 状态码一经使用，不得改成另一种业务含义或回收给其他状态。业务状态使用 `INT` 编码，合法值及状态流转由应用层统一定义和校验，不使用 MySQL `ENUM`、`SET` 承载业务状态；可维护的分类可以建立字典关系，由应用层校验关联。
@@ -324,6 +328,8 @@ MySQL 省略小数秒精度时默认为 0，高精度时间写入低精度列时
 ### 2.2 可空性与默认值
 
 可空性由业务含义决定。必须存在的值使用 `NOT NULL`；未知、未发生或不适用的值可以使用 `NULL`，但字段注释必须明确具体含义。禁止要求所有字段一律非空，也禁止用同一个占位值混淆多种状态。
+
+允许 `NULL` 的列，Go 持久化模型统一使用 2.6 规定的 `sql.Null*` 类型；可空 `DECIMAL` 使用 `decimal.NullDecimal`，不采用字段指针或自定义可空封装。
 
 | 情况 | 规范选择 | 示例与理由 |
 | --- | --- | --- |
@@ -460,17 +466,36 @@ MySQL 保留字段类型、非空、默认值、主键和唯一性等存储约�
 | `deleted_at` | `DATETIME(3) NULL DEFAULT NULL` | 仅在需要软删除时设置；UTC，`NULL` 表示未删除，非空表示删除时刻 |
 | `version` | `BIGINT NOT NULL DEFAULT 0` | 仅在采用版本式并发控制时设置，每次受保护修改加一，所有相关写入路径必须遵守 |
 | `created_by_<实体>_id`、`updated_by_<实体>_id` | 有符号 `BIGINT`，按业务确定可空性 | 仅在需要记录操作者时设置；字段名必须明确实际引用的业务实体，每列固定指向一种实体 |
-| `tenant_id` | 与租户主键一致的非空类型 | 仅在多租户数据模型中设置，必须贯穿访问条件、业务唯一性和关联约束，不能只加列而不隔离访问 |
+| `tenant_id` | 与租户主键一致的非空类型 | 仅用于需要按租户隔离的数据表；不是所有业务表都需要，具体要求见下文 |
 
 操作者字段必须在实际表设计中明确实体名称，使用单数并遵守 1.4 的业务概念用词约定。例如，引用用户时使用 `created_by_user_id`、`updated_by_user_id`，引用账户时使用 `created_by_account_id`、`updated_by_account_id`。禁止直接使用 `created_by_id`、`updated_by_id` 等未说明实体的名称。
 
 字段注释必须说明实际引用的库表及标识列，应用按 2.4 维护关联。同一列不得根据操作来源改为保存另一种实体的 ID。若字段仅记录用户操作者，且允许非用户操作，则可约定该情况为 `NULL` 并注明含义，不得用 `0` 代替关联标识。
 
+**租户与 tenant_id**
+
+租户是共用一套系统、但业务数据和权限需要独立隔离的一方，通常是企业、商户或组织。一个租户可以有多个用户；租户不等于用户、业务服务或数据库。
+
+例如，商户 A、B 共用一套商户管理系统，各自有员工、客户和订单。两者共用 `order_service.sales_order` 表时，通过 `tenant_id` 标记订单归属，普通业务访问只能操作所属租户的数据。以下 ID 为简写：
+
+| id | tenant_id | order_no |
+| --- | --- | --- |
+| 10001 | 1001（商户 A） | ORDER001 |
+| 10002 | 2001（商户 B） | ORDER001 |
+
+`tenant_id` 不是所有业务表的必填通用字段。只有需要按租户区分归属并隔离访问的数据表才设置；没有租户隔离需求的表、明确的全局共享数据，不要求增加该字段。
+
+设置 `tenant_id` 的表必须同时满足：
+
+- 普通业务的查询、修改和删除由应用限定租户范围，租户身份须经服务端验证，不能仅凭客户端传入的 `tenant_id` 授予访问权限。
+- 唯一约束遵循业务范围。例如订单号仅在同一商户内唯一时，约束 `(tenant_id, order_no)`，因此 A、B 可以各有一个 `ORDER001`。
+- 租户内的关联由应用校验归属，不能将 A 的订单关联到 B 的客户；仅增加一列不会自动实现上述隔离。
+
 **时间维护方**
 
 创建时间和修改时间默认由应用统一维护：一次写入先取得统一的 UTC 时间，并对齐列精度。`created_at` 创建后保持不变，`updated_at` 随业务修改维护；导入和数据修复需要保留历史时间时，必须明确来源。
 
-使用 GORM 自动维护时间时，应在统一初始化配置中提供符合规范的时间函数，例如以下配置片段：
+使用 GORM 自动维护时间时，`NowFunc` 用于提供自动填写创建、修改时间所需的“当前时间”。默认采用 `DATETIME(3)`，因此统一初始化时配置为 UTC、毫秒精度：
 
 ```go
 NowFunc: func() time.Time {
@@ -478,7 +503,19 @@ NowFunc: func() time.Time {
 },
 ```
 
-此配置适用于默认毫秒精度的自动维护路径；手动传入的事件时间仍须自行转换和对齐。原始 SQL、`Create(map)`、`UpdateColumn(s)` 等写法不能一概认为会自动维护时间，使用方须按实际执行路径补齐。参见 [GORM 时间函数配置](https://gorm.io/docs/gorm_config.html#NowFunc)和 [GORM 跳过时间追踪的更新](https://gorm.io/docs/update.html#Without-Hooks-Time-Tracking)。
+其中，`time.Now()` 获取当前时刻，`.UTC()` 转换为 UTC 表示，`.Truncate(time.Millisecond)` 截去毫秒之后的小数位，例如 `.123456` 变为 `.123`。
+
+以下按应用维护时间的方案说明，前提是模型中定义了 `CreatedAt`、`UpdatedAt`，已启用 GORM 自动时间维护，且未显式排除相关字段：
+
+| 操作 | 时间维护方式 |
+| --- | --- |
+| 普通模型的 `Create` | 自动为尚未赋值的 `CreatedAt`、`UpdatedAt` 填写 `NowFunc` 返回的时间；已明确赋值的时间保留原值 |
+| 普通模型的 `Update`、`Updates`，包括 `Updates(map)` | 自动维护 `UpdatedAt`；应用显式提供时间时，须确保该写法实际采用预期值 |
+| `Create(map)` | 应用显式提供需要的创建、修改时间 |
+| `UpdateColumn`、`UpdateColumns` | 跳过自动时间维护，应用显式提供需要的修改时间 |
+| 原始写入 SQL，如通过 `Exec` 执行插入或更新 | 应用在 SQL 参数中显式提供需要的时间 |
+
+`NowFunc` 不会统一转换所有时间字段。手动提供的支付时间等业务事件时间，仍须由应用先转换 UTC 并对齐列精度；使用 `DATETIME(6)` 时按微秒精度处理。参见 [GORM 时间函数配置](https://gorm.io/docs/gorm_config.html#NowFunc)、[自动时间字段约定](https://gorm.io/docs/conventions.html#Timestamp-Tracking)、[Map 创建说明](https://gorm.io/docs/create.html#Create-From-Map)和 [跳过时间追踪的更新](https://gorm.io/docs/update.html#Without-Hooks-Time-Tracking)。
 
 确需数据库维护时，可以显式使用 `DEFAULT CURRENT_TIMESTAMP(3)`、`ON UPDATE CURRENT_TIMESTAMP(3)`，但必须在表设计中说明，确保所有连接为 UTC，并让 ORM 正确省略由数据库生成的列。同一列不混用多套自动维护逻辑；只关闭 ORM 时间钩子，却仍写入 Go 零时间，不会自动获得数据库默认值。参见 [MySQL 自动时间字段说明](https://dev.mysql.com/doc/refman/8.4/en/timestamp-initialization.html)。
 
@@ -487,7 +524,7 @@ NowFunc: func() time.Time {
 **软删除与版本控制**
 
 - 软删除必须同时定义普通查询过滤、重复删除、是否恢复、关联数据处理及唯一键复用规则。增加 `deleted_at` 一列不代表这些行为已经实现；软删除也不等于物理清除数据。
-- 使用 GORM 内置软删除时，要明确采用 `gorm.DeletedAt` 及其过滤行为；普通 `*time.Time` 字段即使命名为 `deleted_at`，也不会自动获得同样行为。参见 [GORM 软删除说明](https://gorm.io/docs/delete.html#Soft-Delete)。
+- `deleted_at` 在持久化模型中统一使用 `sql.NullTime`。它只表达时间是否为 `NULL`，不会自动启用 GORM 的软删除行为；应用必须显式写入删除时间，并在普通查询中添加 `deleted_at IS NULL` 等过滤条件，不能认为调用 `Delete` 就会自动执行软删除。参见 [GORM 软删除说明](https://gorm.io/docs/delete.html#Soft-Delete)。
 - 使用 `version` 时，修改条件必须包含读取到的旧版本，更新时同时递增。只有列名叫 `version`，不会自动获得乐观锁保护。
 
 以下 SQL 仅演示用户资料的版本式更新，`?` 为参数占位符：
@@ -506,28 +543,173 @@ WHERE id = ? AND version = ?;
 
 数据库定义和 Go 模型必须保持存储范围、精度、可空性及默认行为一致，业务合法取值与状态规则按 2.4 在应用层校验。不能根据 Go 类型或 ORM 自动推导结果，倒推业务表应该采用什么结构。
 
-| MySQL 字段 | Go 推荐表示 | 映射要求 |
+下表列出非空列的基础映射；允许 `NULL` 的列必须使用后文“可空字段统一映射”中的类型。
+
+| MySQL 字段 | 统一 Go 类型 | 映射要求 |
 | --- | --- | --- |
 | 有符号 `BIGINT` | `int64` | 用于雪花主键、关联标识、整数金额、对象计数、整数计量数量和时长；不使用平台相关的 `int` 或无符号类型替代 |
 | 有符号 `INT` | `int32` | 用于业务状态和类型编码；业务枚举的底层类型也统一为 `int32`，合法值由应用统一定义并校验 |
 | 应用限定取值为 `0`、`1` 的 `TINYINT` 布尔列 | `bool` | 由应用校验写入值，不能依赖 `TINYINT` 类型自动限制为布尔值 |
 | `VARCHAR`、`CHAR`、`TEXT` | `string` | 单独校验业务长度；Go `len` 返回字节数，不能直接作为 Unicode 字符数 |
 | `VARBINARY`、`BLOB` | `[]byte` | 按字节语义处理，不隐式当作文字转换 |
-| `DECIMAL(p,s)` | 精确十进制类型或具备精确转换能力的封装 | 禁止用 `float32`、`float64` 进行精确金额计算；仅将 GORM 标签写成 `decimal` 不能消除 Go 浮点误差 |
+| `DOUBLE` | `float64` | 用于允许近似误差的数值，GORM 显式指定 `type:double`，不以 `float32` 降低精度 |
+| `DECIMAL(p,s)` | `decimal.Decimal` | 统一使用 `github.com/shopspring/decimal`，GORM 显式指定 `type:decimal(p,s)`，不得用浮点类型承接精确十进制值 |
 | `DATETIME(3)`、`DATETIME(6)` | `time.Time` | 配合基线的 `parseTime=true`、`loc=UTC` 与会话 UTC，写入前统一转换和对齐精度 |
-| `DATE` | 日期专用封装，或仅承载年月日的 `time.Time` | 保持日历日期语义，不把日期当作 UTC 事件时刻随意跨时区转换 |
-| 可空列 | 对应的 `sql.Null*`、指针或项目统一可空封装 | 必须区分 `NULL` 与零值，例如可空事件时间使用 `sql.NullTime` 或 `*time.Time` |
+| `DATE` | `time.Time` | 仅使用年月日，保持日历日期语义，不把日期当作 UTC 事件时刻跨时区转换 |
 | `JSON` | 明确结构的类型或项目统一 JSON 封装 | 定义序列化、反序列化、兼容升级和缺失值语义；不能只加 `type:json` 就假定普通结构体会自动序列化 |
 
-自定义精确数值、日期等数据库类型时，应明确实现 `sql.Scanner`、`driver.Valuer` 或采用已验证的等效映射；JSON 可以采用明确的 GORM serializer 等方案。参见 [Go database/sql](https://pkg.go.dev/database/sql#Scanner)和 [GORM 自定义类型](https://gorm.io/docs/data_types.html)。
+**可空字段统一映射**
+
+可空性是在基础类型之外表达“是否有值”的要求。Go 持久化模型必须按下表映射，不再使用字段指针或业务自定义可空封装；`sql.Null*` 是标准库相关类型的统称。
+
+| 可空 MySQL 列 | 统一 Go 类型 | 映射要求 |
+| --- | --- | --- |
+| 有符号 `BIGINT` | `sql.NullInt64` | `Int64` 保存数值，`Valid` 区分 `NULL` 与包括 `0` 在内的具体数值 |
+| 有符号 `INT` | `sql.NullInt32` | 状态、类型编码仍按应用业务枚举校验 |
+| 布尔语义的 `TINYINT` | `sql.NullBool` | 区分 `NULL`、`false` 和 `true`，应用保证数据库值为 `0`、`1` |
+| `DOUBLE` | `sql.NullFloat64` | 用于允许近似误差的可空数值 |
+| `VARCHAR`、`CHAR`、`TEXT` | `sql.NullString` | 区分 `NULL`、空字符串和非空文本 |
+| `DATETIME(3)`、`DATETIME(6)` | `sql.NullTime` | 有值时仍须使用 UTC 并对齐列精度，连接保持 `parseTime=true` |
+| `DATE` | `sql.NullTime` | 有值时底层使用 `time.Time`，仅承载年月日，保持日历日期语义 |
+| `DECIMAL(p,s)` | `decimal.NullDecimal` | 使用 `shopspring/decimal` 提供的可空类型，禁止用浮点可空类型代替 |
+| `VARBINARY`、`BLOB` | `sql.Null[[]byte]` | 使用当前 Go 1.25 支持的标准库泛型，GORM 显式声明对应二进制列类型 |
+| `JSON` | `sql.NullString` | GORM 显式声明 `type:json`，内容为经应用校验的已序列化 JSON 文本，不叠加 `serializer:json` |
+
+`sql.Null*`、`sql.Null[T]`、`decimal.Decimal` 和 `decimal.NullDecimal` 已提供 `sql.Scanner`、`driver.Valuer`，GORM 可以自动完成数据库读写转换，不需要业务自行编写这些映射。模型中仍须显式选择对应类型，ORM 不会自动将普通 `string`、`time.Time` 改成可空类型。参见 [Go 可空类型](https://pkg.go.dev/database/sql#NullString)、[标准库泛型 Null](https://pkg.go.dev/database/sql#Null)、[shopspring/decimal 类型说明](https://pkg.go.dev/github.com/shopspring/decimal#NullDecimal)和 [GORM 模型说明](https://gorm.io/docs/models.html)。
+
+`Valid` 的含义统一如下：
+
+- `Valid=false`：表示 SQL `NULL`，读取方不得将内部值当作业务数据使用；字段参与写入时，其值转换为 SQL `NULL`。
+- `Valid=true`：表示存在具体值，即使这个值是 `0`、`false` 或空字符串，也不能按 `NULL` 处理。
+- `Valid` 不表示业务校验是否通过。有值时仍须按 2.4 校验合法范围、关联关系和状态规则。
+
+例如：
+
+| Go 值 | 对应的数据库值 |
+| --- | --- |
+| `sql.NullString{Valid: false}` | SQL `NULL` |
+| `sql.NullString{String: "", Valid: true}` | 空字符串 |
+| `sql.NullString{String: "备注内容", Valid: true}` | 文本“备注内容” |
+| `sql.NullInt64{Int64: 0, Valid: true}` | 数字 `0` |
+| `sql.NullBool{Bool: false, Valid: true}` | 布尔值 `false`，按本规范写入为 `0` |
+| `decimal.NullDecimal{Decimal: decimal.Zero, Valid: true}` | 精确十进制数 `0` |
+
+二进制列的有效空值必须使用 `sql.Null[[]byte]{V: []byte{}, Valid: true}`，不能用 nil 字节切片表达非空数据。可空 JSON 的 `Valid=false` 表示 SQL `NULL`；`String: "null", Valid: true` 表示 JSON `null`，`String: "{}", Valid: true` 表示空对象，三者含义不同。
+
+**GORM 读写 NULL 示例**
+
+以下以用户资料表的备注列说明，其他字段按实际设计补充。列定义不设置业务默认值：
+
+```sql
+remark VARCHAR(200) NULL DEFAULT NULL COMMENT '备注；NULL表示未提供，空字符串表示已提供空内容'
+```
+
+对应模型示例：
+
+```go
+import (
+    "database/sql"
+    "time"
+)
+
+type UserProfile struct {
+    ID        int64          `gorm:"column:id;type:bigint;primaryKey;autoIncrement:false"`
+    Remark    sql.NullString `gorm:"column:remark;type:varchar(200)"`
+    CreatedAt time.Time      `gorm:"column:created_at;type:datetime(3);not null"`
+    UpdatedAt time.Time      `gorm:"column:updated_at;type:datetime(3);not null"`
+}
+```
+
+创建时，`id` 已由统一雪花组件生成并验证为正数。以下片段显式表示备注为 `NULL`；创建和修改时间按 2.5 自动维护：
+
+```go
+record := UserProfile{
+    ID:     id,
+    Remark: sql.NullString{Valid: false},
+}
+if err := db.Create(&record).Error; err != nil {
+    return err
+}
+```
+
+查询时，GORM 自动填充 `Remark.String` 和 `Remark.Valid`。读取方先检查查询错误，再检查 `loaded.Remark.Valid`：为 `false` 时按 SQL `NULL` 处理，为 `true` 时才使用 `loaded.Remark.String`，该字符串也可能为空：
+
+```go
+var loaded UserProfile
+if err := db.First(&loaded, "id = ?", id).Error; err != nil {
+    return err
+}
+```
+
+将已有备注清为 `NULL` 时，必须显式指定更新列。以下片段通过 `nil` 写 SQL `NULL`，并维护 UTC 修改时间：
+
+```go
+result := db.Model(&UserProfile{}).
+    Where("id = ?", id).
+    Updates(map[string]any{
+        "remark":     nil,
+        "updated_at": time.Now().UTC().Truncate(time.Millisecond),
+    })
+if result.Error != nil {
+    return result.Error
+}
+```
+
+调用方仍须按业务检查 `result.RowsAffected`。`Updates(struct)` 可能跳过全零的可空结构体，不能仅赋值 `sql.NullString{}` 就假定数据库已清空。带 GORM `default` 标签的字段也可能因零值触发默认行为；需要明确写入 `NULL` 时，应使用上述显式更新方式或显式构造插入列和值。参见 [GORM 更新规则](https://gorm.io/docs/update.html#Updates-multiple-columns)和 [GORM 创建默认值规则](https://gorm.io/docs/create.html#Default-Values)。
+
+上述类型约束用于数据库持久化模型；接口中的“未提供字段”和“明确清空字段”仍需分别表达，不能都用同一个 `Valid=false` 混指。
+
+**DOUBLE 与 DECIMAL 映射示例**
+
+以下 SQL 仅为列定义片段，Go 模型仅展示主键与相关字段，其他业务和通用字段按实际表设计补充。商品单价需要精确十进制表示，算法质量评分允许近似误差，列定义片段如下：
+
+```sql
+unit_price DECIMAL(18,6) NOT NULL COMMENT '商品单价，单位：元，币种：CNY，最多6位小数',
+quality_score DOUBLE NOT NULL COMMENT '算法质量评分，允许近似误差，范围0至1'
+```
+
+GORM 字段映射为：
+
+```go
+import "github.com/shopspring/decimal"
+
+type ProductSku struct {
+    ID           int64           `gorm:"column:id;type:bigint;primaryKey;autoIncrement:false"`
+    UnitPrice    decimal.Decimal `gorm:"column:unit_price;type:decimal(18,6);not null"`
+    QualityScore float64         `gorm:"column:quality_score;type:double;not null"`
+}
+```
+
+精确十进制数从十进制字符串或精确整数构造，不能先通过浮点运算再转成 `decimal.Decimal`。以下写入片段中，`id` 已由统一雪花组件生成，实际业务输入须先完成范围和精度校验：
+
+```go
+unitPrice, err := decimal.NewFromString("12.345678")
+if err != nil {
+    return err
+}
+
+record := ProductSku{
+    ID:           id,
+    UnitPrice:    unitPrice,
+    QualityScore: 0.93,
+}
+return db.Create(&record).Error
+```
+
+查询时，GORM 会将 `DECIMAL` 值读入 `UnitPrice`、将 `DOUBLE` 值读入 `QualityScore`。十进制运算使用库提供的 `Add`、`Mul` 等方法，不使用 Go 的 `+`、`*` 运算符；除法等运算还须明确结果精度和舍入规则。
+
+`DECIMAL(18,6)` 只是本示例的容量，不是所有字段的统一精度。自动映射不负责业务范围、小数位和舍入校验，也不代表目标数据库已经具备这些列定义；应用按 2.1、2.4 校验，实际 DDL 按受控 SQL 迁移维护。
 
 **GORM 定义与写入规则**
 
 - 显式核对表名、`column`、类型、长度、精度、可空性和主键生成方式。所有业务模型的雪花主键必须声明 `autoIncrement:false`，数据库 DDL 同时禁止 `AUTO_INCREMENT`。
-- GORM 初始化必须设置 `DisableForeignKeyConstraintWhenMigrating: true`，防止迁移自动创建物理外键；模型不得通过 `check` 标签生成 `CHECK` 约束。该配置不会删除已有约束，也不会阻止显式 DDL 创建约束，所有建表与迁移 SQL 都必须遵守 2.4，参见 [GORM 约束配置](https://gorm.io/docs/constraints.html)。
+- GORM 初始化必须设置 `DisableForeignKeyConstraintWhenMigrating: true`。
+
+  该配置仅阻止 GORM 建表、迁移时自动创建外键，不删除已有外键；手写迁移 SQL 仍禁止定义物理外键。
+- 模型不得通过 `check` 标签生成 `CHECK` 约束，参见 [GORM 约束配置](https://gorm.io/docs/constraints.html)。
 - 不直接将 `gorm.Model` 作为所有业务模型的统一基类：它包含 `uint` 类型主键和软删除字段等预设，不符合本规范统一的主键方案及按需字段要求。参见 [GORM 模型说明](https://gorm.io/docs/models.html)。
 - SQL `NULL`、字段未提供、Go 零值是不同状态。禁止用 `time.Time{}` 表达“尚未支付”，也不能只靠普通 `bool` 区分“未提供”与“明确为 false”。
-- `Create` 中带 `default` 标签的字段，其 `0`、`false`、空字符串等零值可能被默认值替代。需要明确写入零值时，使用能表达“已提供”的指针、可空封装或显式构造的写入方式，并核对最终 SQL。参见 [GORM 创建时的默认值](https://gorm.io/docs/create.html#Default-Values)。
+- `Create` 中带 `default` 标签的字段，其 `0`、`false`、空字符串等零值可能被默认值替代。需要明确写入零值或 SQL `NULL` 时，使用符合上述类型约定的值并显式构造写入列和值，核对最终 SQL，不改用字段指针或自行增加可空封装。参见 [GORM 创建时的默认值](https://gorm.io/docs/create.html#Default-Values)。
 - `Updates(struct)` 默认忽略零值。需要将字段更新为 `0`、`false` 或空字符串时，使用明确的 `map` 或 `Select` 指定字段；写入 SQL `NULL` 时也必须显式表达。参见 [GORM 更新字段规则](https://gorm.io/docs/update.html#Updates-multiple-columns)。
 
 主键映射示例如下，仅展示 ID 字段，其他业务字段按实际设计补充：
@@ -542,7 +724,7 @@ type SalesOrder struct {
 
 JSON 接口面向 JavaScript 等存在安全整数范围限制的调用方时，雪花 ID 使用十进制字符串传输，不经 `float64` 中转；数据库和 Go 内部仍使用 `BIGINT`、`int64`。参见 [JSON 数值互操作范围](https://www.rfc-editor.org/rfc/rfc8259.html#section-6)。
 
-例如，明确禁用用户并维护修改时间的写入片段如下；实际业务还应补齐相应的访问和并发条件：
+下面以“禁用指定用户并记录修改时间”为例，说明如何用 `map` 写入零值。`Updates(struct)` 默认跳过 `false`、`0` 和空字符串，而这里的 `false` 正是需要保存的禁用状态。实际业务还应补齐访问与并发条件：
 
 ```go
 result := db.Model(&UserProfile{}).
@@ -553,7 +735,7 @@ result := db.Model(&UserProfile{}).
     })
 ```
 
-调用方仍须检查 `result.Error` 和业务要求的影响行数。不能因为 `false` 是 Go 零值，就让本次禁用操作被忽略。
+执行后先检查 `result.Error`，确认是否报错，再按业务检查 `result.RowsAffected`。影响行数为 `0` 时须核对记录是否存在、条件是否匹配或值是否未变化，不能仅凭未报错认定成功。
 
 **模型与 DDL 一致性**
 
