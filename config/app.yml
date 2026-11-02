@@ -1,0 +1,13 @@
+app_name: go-service-template
+app_debug: false
+
+http:
+  address: ":8080"
+  # Empty means routes are mounted at the root, for example /v1/health.
+  base_path: ""
+  read_header_timeout: 5s
+  write_timeout: 10s
+  idle_timeout: 60s
+  shutdown_timeout: 5s
+  # Proxy headers are ignored unless the immediate peer is trusted here.
+  trusted_proxies: []

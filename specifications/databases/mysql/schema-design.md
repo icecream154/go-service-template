@@ -39,7 +39,7 @@ RDS 实例按应用分配，业务库按服务划分。服务之间共用该应�
 
 数据库权限能够限制访问范围，但无法识别代码当前是否正在执行指定业务流程，因此还必须在代码中集中事务入口，限制跨库连接的使用范围。
 
-**购买会员的支付回调示例**：要求 `order_service.sales_order` 的订单支付状态与 `user_service.user_membership` 的当前会员权益一起更新。
+**购买会员的支付回调示例**：要求 `order_service.membership_order` 的订单支付状态与 `user_service.user_membership` 的当前会员权益一起更新。
 
 本例将用户资料和会员权益分表保存，假定每个用户最多一份当前会员权益，会员表对 `user_id` 设置唯一约束。创建或变更会员权益的入口统一先锁定所属用户，再处理会员记录，避免首次创建与其他会员操作互相竞争。对象拆分和关系建模的通用要求见 1.4。
 
@@ -52,7 +52,7 @@ RDS 实例按应用分配，业务库按服务划分。服务之间共用该应�
 
 回调校验通过后，按以下顺序处理：
 
-1. 从该 RDS 主实例连接开启一个 `sql.Tx`，查询并锁定 `order_service.sales_order` 中的目标订单，检查本次支付是否已经处理。
+1. 从该 RDS 主实例连接开启一个 `sql.Tx`，查询并锁定 `order_service.membership_order` 中的目标订单，检查本次支付是否已经处理。
 2. 在同一个事务中先查询并锁定 `user_service.user_profile` 中的目标用户，确认用户存在；再按 `user_id` 读取并锁定已有的 `user_service.user_membership` 记录，按统一会员规则计算权益。
 3. 仍使用同一个 `sql.Tx` 保存计算后的会员权益：已有记录则更新，不存在则先分配雪花 `id` 并新建；然后更新订单支付状态。任一检查或写入失败，程序必须回滚整个事务。
 4. 两项更新都完成后统一提交，只有 `Commit` 明确成功后才确认回调处理成功。
@@ -251,6 +251,14 @@ RDS 实例按应用分配，业务库按服务划分。服务之间共用该应�
 | 会员资格与权益 | `membership` | `user_membership`、`membership_status` | 表示会员资格或权益，不与成员或会员主体 `member` 混用 |
 | 等级 | `level` | `membership_level` | 表示有顺序的业务等级，不与分类、类型或状态混用 |
 | 业务变更记录 | `record` | `membership_change_record` | 表示一条业务记录；技术运行日志属于不同概念，不将 `record` 与 `log` 当作同义词混用 |
+| 帖子 | `post` | `post_service`、`post_id` | 表示社区帖子；与其他独立的文章业务对象分别命名 |
+| 点赞 | `like` | `post_like`、`like_count` | 表示当前点赞关系及其计数，不与全部操作历史混用 |
+| 关注 | `follow` | `user_follow` | 表示有方向的当前关注关系 |
+| 关注方 | `follower` | `follower_user_id` | 表示主动关注的一方，与被关注方分别命名 |
+| 被关注方 | `followed` | `followed_user_id` | 表示被关注的一方，同一含义不混用其他英文写法 |
+| 作者 | `author` | `author_user_id` | 表示内容作者，不自动等同于最后修改者或其他操作者 |
+| 套餐 | `plan` | `plan_code`、`plan_version` | 表示可购买的权益规格定义，订单中保存购买时的配置快照 |
+| 币种 | `currency` | `currency_code` | 表示货币种类，与金额单位和支付渠道分别表达 |
 | 对象标识 | `id` | `user_id`、`account_id` | 表示对象标识，不与面向业务使用的编号 `no` 混用 |
 | 业务编号 | `no` | `order_no`、`payment_no` | 表示业务编号，同一含义不混用 `num`、`number` |
 | 业务编码 | `code` | `product_code` | 表示编码体系中的代码，按业务定义与对象标识 `id`、业务编号 `no` 区分 |
@@ -1114,3 +1122,813 @@ SHOW INDEX FROM order_service.sales_order;
 随后重新执行受影响的关键 SQL，核对结果、执行计划和耗时。上线后再结合 RDS 慢查询、应用请求延迟和写入吞吐观察实际表现，并按执行前确定的资源指标继续监控。确认结构正确、查询耗时达到目标，写入性能和资源占用也在约定范围内后，完成本次变更验收。
 
 ## 4. 完整示例与评审清单
+
+### 4.1 示例中的数据与关系
+
+本例是一套会员社区。用户可以关注其他用户、发布帖子和点赞，也可以购买会员。先看这些业务需要保存哪些数据，再看它们怎样关联和分库。
+
+#### 4.1.1 七张表分别保存什么
+
+| 业务数据 | 表名 | 每行保存什么 |
+| --- | --- | --- |
+| 用户资料 | `user_profile` | 一位用户的身份、昵称、头像和启用状态 |
+| 用户关注 | `user_follow` | 一位用户对另一位用户的一条当前关注关系 |
+| 帖子 | `post` | 一篇帖子的作者、标题、正文和删除状态 |
+| 帖子点赞 | `post_like` | 一位用户对一篇帖子的一条当前点赞关系 |
+| 会员订单 | `membership_order` | 一次会员购买的规格、金额和支付结果 |
+| 当前会员权益 | `user_membership` | 一位用户当前的会员等级、生效时间和到期时间 |
+| 权益变更历史 | `membership_change_record` | 一次开通或续费前后，会员权益发生的变化 |
+
+关注和点赞表只保留用户尚未取消的关系。会员权益表保存当前状态，变更历史表保存每次变化，两者承担不同职责。
+
+#### 4.1.2 这些数据怎样关联
+
+**用户与社交关系**：用户既可以发起关注，也可以被其他用户关注。一条关注关系连接两位用户，并区分方向；A 关注 B 和 B 关注 A 是两条不同关系。
+
+**用户、帖子与点赞**：用户发布帖子，帖子记录作者。另一位用户点赞时，点赞记录连接这位用户和这篇帖子。帖子另外保存点赞数，便于列表展示；用户取消点赞后，当前点赞记录删除，计数随之减少。
+
+**订单、当前权益与变更历史**：购买会员先产生订单。确认支付后，更新该用户的当前权益，同时追加一条变更历史。每位用户最多一份当前权益，首次购买前没有会员记录，首次开通时创建，后续续费更新同一份当前权益。
+
+例如，用户先成功开通 30 天会员，再续费 30 天，订单表和变更历史表各增加两条记录；当前权益表保留一条记录，更新为续费后的到期时间。
+
+#### 4.1.3 这些表分别属于哪个库
+
+| 业务库 | 所属数据表 |
+| --- | --- |
+| `user_service` | `user_profile`、`user_follow`、`user_membership`、`membership_change_record` |
+| `post_service` | `post`、`post_like` |
+| `order_service` | `membership_order` |
+
+三个库位于同一应用、同一环境的 RDS MySQL 8.4 主实例。普通业务操作各自的库；用户服务提供作者资料，再由应用与帖子数据组装。只有已授权的支付确认模块需要同时修改订单库和用户库，回调与支付核对任务共用这一模块。
+
+表间通过对象标识关联，由应用维护这些关系，数据库不创建物理外键。
+
+本章采用单租户模型。完整结构以 4.2 的 DDL 为准；前文的局部字段、模型片段和其他示意表用于说明单项规则，三元关系、价格有效版本等内容继续按前文示例理解。
+
+### 4.2 完整建库建表 SQL
+
+以下 SQL 用于初始化本例的三个业务库及七张业务表。执行前必须通过基线验收，并确认目标库表尚不存在；所有主键由应用在写入前生成正的有符号 64 位雪花 ID，时间由应用按 UTC 语义填写并截断到毫秒。
+
+建库建表 DDL 与下文业务 DML 分开执行；DDL 不因包入业务事务就能整体回滚。已有库表应使用受控迁移，不通过重复初始化覆盖结构。参见 [MySQL 隐式提交说明](https://dev.mysql.com/doc/refman/8.4/en/implicit-commit.html)。
+
+#### 4.2.1 业务库
+
+```sql
+CREATE DATABASE user_service
+    DEFAULT CHARACTER SET utf8mb4
+    DEFAULT COLLATE utf8mb4_0900_bin;
+
+CREATE DATABASE post_service
+    DEFAULT CHARACTER SET utf8mb4
+    DEFAULT COLLATE utf8mb4_0900_bin;
+
+CREATE DATABASE order_service
+    DEFAULT CHARACTER SET utf8mb4
+    DEFAULT COLLATE utf8mb4_0900_bin;
+```
+
+#### 4.2.2 用户服务业务表
+
+```sql
+CREATE TABLE user_service.user_profile (
+    id BIGINT NOT NULL COMMENT '用户内部标识，应用生成的正数雪花ID',
+    account_source VARCHAR(32) NOT NULL COMMENT '可信外部账户的完整身份命名空间代码，由服务端配置确定',
+    external_account_id VARCHAR(128) NOT NULL COMMENT '来源内唯一的外部账户原始标识，按字符串保留，非本系统雪花ID',
+    user_name VARCHAR(64) NOT NULL COMMENT '用户展示昵称，允许重名',
+    avatar_url VARCHAR(512) NULL DEFAULT NULL COMMENT '用户头像URL；NULL表示尚未提供',
+    is_enabled TINYINT NOT NULL DEFAULT 1 COMMENT '用户是否启用：0禁用，1启用；由应用校验',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '资料修改乐观锁版本，每次受保护的资料修改加一',
+    created_at DATETIME(3) NOT NULL COMMENT '用户资料创建时间，UTC，由应用填写',
+    updated_at DATETIME(3) NOT NULL COMMENT '用户资料最近修改时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_user_profile_account_source_external_account_id
+        (account_source, external_account_id)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='用户当前资料及固定外部账户映射，每个外部账户对应一个用户，昵称允许重名';
+
+CREATE TABLE user_service.user_membership (
+    id BIGINT NOT NULL COMMENT '当前会员权益记录标识，应用生成的正数雪花ID',
+    user_id BIGINT NOT NULL COMMENT '所属用户标识，引用user_service.user_profile.id',
+    membership_level INT NOT NULL COMMENT '当前会员等级，本例10表示标准会员',
+    effective_at DATETIME(3) NOT NULL COMMENT '当前会员权益生效时间，UTC',
+    expired_at DATETIME(3) NOT NULL COMMENT '当前会员权益到期时间，UTC',
+    created_at DATETIME(3) NOT NULL COMMENT '会员权益记录创建时间，UTC，由应用填写',
+    updated_at DATETIME(3) NOT NULL COMMENT '会员权益最近修改时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_user_membership_user_id (user_id)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='用户当前会员权益，每个已开通过会员的用户最多一行，到期后保留记录';
+
+CREATE TABLE user_service.user_follow (
+    id BIGINT NOT NULL COMMENT '用户关注关系标识，应用生成的正数雪花ID',
+    follower_user_id BIGINT NOT NULL COMMENT '关注方用户标识，引用user_service.user_profile.id',
+    followed_user_id BIGINT NOT NULL COMMENT '被关注方用户标识，引用user_service.user_profile.id',
+    created_at DATETIME(3) NOT NULL COMMENT '本次关注建立时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_user_follow_follower_user_id_followed_user_id
+        (follower_user_id, followed_user_id),
+    KEY idx_user_follow_follower_user_id_created_at
+        (follower_user_id, created_at),
+    KEY idx_user_follow_followed_user_id_created_at
+        (followed_user_id, created_at)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='用户当前有向关注关系，每行表示关注方关注被关注方，取消关注时物理删除';
+
+CREATE TABLE user_service.membership_change_record (
+    id BIGINT NOT NULL COMMENT '会员权益变更记录标识，应用生成的正数雪花ID',
+    user_id BIGINT NOT NULL COMMENT '会员权益所属用户标识，引用user_service.user_profile.id',
+    membership_id BIGINT NOT NULL COMMENT '当前会员权益记录标识，引用user_service.user_membership.id',
+    order_id BIGINT NOT NULL COMMENT '本次权益变更对应订单标识，引用order_service.membership_order.id',
+    change_type INT NOT NULL COMMENT '权益变更类型：10开通，20续费；由应用校验',
+    before_membership_level INT NULL DEFAULT NULL COMMENT '变更前会员等级；首次开通时为NULL',
+    before_effective_at DATETIME(3) NULL DEFAULT NULL COMMENT '变更前权益生效时间，UTC；首次开通时为NULL',
+    before_expired_at DATETIME(3) NULL DEFAULT NULL COMMENT '变更前权益到期时间，UTC；首次开通时为NULL',
+    after_membership_level INT NOT NULL COMMENT '变更后会员等级，本例10表示标准会员',
+    after_effective_at DATETIME(3) NOT NULL COMMENT '变更后权益生效时间，UTC',
+    after_expired_at DATETIME(3) NOT NULL COMMENT '变更后权益到期时间，UTC',
+    created_at DATETIME(3) NOT NULL COMMENT '本次权益变更记录创建时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_membership_change_record_order_id (order_id),
+    KEY idx_membership_change_record_user_id_created_at (user_id, created_at)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='会员权益变更历史，每行保存一笔会员订单引发的权益变更前后快照，只追加不修改';
+```
+
+#### 4.2.3 帖子服务业务表
+
+```sql
+CREATE TABLE post_service.post (
+    id BIGINT NOT NULL COMMENT '帖子内部标识，应用生成的正数雪花ID',
+    author_user_id BIGINT NOT NULL COMMENT '帖子作者用户标识，引用user_service.user_profile.id',
+    title VARCHAR(200) NOT NULL COMMENT '帖子标题，由应用校验非空及长度',
+    content TEXT NOT NULL COMMENT '帖子正文，由应用校验内容及大小',
+    like_count BIGINT NOT NULL DEFAULT 0 COMMENT '用户尚未取消的点赞数量，来源于post_service.post_like；帖子软删除时保留',
+    created_at DATETIME(3) NOT NULL COMMENT '帖子创建时间，UTC，由应用填写',
+    updated_at DATETIME(3) NOT NULL COMMENT '帖子最近修改时间，UTC；正文、点赞计数或删除状态变更时由应用更新',
+    deleted_at DATETIME(3) NULL DEFAULT NULL COMMENT '帖子软删除时间，UTC；NULL表示未删除',
+    PRIMARY KEY (id),
+    KEY idx_post_author_user_id_deleted_at_created_at
+        (author_user_id, deleted_at, created_at),
+    KEY idx_post_deleted_at_created_at (deleted_at, created_at)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='帖子当前内容及状态，每行表示一篇帖子，采用软删除并保存尚未取消的点赞计数';
+
+CREATE TABLE post_service.post_like (
+    id BIGINT NOT NULL COMMENT '帖子点赞关系标识，应用生成的正数雪花ID',
+    post_id BIGINT NOT NULL COMMENT '被点赞帖子标识，引用post_service.post.id',
+    user_id BIGINT NOT NULL COMMENT '点赞用户标识，引用user_service.user_profile.id',
+    created_at DATETIME(3) NOT NULL COMMENT '本次点赞建立时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_post_like_post_id_user_id (post_id, user_id),
+    KEY idx_post_like_user_id_created_at_id_post_id
+        (user_id, created_at, id, post_id)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='帖子当前尚未取消的点赞关系，每个帖子与用户组合最多一行，取消点赞时物理删除';
+```
+
+#### 4.2.4 订单服务业务表
+
+```sql
+CREATE TABLE order_service.membership_order (
+    id BIGINT NOT NULL COMMENT '会员订单内部标识，应用生成的正数雪花ID',
+    order_no VARCHAR(64) NOT NULL COMMENT '会员订单业务编号，在本表内唯一，对外展示和查询',
+    user_id BIGINT NOT NULL COMMENT '购买会员的用户标识，引用user_service.user_profile.id',
+    plan_code VARCHAR(64) NOT NULL COMMENT '下单时会员套餐编码快照，不随套餐配置变化',
+    plan_version BIGINT NOT NULL COMMENT '下单时会员套餐版本快照，用于定位购买时的套餐定义',
+    membership_level INT NOT NULL COMMENT '下单时购买的会员等级快照，本例10表示标准会员',
+    duration_seconds BIGINT NOT NULL COMMENT '下单时购买的会员有效时长快照，单位：秒，由应用校验为正数',
+    payable_amount BIGINT NOT NULL COMMENT '下单时应付金额快照，单位：分，币种：CNY，本例由应用校验为正数',
+    currency_code VARCHAR(3) NOT NULL COMMENT '下单时币种代码快照，本例固定为CNY，由应用校验',
+    payment_status INT NOT NULL DEFAULT 10 COMMENT '支付及履约状态：10待支付，20已支付且已完成权益发放',
+    payment_channel VARCHAR(32) NOT NULL COMMENT '下单时选定的支付渠道，本例每个渠道对应唯一固定商户账户',
+    payment_transaction_no VARCHAR(128) NULL DEFAULT NULL COMMENT '支付渠道返回的交易流水号；NULL表示尚未取得流水',
+    paid_at DATETIME(3) NULL DEFAULT NULL COMMENT '支付渠道确认的实际支付成功时间，UTC；NULL表示尚未确认支付',
+    fulfilled_at DATETIME(3) NULL DEFAULT NULL COMMENT '本地完成会员权益履约时取用的处理时间，UTC，不代表提交时间；NULL表示尚未完成履约',
+    created_at DATETIME(3) NOT NULL COMMENT '会员订单创建时间，UTC，由应用填写',
+    updated_at DATETIME(3) NOT NULL COMMENT '会员订单最近修改时间，UTC，由应用填写',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_membership_order_order_no (order_no),
+    UNIQUE KEY uk_membership_order_payment_channel_payment_transaction_no
+        (payment_channel, payment_transaction_no),
+    KEY idx_membership_order_user_id_created_at (user_id, created_at),
+    KEY idx_membership_order_payment_status_created_at (payment_status, created_at)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET=utf8mb4
+  COLLATE=utf8mb4_0900_bin
+  COMMENT='会员购买订单，每行保存一笔订单的套餐价格快照及当前支付履约状态';
+```
+
+本例的支付渠道在下单时确定，尚未取得渠道流水时使用 SQL `NULL`。联合唯一键允许同渠道的多笔未取得流水订单；取得非空流水后，约束同一渠道流水只能关联一笔订单。应用不得用空字符串代替未知流水，且在将订单置为已支付且已完成权益发放前，必须校验并填写渠道流水、实际支付时间与本地履约处理时间。渠道与固定商户账户的对应关系属于本例前提，扩大商户账户范围时必须重新设计流水唯一性范围。
+
+`post_like` 的列表索引显式将 `id` 放在 `post_id` 前，使按 `user_id` 过滤、按 `created_at` 与 `id` 排序的点赞列表同时覆盖 `post_id`。不能仅因二级索引包含主键，就删除这个决定排序位置的 `id` 键列。
+
+所有字符列继承所在表的字符集和比较规则；有符号 `BIGINT` 在 Go 中映射为 `int64`，`INT` 映射为 `int32` 或对应底层类型的业务枚举，`is_enabled` 映射为 `bool`；可空字符串使用 `sql.NullString`，可空时间使用 `sql.NullTime`，变更前可空等级使用 `sql.NullInt32`。所有时间写入仍遵守 UTC 及毫秒精度要求。
+
+### 4.3 关键写入流程
+
+以下按业务操作说明读写哪些数据，并给出参数化 SQL 片段。实际执行时必须遵守 4.5 的统一发号、鉴权、请求幂等和事务约定；SQL 中的 `?` 由应用绑定参数，互斥分支只执行符合条件的一支。
+
+#### 4.3.1 注册用户与修改资料
+
+本例中，一个已验证的外部账户对应一位用户，昵称只是展示名称，允许重名；不演示多个外部身份的绑定或合并。账户来源与标识取自认证组件的核验结果，`account_source` 与 `external_account_id` 在注册后不由普通资料编辑接口修改。
+
+`account_source` 是服务端配置的身份命名空间代码，完整区分来源系统、租户及应用等标识范围，不能只用一个可能混淆身份的宽泛平台名称。本例代码最多 32 个字符，来源内账户标识最多 128 个字符，由接入来源的契约保证；外部标识按原字符串保存，不自动转整数、改大小写或截断。
+
+先在公共幂等事务中按账户身份查找用户：
+
+```sql
+SELECT id, is_enabled
+FROM user_service.user_profile
+WHERE account_source = ?
+  AND external_account_id = ?;
+```
+
+已有用户时返回该用户，不覆盖原昵称、头像，也不自动启用已停用账户。不存在时才生成新用户 ID 并插入；`is_enabled`、`version` 使用已确定的初始默认值。头像未提供时写 SQL `NULL`，提供时检查格式和长度。
+
+```sql
+INSERT INTO user_service.user_profile (
+    id, account_source, external_account_id,
+    user_name, avatar_url, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?);
+```
+
+并发注册同一外部账户时，由联合唯一键兜底。遇到该身份的唯一冲突后回滚整个事务，再以原请求标识重新进入幂等流程，核对并返回已有用户、保存本次回执，不能将任意主键冲突都当作账户已存在。重复同次请求返回原结果；即使使用新的请求标识，也不能为同一外部账户创建第二个用户。
+
+资料修改携带调用方读取到的旧版本：
+
+```sql
+UPDATE user_service.user_profile
+SET user_name = ?,
+    avatar_url = ?,
+    updated_at = ?,
+    version = version + 1
+WHERE id = ?
+  AND version = ?
+  AND is_enabled = 1;
+```
+
+本次更新必须影响一行；为零时检查用户是否存在、是否停用或版本是否已变化。所有资料修改入口，包括后台启用、停用用户，都要遵守版本维护规则；启用、停用入口的授权条件另行校验，不能复用仅允许启用用户编辑的上述条件。
+
+本例只演示用户启用和停用，不演示注销或物理清理。停用用户不能通过鉴权入口发起新的业务操作，但保留旧帖子、关注、点赞和订单，也不暂停会员期限。已经在渠道付款的订单仍按 4.3.5 完成履约，不会因支付成功自动重新启用用户。
+
+#### 4.3.2 关注与取消关注
+
+关注是有方向的关系：`follower_user_id` 是当前调用用户，`followed_user_id` 是目标用户。应用先拒绝自关注，然后在公共幂等入口中执行：
+
+1. 开启事务，将两个用户 ID 排序，先锁定较小 ID 的用户，再锁定较大 ID 的用户。下面的锁定 SQL 分别执行两次，不按请求中参数的先后顺序加锁。
+2. 确认两个用户存在。建立关注时双方都必须启用；取消关注时，调用用户必须启用，被关注用户停用不妨碍解除原关系。
+3. 查询当前关系，按建立或解除操作执行一个分支。
+4. 保存幂等回执并提交事务。本例不保存冗余关注数，查询时按关系统计。
+
+锁定用户和查询关系的 SQL：
+
+```sql
+SELECT id, is_enabled
+FROM user_service.user_profile
+WHERE id = ?
+FOR UPDATE;
+
+SELECT id
+FROM user_service.user_follow
+WHERE follower_user_id = ?
+  AND followed_user_id = ?
+FOR UPDATE;
+```
+
+- **建立关注**：已存在关系则按当前关系已建立处理；不存在时分配新 ID，并执行插入。
+- **取消关注**：没有关系则按已解除处理；存在时按查询到的关系 ID 删除，必须影响一行。
+
+```sql
+-- 建立分支
+INSERT INTO user_service.user_follow (
+    id, follower_user_id, followed_user_id, created_at
+) VALUES (?, ?, ?, ?);
+
+-- 解除分支
+DELETE FROM user_service.user_follow
+WHERE id = ?
+  AND follower_user_id = ?
+  AND followed_user_id = ?;
+```
+
+再次主动关注会生成新的关系 ID 和建立时间。同一次旧请求的重试由公共幂等组件拦截，不能因原关系已经删除就重新执行插入。
+
+#### 4.3.3 发帖、点赞与取消点赞
+
+**发布帖子**
+
+作者标识取自服务端认证结果，标题和正文由应用检查非空及容量。正文须满足 `TEXT` 的字节容量，不能只按 Go 字符串的字符数量判断。发布后即为本例可见帖子，不增加草稿或审核状态。
+
+```sql
+INSERT INTO post_service.post (
+    id, author_user_id, title, content, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?);
+```
+
+新帖的 `like_count` 默认为 `0`，`deleted_at` 默认为 `NULL`。发帖也通过公共幂等入口执行。
+
+**点赞与取消点赞**
+
+两个操作均在事务中先锁定帖子，再检查当前关系：
+
+```sql
+SELECT id, author_user_id, deleted_at, like_count
+FROM post_service.post
+WHERE id = ?
+FOR UPDATE;
+
+SELECT id
+FROM post_service.post_like
+WHERE post_id = ?
+  AND user_id = ?
+FOR UPDATE;
+```
+
+帖子不存在或已软删除时拒绝互动。点赞用户来自当前认证身份；不读取或修改其他业务库的用户表来代替鉴权。
+
+- **点赞**：关系已存在时不修改计数；不存在时新建关系，再将计数加一。
+- **取消点赞**：关系不存在时不修改计数；存在时先检查计数大于零，再删除关系并将计数减一。关系存在但计数为零是数据不一致，回滚并进入核对流程。
+
+点赞分支的两条 SQL 在同一个事务中执行，均须影响一行：
+
+```sql
+INSERT INTO post_service.post_like (
+    id, post_id, user_id, created_at
+) VALUES (?, ?, ?, ?);
+
+UPDATE post_service.post
+SET like_count = like_count + 1,
+    updated_at = ?
+WHERE id = ?
+  AND deleted_at IS NULL;
+```
+
+取消分支的两条 SQL 也在同一个事务中执行，均须影响一行：
+
+```sql
+DELETE FROM post_service.post_like
+WHERE id = ?
+  AND post_id = ?
+  AND user_id = ?;
+
+UPDATE post_service.post
+SET like_count = like_count - 1,
+    updated_at = ?
+WHERE id = ?
+  AND deleted_at IS NULL
+  AND like_count > 0;
+```
+
+计数更新失败时，前面的关系新增或删除必须一起回滚。不得把每次请求都当成一次计数变化，也不通过 `GREATEST(0, ...)` 隐藏计数错误。
+
+所有建立、解除关系及计数修复入口都先锁定同一帖子。这样即使隔离级别是 `READ COMMITTED`，也能通过共同的帖子锁串行处理该帖的关系变化。锁必须持有到事务结束，参见 [MySQL 锁定读](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html)。
+
+#### 4.3.4 帖子软删除、恢复与计数修复
+
+帖子采用软删除：隐藏帖子，保留点赞关系和计数，供以后恢复。删除期间不接受编辑、点赞和取消点赞。本例只允许作者删除和恢复自己的帖子。两个入口也使用公共幂等组件，回执与状态变化同事务提交；已完成的旧删除或恢复请求不能在后续状态变化后重新执行。应用在事务中先按 4.3.3 锁定帖子，核对作者身份，再处理对应分支：
+
+| 操作 | 处理规则 |
+| --- | --- |
+| 删除未删除的帖子 | 写入 UTC 删除时间；保留全部尚未取消的点赞和计数 |
+| 重复删除 | 返回已删除结果，不重写第一次删除时间 |
+| 恢复已删除帖子 | 按保留的点赞关系核对计数，解除帖子删除标记 |
+| 重复恢复 | 返回当前已恢复结果，不重新建立任何点赞关系 |
+
+```sql
+-- 删除分支
+UPDATE post_service.post
+SET deleted_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND deleted_at IS NULL;
+
+-- 恢复分支：先统计保留关系，再把统计结果与恢复状态一起写回
+SELECT COUNT(*) AS actual_like_count
+FROM post_service.post_like
+WHERE post_id = ?;
+
+UPDATE post_service.post
+SET deleted_at = NULL,
+    like_count = ?,
+    updated_at = ?
+WHERE id = ?
+  AND deleted_at IS NOT NULL;
+```
+
+实际删除、恢复分支的更新必须影响一行。业务可见性变化与恢复时的计数修正一起提交，普通查询始终过滤 `post.deleted_at IS NULL`。整个流程不修改点赞记录，因此用户此前已取消的点赞不会被恢复。
+
+后台修复计数也使用相同帖子锁：在同一个事务中锁定帖子、按 `post_id` 统计关系，仅在计数不一致时更新 `like_count` 和 `updated_at`。批量巡检按帖子分成短事务，不能先在事务外统计，再无条件写回旧结果。
+
+#### 4.3.5 创建会员订单与支付回调
+
+**本例购买规则**
+
+用户购买的是标准会员资格，一笔订单购买一期。每期固定为 30×24 小时；首次开通从本地确认履约的处理时刻起生效，未到期续费从原到期时间继续延长，已到期续费从本次处理时刻重新起算。过期会员记录保留，后续购买仍更新这份当前权益。
+
+本例服务端套餐配置如下，订单保存购买时的这份配置：
+
+| 配置项 | 示例值 |
+| --- | --- |
+| 套餐编码 `plan_code` | `standard_30_day` |
+| 套餐版本 `plan_version` | `1` |
+| 会员等级 `membership_level` | `10`，标准会员 |
+| 时长 `duration_seconds` | `2592000` 秒，即 30×24 小时 |
+| 应付金额 `payable_amount` | `2900` 分，即 29 元 |
+| 币种 `currency_code` | `CNY` |
+
+上表的套餐来自可信的、带版本的服务端配置，不接受客户端提交的价格或时长作为定价依据。订单保存下单时的配置快照；后续配置调整不改变已创建订单的购买内容。
+
+一笔订单只接受一次成功支付，并产生一条只追加、不修改、不软删除的权益变更历史。订单状态 `10` 表示待支付，`20` 表示已确认支付且已完成权益发放。订单关闭、退款、支付尝试历史和等级升级折算不在本例中展开。
+
+**创建订单**
+
+应用根据认证用户、选择的套餐编码和支付渠道读取可信配置，生成雪花 ID 与独立业务订单号，保存购买快照。会员记录尚不存在不影响下单。
+
+```sql
+INSERT INTO order_service.membership_order (
+    id, order_no, user_id,
+    plan_code, plan_version, membership_level, duration_seconds,
+    payable_amount, currency_code, payment_channel,
+    created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+```
+
+创建时 `payment_status=10`，渠道流水、支付时间和履约时间均为 SQL `NULL`。金额、期限和等级不得从客户端提交值直接入库；本例必须与本节的服务端套餐配置一致。
+
+订单提交后，才使用该订单号和快照请求支付渠道。网络请求在数据库事务外进行；请求失败或结果未知时，保留原订单，按原订单号重试或查询渠道结果，不重新创建业务订单。本例不记录每次渠道调用尝试。
+
+**核验支付并执行受控事务**
+
+签名校验、必要的渠道查询在加锁前完成，得到经核验的商户身份、订单号、渠道交易号、金额、币种和支付成功时间。本例将渠道金额精确转换为 CNY 分后与 `payable_amount` 比较，不经浮点数中转。受益用户始终从本地订单读取，不采用回调新传入的用户标识。
+
+通过专用连接开启一个 `sql.Tx`，依次处理：
+
+1. 按订单号锁定订单，重新核对渠道、固定商户账户、金额和币种。订单不存在、状态未知或核验不符时停止处理，不新建订单承接未知支付。成功流水必须非空，`paid_at` 使用渠道实际支付时间并转换为 UTC 毫秒精度。
+2. 若订单已为 `20`，核对原渠道流水和该订单的权益变更记录。确认同一次支付已经完成后返回既有结果，不再次延长权益；发现不同流水或历史缺失时作为异常处理。
+3. 若订单为 `10`，按订单中的 `user_id` 锁定真实存在的用户，再查询并锁定已有会员记录。用户停用不取消已成功支付的履约，也不得在回调中自动启用用户。
+4. 获取本次 UTC 毫秒处理时刻 `t`，按下表计算权益，校验等级、期限、时间范围及运算溢出。
+5. 新建或更新当前会员记录，追加本订单的权益变更历史，将订单改为 `20` 并填写支付与履约信息。
+6. 三项写入全部成功后统一提交，才确认回调处理成功。任一步失败显式回滚整个事务。
+
+锁定顺序和查询 SQL 如下：
+
+```sql
+SELECT id, order_no, user_id,
+       plan_code, plan_version, membership_level, duration_seconds,
+       payable_amount, currency_code, payment_channel,
+       payment_status, payment_transaction_no, paid_at, fulfilled_at
+FROM order_service.membership_order
+WHERE order_no = ?
+FOR UPDATE;
+
+SELECT id, is_enabled
+FROM user_service.user_profile
+WHERE id = ?
+FOR UPDATE;
+
+SELECT id, membership_level, effective_at, expired_at
+FROM user_service.user_membership
+WHERE user_id = ?
+FOR UPDATE;
+```
+
+订单已支付时核对的历史记录：
+
+```sql
+SELECT id, user_id, membership_id, order_id, change_type,
+       after_membership_level, after_effective_at, after_expired_at
+FROM user_service.membership_change_record
+WHERE order_id = ?;
+```
+
+同一用户的所有权益创建、续费入口都必须先锁用户行。不能只锁尚不存在的会员记录，随后假定并发首购已经被阻止。事务账号还须具备实际锁定读所需权限，不能只授予普通查询权限而忽略 `FOR UPDATE` 的授权要求。
+
+| 当前权益 | 本次处理 |
+| --- | --- |
+| 无会员记录 | 类型为 `10` 开通；新生效时间为 `t`，新到期时间为 `t + 订单快照时长`；变更前的等级和两个时间均为 SQL `NULL` |
+| 同级且未到期 | 类型为 `20` 续费；保留原生效时间，新到期时间为 `原到期时间 + 订单快照时长` |
+| 同级且已到期 | 类型为 `20` 续费；新生效时间为 `t`，新到期时间为 `t + 订单快照时长` |
+
+统一的到期计算为：`new_expired_at = max(t, before_expired_at) + duration_seconds`；首购时基准为 `t`。未来生效、未知等级或不同等级等不符合本例规则的数据应作为异常处理，不能直接覆盖等级。应用先校验时长和计算范围，再做时间运算，不能无检查地将任意 `BIGINT` 秒数转换成 Go `time.Duration`。
+
+当前权益只执行下列一个分支；首购时生成新的会员记录 ID，续费沿用当前会员记录 ID：
+
+```sql
+-- 首次开通分支
+INSERT INTO user_service.user_membership (
+    id, user_id, membership_level,
+    effective_at, expired_at, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- 续费分支
+UPDATE user_service.user_membership
+SET membership_level = ?,
+    effective_at = ?,
+    expired_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND user_id = ?;
+```
+
+随后插入变更记录，并更新订单，两条 SQL 与上面的当前权益写入使用同一个事务：
+
+```sql
+INSERT INTO user_service.membership_change_record (
+    id, user_id, membership_id, order_id, change_type,
+    before_membership_level, before_effective_at, before_expired_at,
+    after_membership_level, after_effective_at, after_expired_at,
+    created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+UPDATE order_service.membership_order
+SET payment_status = 20,
+    payment_transaction_no = ?,
+    paid_at = ?,
+    fulfilled_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND payment_status = 10
+  AND payment_channel = ?;
+```
+
+每笔成功履约的会员写入、历史插入和订单条件更新均必须影响一行。`UNIQUE(order_id)` 防止同单重复历史；渠道与流水的唯一键防止同一笔成功支付用于不同订单。任何重复键错误都回滚本次完整事务，核对后再决定返回结果，不吞错继续提交。
+
+例如，按上述固定时长计算，以下时间均为 UTC：
+
+| 操作 | 处理时刻 | 原到期时间 | 新到期时间 |
+| --- | --- | --- | --- |
+| 首次开通 | 2026-11-02 02:00:00.000 | 无 | 2026-12-02 02:00:00.000 |
+| 未到期续费 | 2026-11-12 02:00:00.000 | 2026-12-02 02:00:00.000 | 2027-01-01 02:00:00.000 |
+| 重复通知第一笔订单 | 任意后续处理时刻 | 当前权益可能已被第二笔订单延长 | 不变，不再次增加 30 天 |
+
+重复回调核对的是原订单与对应历史，而不是要求当前权益仍等于那笔历史的变更后值。后续续费可以合法改变当前权益。会员是否已到期由查询时刻判断，不靠后台把会员行删除或将等级改成零。
+
+**未收到回调时核对支付结果**
+
+定时任务在订单库按创建时间分段、分页读取仍待支付的订单，再到渠道查询结果。渠道确认支付成功时，调用上面同一个受控支付确认模块；确认仍未支付时保留待支付状态，不由核对任务绕过权益流程直接修改订单状态。
+
+```sql
+SELECT id, order_no, payment_channel, created_at
+FROM order_service.membership_order
+WHERE payment_status = 10
+  AND created_at >= ?
+  AND created_at < ?
+ORDER BY created_at ASC, id ASC
+LIMIT 100;
+```
+
+继续分页使用对应的 `created_at + id` 升序游标。每轮核对必须覆盖仍未确认的旧订单，不能永久跳过此前查到未支付的订单；调用频率按渠道限流和履约恢复要求确定。网络查询仍放在事务外，所有本地履约都复用同一订单幂等和锁定流程。
+
+### 4.4 关键查询、索引与数据核对
+
+#### 4.4.1 查询当前会员权益
+
+```sql
+SELECT id, user_id, membership_level, effective_at, expired_at
+FROM user_service.user_membership
+WHERE user_id = ?;
+```
+
+没有记录表示尚未开通；有记录时，应用以同一次 UTC 查询时刻判断 `effective_at <= t AND t < expired_at`。到期不删除记录，新的购买仍按 4.3.5 续费规则处理。
+
+#### 4.4.2 查询关注列表和粉丝列表
+
+以下列表只展示当前启用的对端用户，用户停用不等同于解除关注。当前调用用户身份由鉴权入口确认。
+
+```sql
+-- 我的关注
+SELECT f.id AS follow_id,
+       u.id AS followed_user_id,
+       u.user_name,
+       f.created_at AS followed_at
+FROM user_service.user_follow AS f
+JOIN user_service.user_profile AS u ON u.id = f.followed_user_id
+WHERE f.follower_user_id = ?
+  AND u.is_enabled = 1
+ORDER BY f.created_at DESC, f.id DESC
+LIMIT 20;
+
+-- 我的粉丝
+SELECT f.id AS follow_id,
+       u.id AS follower_user_id,
+       u.user_name,
+       f.created_at AS followed_at
+FROM user_service.user_follow AS f
+JOIN user_service.user_profile AS u ON u.id = f.follower_user_id
+WHERE f.followed_user_id = ?
+  AND u.is_enabled = 1
+ORDER BY f.created_at DESC, f.id DESC
+LIMIT 20;
+```
+
+两个方向分别使用以 `follower_user_id`、`followed_user_id` 开头的列表索引。组合唯一索引负责防止重复关注，不能仅因其首列相同就认定列表排序索引无用。
+
+#### 4.4.3 查询帖子和用户点赞列表
+
+全站帖子列表不读取大正文：
+
+```sql
+SELECT id, author_user_id, title, like_count, created_at
+FROM post_service.post
+WHERE deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+作者帖子列表增加明确的作者条件，使用相应联合索引：
+
+```sql
+SELECT id, author_user_id, title, like_count, created_at
+FROM post_service.post
+WHERE author_user_id = ?
+  AND deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+“我点赞的帖子”表示用户尚未取消点赞、且帖子目前未删除的结果：
+
+```sql
+SELECT l.id AS like_id,
+       p.id AS post_id,
+       p.title,
+       p.like_count,
+       l.created_at AS liked_at
+FROM post_service.post_like AS l
+JOIN post_service.post AS p ON p.id = l.post_id
+WHERE l.user_id = ?
+  AND p.deleted_at IS NULL
+ORDER BY l.created_at DESC, l.id DESC
+LIMIT 20;
+```
+
+`post_like` 不使用软删除，因此不添加 `l.deleted_at`。在同一条 SQL 中关联、过滤和分页，不能先取一页点赞记录再由应用过滤已删除帖子。
+
+上述 SQL 是第一页。继续读取点赞列表时，在原 `WHERE` 条件中增加以下游标条件，参数来自上一页最后一条结果的 `liked_at`、`like_id`：
+
+```sql
+AND (
+    l.created_at < ?
+    OR (l.created_at = ? AND l.id < ?)
+)
+```
+
+前两个时间参数传相同值，保留原排序和 `LIMIT`。关注、帖子、订单和权益历史列表也使用各自记录的 `created_at + id` 作为游标。接口中的雪花 ID 按 2.6 使用十进制字符串，不能经过浮点数转换。
+
+列表总数采用与列表相同的关联、权限和状态条件。例如可见点赞帖子的数量：
+
+```sql
+SELECT COUNT(*) AS visible_post_count
+FROM post_service.post_like AS l
+JOIN post_service.post AS p ON p.id = l.post_id
+WHERE l.user_id = ?
+  AND p.deleted_at IS NULL;
+```
+
+这些是实时列表，跨页和分开执行的总数查询不承诺固定快照。某用户有大量点赞指向已删除帖子时，返回 20 条结果可能需要检查更多点赞；必须用代表性数据验证，不能把 `LIMIT 20` 理解为只访问 20 行。
+
+#### 4.4.4 查询订单和权益变更历史
+
+```sql
+SELECT id, order_no, membership_level, duration_seconds,
+       payable_amount, currency_code, payment_status,
+       paid_at, fulfilled_at, created_at
+FROM order_service.membership_order
+WHERE user_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+SELECT id, order_id, change_type,
+       before_membership_level, before_effective_at, before_expired_at,
+       after_membership_level, after_effective_at, after_expired_at,
+       created_at
+FROM user_service.membership_change_record
+WHERE user_id = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+订单展示购买内容及支付履约结果，历史展示每次权益变化，两者不互相覆盖。用户服务需要展示订单号等信息时，通过订单服务按授权提供，不自行进行跨库 JOIN。
+
+#### 4.4.5 核对点赞数与索引效果
+
+以下查询核对单篇帖子，包含被软删除但仍保留关系的帖子：
+
+```sql
+SELECT p.id,
+       p.like_count,
+       COUNT(l.id) AS actual_like_count
+FROM post_service.post AS p
+LEFT JOIN post_service.post_like AS l ON l.post_id = p.id
+WHERE p.id = ?
+GROUP BY p.id, p.like_count;
+```
+
+没有点赞时 `COUNT(l.id)` 为零；不能改成 `COUNT(*)`，否则 LEFT JOIN 产生的空匹配行也会被计入。没有帖子时返回空结果，不等于帖子点赞数为零。发现差异后按 4.3.4 的锁定和修复流程处理。
+
+各索引的验证目标如下；具体计划按第 3 章在实际规模的数据上检查：
+
+| 索引 | 支持的操作 |
+| --- | --- |
+| `user_profile` 的账户身份联合唯一索引 | 注册或登录时定位固定账户对应的用户，防止同一外部身份重复注册 |
+| `user_membership` 的 `UNIQUE(user_id)` | 定位当前权益，并保证每用户至多一条 |
+| `user_follow` 的组合唯一索引 | 识别当前关注关系，防止重复建立 |
+| `user_follow` 两个方向的列表索引 | 按建立时间查询关注或粉丝 |
+| `post` 的作者与删除时间联合索引 | 查询某作者的可见帖子列表 |
+| `post` 的删除时间与创建时间联合索引 | 查询全站可见帖子列表 |
+| `post_like` 的组合唯一索引 | 识别当前点赞、按帖子统计和清理关系 |
+| `post_like` 的用户列表索引 | 按点赞时间取用户列表，并从索引取得关联帖子 ID |
+| `membership_order` 的两个唯一索引 | 定位订单、防止业务订单号及渠道成功支付重复 |
+| `membership_order` 与 `membership_change_record` 的用户列表索引 | 查询订单和权益变化的时间顺序 |
+| `membership_order` 的支付状态与创建时间索引 | 分段查询待支付订单，核对丢失回调或结果未知的支付 |
+| `membership_change_record` 的 `UNIQUE(order_id)` | 定位某次履约结果，防止同单重复历史 |
+
+### 4.5 执行约定与公共能力
+
+本节汇总业务 SQL 落地时的共同要求，与前面的各条流程一起执行。
+
+#### 4.5.1 SQL 与事务执行约定
+
+1. `?` 是 Go 驱动参数占位符，各参数由应用校验后绑定；本章 SQL 块不是可以一次发送的多语句请求，连接仍保持 `multiStatements=false`。
+2. 一个业务事务内的查询、加锁和写入全部使用同一个 `sql.Tx`，由应用调用 `Commit` 或 `Rollback`。SQL 块中的互斥分支只执行符合条件的一支。
+3. ID 在创建前通过统一组件分配；同次创建重试复用已分配 ID，新业务操作生成新 ID。
+4. 时间由应用转换为 UTC 并截断到毫秒。一笔写入使用明确的处理时刻 `t`；渠道支付时间另行解析，不能用处理时间冒充支付时间。
+5. 任一业务检查或 SQL 失败，显式回滚整个事务。实际新增、删除及条件更新按对应流程检查影响行数；幂等空操作单独处理，不盲目执行后续计数。
+6. 死锁、锁等待超时和重复键错误按事务边界处理；重试前核对业务幂等结果。提交报错时结果可能未知，先在主实例核对订单或原请求结果，不能直接换新 ID 重做。参见 [InnoDB 错误处理](https://dev.mysql.com/doc/refman/8.4/en/innodb-error-handling.html)。
+
+#### 4.5.2 公共组件与请求幂等
+
+本章各写入流程均先完成身份、权限及参数校验，再进入业务事务。普通服务不得为了校验用户而自行获取跨库写权限；跨服务用户状态由鉴权或用户服务提供，本例不实现用户停用状态的跨服务即时撤销协议。
+
+本例要求应用提供统一发号、认证鉴权、时间处理和持久化请求幂等能力。七张表是业务表清单，不包含这些公共组件的技术表或实现。公共幂等组件在各服务自己的库内保存技术回执，复用当前事务；实现统一不等于把回执集中写入另一个库。
+
+本例用户发起的写入，包括注册、资料修改、关注、发帖、点赞、删帖、恢复和创建订单，都通过公共幂等入口执行。幂等组件必须满足以下契约：
+
+- 请求携带稳定的 `request_id`，按调用者、操作类型和请求标识识别一次操作，并核对目标资源及参数；同一标识携带不同内容时拒绝执行。注册调用者使用已验证的外部账户身份识别，其他用户操作使用内部用户 ID。
+- 请求处理结果持久化，且可与业务写入使用同一个 `sql.Tx` 原子提交。已完成请求重试时返回原操作回执，不重新执行写入；回执不是当前业务状态，当前状态通过查询取得。
+- 明确回执保留窗口；窗口之外的旧请求不得直接当作新请求执行。当前关系的组合唯一键、进程内记录或临时缓存锁都不能替代这项能力。
+- 本例要求客户端对同一关系顺序提交操作，前一次结果确认后再提交新的建立或解除操作；超时先用原请求标识核对或重试，不更换标识绕过未确认结果。不同请求的业务顺序不能只靠去重保证；需要处理乱序命令的应用，应另行设计命令序号或版本校验。
+
+4.3 展示业务写入部分。公共幂等组件的建表与实现不在本章中；未接入满足上述契约的组件，不能宣称七张业务表本身已经防住“取消后重放旧点赞请求”。幂等与迟到请求的背景可参见 [AWS 幂等接口设计说明](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/)。
+
+### 4.6 评审清单
+
+#### 4.6.1 模型与 DDL
+
+- [ ] 三库位于同一应用、同一环境的 RDS 主实例，库归属、普通访问与受控事务权限清楚。
+- [ ] 七张表的行粒度与 4.1 一致；会员记录是当前状态，变更记录是逐次历史，关注与点赞是当前关系。
+- [ ] 每张表都有独立的正数雪花 `BIGINT` 主键，不存在 `AUTO_INCREMENT`、无符号整数、物理外键或 `CHECK`；业务规则未转移到触发器或存储过程。
+- [ ] 三库与七表均显式声明 `utf8mb4`、`utf8mb4_0900_bin`，每张表都使用 InnoDB，字符列按规则继承。
+- [ ] 字段名、索引名和注释准确说明角色、范围、单位及 UTC 语义；字段容量与接口契约一致。
+- [ ] 时间列统一 `DATETIME(3)`，没有 `TIMESTAMP` 类型；所有实际连接及应用写入均按基线使用 UTC。
+- [ ] 必填字段没有虚假默认值；未支付时间、未知流水、未提供头像及首购前值使用有说明的 SQL `NULL`。
+- [ ] 外部账户身份、当前权益、关注、点赞、订单与成功流水的唯一性范围正确，创建和解除流程不会绕过这些约束。
+- [ ] 只有帖子使用软删除；当前关注、当前点赞不设置删除标记；订单与权益历史不因帖子或用户停用而清理。
+- [ ] Go 映射符合 2.6，内部雪花 ID 为 `int64`，外部账户原始标识为 `string`；可空列使用规定的 `sql.Null*`，GORM 主键声明 `autoIncrement:false`。
+- [ ] 新增公共业务词已按 1.5 记录含义，模型与受控 SQL 迁移一致，生产启动不执行 `AutoMigrate`。
+
+#### 4.6.2 业务与并发
+
+| 检查场景 | 预期结果 |
+| --- | --- |
+| 同一外部账户用不同请求并发注册 | 最多创建一个用户，返回同一用户身份；不覆盖原资料、不自动启用已停用账户 |
+| 并发关注、重复关注与自关注 | 相同有向关系最多一条，反向关注不受影响；自关注被应用拒绝 |
+| 取消后再次关注或点赞 | 当前关系物理删除，新的主动操作生成新关系 ID；旧请求重放只返回原回执，不重建关系 |
+| 两个用户同时互相关注 | 两个入口按相同用户 ID 顺序加锁，避免因相反加锁顺序制造死锁 |
+| 并发点赞、取消与计数 | 每次实际关系变化只调整一次计数；重复请求不调整，正常完成后计数与关系一致 |
+| 删帖与点赞同时发生 | 通过同一帖子锁串行处理；删除后新互动失败，不留下绕过状态检查的新关系 |
+| 删除、恢复帖子 | 删除时保留原关系和计数；恢复只恢复仍存在的关系，已取消点赞不复活 |
+| 删除、恢复后的旧请求重放 | 原请求只返回原回执；旧删除不再次删除已恢复帖子，旧恢复不重新恢复后来再次删除的帖子 |
+| 计数重建期间发生互动 | 修复遵守同一帖子锁，不以旧统计结果覆盖并发变化 |
+| 两笔订单并发首购或续费 | 先锁用户再处理会员，每用户最多一行，每笔成功订单只增加一次快照时长 |
+| 首购、未到期续费、过期续费 | 当前权益、前后历史及时间边界分别符合 4.3.5；固定 30 天不按自然月计算 |
+| 同单重复回调、续费后的旧回调 | 核对原流水和历史后返回既有结果，不再次延长，也不要求当前到期时间等于旧历史 |
+| 渠道已支付但回调未到达 | 支付核对任务查到成功后复用同一确认模块，补齐订单、权益和历史；与回调并发也只发放一次 |
+| 同一渠道流水用于不同订单 | 数据库唯一键拒绝第二次确认，会员和历史写入一起回滚 |
+| 回调金额、币种、商户或订单身份不符 | 不修改订单与权益，按渠道核验结果处理异常 |
+| 当前权益、历史或订单更新任一步失败 | 整个本地事务回滚，不提交部分业务结果 |
+| 提交结果未知、死锁或锁超时 | 核对原请求或订单结果，再按完整事务规则处理，不盲目补发权益或更换 ID |
+| 用户停用后收到成功支付回调 | 按原订单履约并保留历史，不重新启用用户，不暂停会员期限 |
+
+#### 4.6.3 查询与上线验收
+
+- [ ] 注册、首次购买、续费、关注、点赞、删除与恢复的数据准备可以串起完整场景，所有参数均来自真实校验入口。
+- [ ] 用户列表、粉丝、帖子、点赞、订单和权益历史均有对应查询依据；排序包含唯一 ID，分页和总数采用相同过滤口径。
+- [ ] “我点赞的帖子”在 SQL 内关联并过滤帖子删除状态，返回游标所需的点赞 ID 与时间，不在取页后再由应用删减结果。
+- [ ] 使用热点用户、大量已删帖关系、同毫秒多条记录等代表性数据验证执行计划和耗时；不凭索引存在就认定达标。
+- [ ] 普通跨服务资料通过服务接口或应用组合，跨库写入仅由已授权的支付确认模块执行，回调和核对任务共用该模块。
+- [ ] 公共幂等组件能与业务写入原子持久化回执，已测试重复请求、取消后的旧请求、参数冲突及回执过期；没有该能力时不得勾选通过。
+- [ ] 已核对 RDS 参数、实际会话、TLS 连接及库表定义，并按第 3 章完成 DDL 执行方式、资源和恢复方案评审。
+- [ ] 上线后的监控能够发现支付成功但未完成履约、计数不一致和异常重试，并有明确的核对与修复入口。
