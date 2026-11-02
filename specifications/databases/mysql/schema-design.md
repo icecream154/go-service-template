@@ -892,6 +892,8 @@ result := db.Model(&UserProfile{}).
 
 表结构以受版本管理和评审的 SQL 迁移为准，Go 模型必须同步维护。生产环境禁止在应用启动时自动执行 `AutoMigrate`；这是公司的变更管理要求，避免运行时自动推导替代已评审的 DDL。
 
+新需求涉及结构调整、兼容发布、存量数据处理或归档清理时，按 [MySQL 变更与数据维护规范](change-and-maintenance.md)执行。
+
 上线前应核对目标库的 `SHOW CREATE TABLE`，确认字段类型、精度、默认值、主键、唯一约束和 Go 映射一致，且不存在物理外键及 `CHECK` 约束；GORM 标签不等于目标库已经具备相应定义。历史表整改应先确保应用已接管相关校验，再通过受控 SQL 迁移移除这些约束。参见 [GORM 迁移说明](https://gorm.io/docs/migration.html)。
 
 ## 3. 索引设计

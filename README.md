@@ -1,6 +1,6 @@
 # Go 后端工程规范与框架示例
 
-以 `moralspace-tennis-backend` 为参考，实现从应用初始化到健康请求响应、退出清理的完整链路。框架规范见 [应用基线](specifications/application/baseline.md)，数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)。
+以 `moralspace-tennis-backend` 为参考，实现从应用初始化到健康请求响应、退出清理的完整链路。框架规范见 [应用基线](specifications/application/baseline.md)，数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。
 
 ## 启动
 
