@@ -105,7 +105,7 @@ CREATE DATABASE service_db
     COLLATE utf8mb4_0900_bin;
 
 CREATE TABLE service_db.baseline_example (
-    id BIGINT NOT NULL COMMENT '示例主键',
+    id BIGINT NOT NULL COMMENT '示例主键，应用通过雪花算法生成',
     business_code VARCHAR(64) NOT NULL COMMENT '示例业务编码',
     PRIMARY KEY (id)
 ) ENGINE=InnoDB
@@ -114,7 +114,7 @@ CREATE TABLE service_db.baseline_example (
   COMMENT='基线属性示例表';
 ```
 
-示例中的 `business_code` 继承表配置，实际使用 `utf8mb4` 和 `utf8mb4_0900_bin`；数值字段 `id` 不适用字符比较规则。该示例只展示基础属性，主键生成方式和字段长度按业务设计。阿里云支持上述字符集与比较规则组合，参见 [RDS 字符集与比较规则配置](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/modify-the-character-set-server-and-collation-server-parameters)。
+示例中的 `business_code` 继承表配置，实际使用 `utf8mb4` 和 `utf8mb4_0900_bin`；数值字段 `id` 不适用字符比较规则。业务主键统一由应用通过雪花算法生成，具体要求遵守 [MySQL 库表设计规范](schema-design.md)。该示例只展示基础属性，字段长度按业务设计。阿里云支持上述字符集与比较规则组合，参见 [RDS 字符集与比较规则配置](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/modify-the-character-set-server-and-collation-server-parameters)。
 
 ## 时区与时间语义
 
