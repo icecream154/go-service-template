@@ -26,9 +26,9 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 临时插入单条用户资料 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
-当前 `bootstrap.Init` 保留单条临时用户写入：每次成功启动仅在 `user_service.user_profile` 新增 1 条资料，使用 `startup_test` 身份空间。验证结束后应移除此段临时启动写入。
+当前 `bootstrap.Init` 中的临时用户插入代码已注释，启动不写入用户数据。
 
 ## 请求与响应
 
@@ -43,6 +43,28 @@ curl -i http://localhost:8080/health
 ```
 
 健康检查表示 HTTP 进程存活；数据库在启动时校验，此接口不会持续探测数据库。
+
+`GET /users/:user_id` 按内部用户 ID 查询基本资料。路径参数须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
+
+```sh
+curl -i http://localhost:8080/users/1234567890123456789
+```
+
+查询成功返回 HTTP 200：
+
+```json
+{"user_id":"1234567890123456789","user_name":"Example User","avatar_url":null}
+```
+
+`user_id` 在 JSON 中使用十进制字符串，避免雪花 ID 精度丢失。`avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。
+
+| 情况 | HTTP 状态 | JSON 响应 |
+| --- | --- | --- |
+| ID 格式错误、非正数或超出 int64 范围 | 400 | `{"error":"user_id must be a positive 64-bit integer"}` |
+| 用户资料不存在 | 404 | `{"error":"user profile not found"}` |
+| 查询或其他内部错误 | 500 | `{"error":"internal server error"}` |
+
+调用链为 Controller → Service → Repository。Controller 解析路径参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，仅输出用户 ID、昵称和头像。
 
 ## 数据库连接
 

@@ -17,10 +17,12 @@ import (
 	"syscall"
 	"time"
 
+	usercontroller "go-service-template/app/domains/user/controller"
+	userrepository "go-service-template/app/domains/user/repository"
+	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/bootstrap"
 	"go-service-template/env"
-
-	"github.com/gin-gonic/gin"
+	"go-service-template/routers"
 )
 
 // main 将系统信号转换为取消通知，并在 run 完成全部清理后决定进程退出码。
@@ -104,16 +106,21 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
+	// 使用普通 user 连接装配仓储、Service 和 Controller，随后注册路由。
+	// 此连接不绑定已经取消的 startupCtx；连接池仍由上面的 Runtime.Close 统一关闭。
+	userDB, err := runtime.Databases.Get("user")
+	if err != nil {
+		return fmt.Errorf("get user database for HTTP routes: %w", err)
+	}
+	userProfileRepository := userrepository.NewUserProfileRepository(userDB)
+	userProfileService := userservice.NewUserProfileService(userProfileRepository)
+	userProfileController := usercontroller.NewUserProfileController(userProfileService)
+	router := routers.New(userProfileController)
+
 	// 只有环境、配置文件以及全部启用的数据库连接都初始化成功后，才打印成功日志。
 	// 此日志描述应用依赖已就绪；HTTP 是否成功监听由后面的独立日志说明。
 	deployment := env.Current()
 	log.Printf("Application initialized successfully: environment=%s region=%s", deployment.Environment, deployment.Region)
-
-	// 保留现有的存活检查路由。数据库已在启动阶段检查，这个接口不在每次请求时查库。
-	router := gin.Default()
-	router.GET("/health", func(ctx *gin.Context) {
-		ctx.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
 
 	// 显式创建 listener 使端口占用等错误直接返回 run，并触发数据库的 defer 清理。
 	// 成功后将 listener 的关闭责任交给 serve，避免路由组件自行创建和持有数据库资源。
