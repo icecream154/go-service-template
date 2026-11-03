@@ -108,11 +108,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 
 	// 使用普通 user 连接装配仓储、Service 和 Controller，随后注册路由。
 	// 此连接不绑定已经取消的 startupCtx；连接池仍由上面的 Runtime.Close 统一关闭。
-	userDB, err := runtime.Databases.Get("user")
-	if err != nil {
-		return fmt.Errorf("get user database for HTTP routes: %w", err)
-	}
-	userProfileRepository := userrepository.NewUserProfileRepository(userDB)
+	userProfileRepository := userrepository.NewUserProfileRepository(runtime.UserDB)
 	userProfileService := userservice.NewUserProfileService(userProfileRepository)
 	userProfileController := usercontroller.NewUserProfileController(userProfileService)
 	router := routers.New(userProfileController)

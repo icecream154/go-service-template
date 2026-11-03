@@ -28,7 +28,7 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
-当前 `bootstrap.Init` 中的临时用户插入代码已注释，启动不写入用户数据。
+当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
 
 ## 请求与响应
 
@@ -70,19 +70,16 @@ curl -i http://localhost:8080/users/1234567890123456789
 
 现有普通连接为 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。另有通用的 `transaction` 连接，不选择默认库，供同一 MySQL 实例中授权范围相同的跨库流程使用。即使地址和账号相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
 
-`bootstrap.Init(ctx, configDir)` 成功返回 `Runtime`，装配业务服务时传入相应连接：
+`bootstrap.Init(ctx, configDir)` 负责加载环境与配置，再由 `runtime.go` 内的 `newRuntime` 创建资源。成功返回后，通过 `Runtime.UserDB`、`PostDB` 和 `OrderDB` 直接访问三个业务库的连接池入口，装配业务服务时传入相应连接：
 
 ```go
-userDB, err := runtime.Databases.Get("user")
-if err != nil {
-    return err
-}
+userDB := runtime.UserDB
 // 将 userDB 传给对应表的仓储构造函数，例如 NewUserProfileRepository(userDB)。
 ```
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
 
-使用通用事务池时，从 `Get("transaction")` 取得连接，在业务入口显式 `Begin`，将同一个 `tx` 传给所有数据库操作，全部成功后 `Commit`，失败则 `Rollback`。`NewUserProfileRepository(tx)` 由仓储内部定位用户表；直接使用 GORM 操作其他表时，需明确指定完整库表名，例如 `order_service.membership_order`。同一授权范围内的流程可以复用这个池；每次 `Begin` 都是独立事务，各自提交和回滚。
+事务由每次业务操作显式 `Begin` 创建，将同一个 `tx` 传给所有参与的数据库操作，全部成功后 `Commit`，失败则 `Rollback`。连接池按进程复用，事务不保存在 `Runtime` 中。`NewUserProfileRepository(tx)` 由仓储内部定位用户表；直接使用 GORM 操作其他表时，需明确指定完整库表名，例如 `order_service.membership_order`。
 
 `DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
 
