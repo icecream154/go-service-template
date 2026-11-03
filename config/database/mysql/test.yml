@@ -45,7 +45,7 @@ Gormv2:
             # 此开关要求客户端使用 TLS；RDS 控制台还须为上述连接地址提前开启 SSL。
             Enabled: true
             # 相对路径以本 test.yml 所在目录解析，使用证书包中的 PEM 链；不使用 JKS 或 P7B。
-            CAFile: "Test-ApsaraDB-CA-Chain/Test-ApsaraDB-CA-Chain.pem"
+            CAFile: "Test-ApsaraDB-CA-Chain/ApsaraDB-CA-Chain.pem"
             # 校验实际连接域名的服务器证书，不能把 CA 证书的名称当成服务器主机名。
             ServerName: "rm-wz94z8n0ac1rnc3teno.mysql.rds.aliyuncs.com"
             MinVersion: "1.2"

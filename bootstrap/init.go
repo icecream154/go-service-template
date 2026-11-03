@@ -60,6 +60,34 @@ func Init(ctx context.Context, configDir string) (*Runtime, error) {
 		return nil, fmt.Errorf("initialize MySQL connections: %w", err)
 	}
 
+	//// 临时验证：数据库就绪后，每次启动向用户资料表新增一条记录；验证结束后删除此段。
+	//// 通过普通 user 连接写入，完整库表名由 UserProfileRepository 内部维护。
+	//userDB, err := databases.Get("user")
+	//if err != nil {
+	//	return nil, errors.Join(fmt.Errorf("get user database for temporary insert: %w", err), databases.Close())
+	//}
+	//// 当前尚未接入统一发号组件，临时生成随机正数 ID，便于重复启动观察新增记录。
+	//// 这不是正式的 Snowflake 发号方案，正式业务应替换为统一 ID 生成器。
+	//randomID, err := rand.Int(rand.Reader, big.NewInt(1<<63-1))
+	//if err != nil {
+	//	return nil, errors.Join(fmt.Errorf("generate temporary user profile ID: %w", err), databases.Close())
+	//}
+	//profile := &usertables.UserProfile{
+	//	ID:                randomID.Int64() + 1,
+	//	AccountSource:     "startup_test",
+	//	ExternalAccountID: fmt.Sprintf("startup_test_%s", randomID.String()),
+	//	UserName:          "Startup Test User",
+	//	IsEnabled:         true,
+	//	Version:           0,
+	//}
+	//// 使用独立的 startup_test 身份空间区分临时数据；头像零值保存为 SQL NULL。
+	//// 创建和更新时间由仓储填写为 UTC 毫秒，启动 context 限制本次写入的等待时间。
+	//// 写入失败时先关闭本次创建的全部连接池，再把原始原因及清理错误一并返回。
+	//if err := userrepository.NewUserProfileRepository(userDB.WithContext(ctx)).CreateProfile(profile); err != nil {
+	//	return nil, errors.Join(fmt.Errorf("insert temporary startup user profile: %w", err), databases.Close())
+	//}
+	//log.Printf("Temporary startup user profile inserted: id=%d", profile.ID)
+
 	return &Runtime{Databases: databases}, nil
 }
 

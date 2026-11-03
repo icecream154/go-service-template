@@ -26,9 +26,9 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 临时插入及跨库事务示例 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 临时插入单条用户资料 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
-当前 `bootstrap.Init` 保留临时写入：每次成功启动先独立新增一位用户，再通过一个跨库事务新增另一位用户及其待支付订单。事务内两条记录一起提交或回滚；前面的独立插入不属于该事务。验证结束后应移除这两段临时启动写入。
+当前 `bootstrap.Init` 保留单条临时用户写入：每次成功启动仅在 `user_service.user_profile` 新增 1 条资料，使用 `startup_test` 身份空间。验证结束后应移除此段临时启动写入。
 
 ## 请求与响应
 
@@ -60,7 +60,7 @@ if err != nil {
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
 
-`init` 中的跨库示例从 `Get("transaction")` 取得连接，再按 `Begin → 插入用户 → 插入订单 → Commit` 的过程式顺序执行；任一步写入失败则显式 `Rollback`。两个写入均使用同一个 `tx`；用户表由 `UserProfileRepository` 内部定位，调用方直接 `NewUserProfileRepository(tx)`，无需拼接库表名。订单目前是直接使用 GORM 的临时示例，仍显式指定 `order_service.membership_order`。其他获准的跨库流程可以复用这个池；每次 `Begin` 都是独立事务，各自提交和回滚。
+使用通用事务池时，从 `Get("transaction")` 取得连接，在业务入口显式 `Begin`，将同一个 `tx` 传给所有数据库操作，全部成功后 `Commit`，失败则 `Rollback`。`NewUserProfileRepository(tx)` 由仓储内部定位用户表；直接使用 GORM 操作其他表时，需明确指定完整库表名，例如 `order_service.membership_order`。同一授权范围内的流程可以复用这个池；每次 `Begin` 都是独立事务，各自提交和回滚。
 
 `DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
 
