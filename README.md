@@ -70,11 +70,10 @@ curl -i http://localhost:8080/users/1234567890123456789
 
 现有普通连接为 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。另有通用的 `transaction` 连接，不选择默认库，供同一 MySQL 实例中授权范围相同的跨库流程使用。即使地址和账号相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
 
-`bootstrap.Init(ctx, configDir)` 负责加载环境与配置，再由 `runtime.go` 内的 `newRuntime` 创建资源。成功返回后，通过 `Runtime.UserDB`、`PostDB` 和 `OrderDB` 直接访问三个业务库的连接池入口，装配业务服务时传入相应连接：
+`bootstrap.Init(ctx, configDir)` 负责加载环境与配置，再由 `runtime.go` 内的 `newRuntime` 创建资源。`Runtime.DB` 保存 `User`、`Post`、`Order` 三个业务库入口，`Runtime.Repositories` 保存已初始化的用户领域仓储。装配服务时直接复用：
 
 ```go
-userDB := runtime.UserDB
-// 将 userDB 传给对应表的仓储构造函数，例如 NewUserProfileRepository(userDB)。
+userProfileService := userservice.NewUserProfileService(runtime.Repositories.UserProfile)
 ```
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
@@ -114,6 +113,16 @@ userDB := runtime.UserDB
 `UpdateProfile` 返回 `(rowsAffected int64, err error)`。调用方先处理 `err`，再判断影响行数；`0, nil` 表示 SQL 执行正常但条件未匹配，可能是用户不存在、停用或版本过期，由外层决定业务含义。版本和启用条件仍在 SQL 中原子判断，不能仅依赖写入前的内存检查。
 
 同库或跨库事务中都可直接将 `tx` 传给 `NewUserProfileRepository`，由事务发起方统一提交或回滚；仓储不会切换回普通连接。事务中的创建回填仅表示该语句成功，调用方须在最终提交成功后再对外使用结果；回滚不会自动恢复内存对象。跨库流程仍遵守专用连接和同一事务的规范。
+
+用户领域其余三张表也分别拥有单表仓储，均使用完整库表名、直接返回 `tables` 结构，并保留 `NewXxxRepository(tx)` 的局部事务用法：
+
+| Runtime 中的仓储 | 基础操作 |
+| --- | --- |
+| `Repositories.UserFollow` | 按 ID 或双方用户 ID 查询、创建关注、按关系 ID 和双方用户 ID 物理删除 |
+| `Repositories.UserMembership` | 按 ID 或用户 ID 查询、创建会员权益、按 ID 和用户 ID 更新权益字段 |
+| `Repositories.MembershipChangeRecord` | 按 ID 或订单 ID 查询、追加会员变更历史 |
+
+会员权益到期后保留记录；会员变更历史仅提供查询和追加。各仓储的参数合法性由外层保证，未命中、重复键等错误原样返回，更新和删除同时返回影响行数。
 
 ## 职责与扩展
 

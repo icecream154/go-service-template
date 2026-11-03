@@ -18,7 +18,6 @@ import (
 	"time"
 
 	usercontroller "go-service-template/app/domains/user/controller"
-	userrepository "go-service-template/app/domains/user/repository"
 	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/bootstrap"
 	"go-service-template/env"
@@ -106,10 +105,8 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 使用普通 user 连接装配仓储、Service 和 Controller，随后注册路由。
-	// 此连接不绑定已经取消的 startupCtx；连接池仍由上面的 Runtime.Close 统一关闭。
-	userProfileRepository := userrepository.NewUserProfileRepository(runtime.UserDB)
-	userProfileService := userservice.NewUserProfileService(userProfileRepository)
+	// 复用 Runtime 中的用户资料仓储，创建 Service、Controller 并注册路由。
+	userProfileService := userservice.NewUserProfileService(runtime.Repositories.UserProfile)
 	userProfileController := usercontroller.NewUserProfileController(userProfileService)
 	router := routers.New(userProfileController)
 
