@@ -17,8 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	usercontroller "go-service-template/app/domains/user/controller"
-	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/bootstrap"
 	"go-service-template/env"
 	"go-service-template/routers"
@@ -105,10 +103,8 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 创建 Service、Controller 并注册路由；Service 查询时自行读取默认 Runtime。
-	userProfileService := userservice.NewUserProfileService()
-	userProfileController := usercontroller.NewUserProfileController(userProfileService)
-	router := routers.New(userProfileController)
+	// 默认服务已初始化，路由入口创建各领域控制器并挂载版本化接口。
+	router := routers.New()
 
 	// 只有环境、配置文件以及全部启用的数据库连接都初始化成功后，才打印成功日志。
 	// 此日志描述应用依赖已就绪；HTTP 是否成功监听由后面的独立日志说明。

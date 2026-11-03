@@ -1,4 +1,4 @@
-// Package shared 定义可复用的用户数据结构。
+// Package shared 定义用户 V1 接口复用的数据结构。
 package shared
 
 // UserProfile 表示用户的基本资料，包括内部 ID、展示昵称和头像。

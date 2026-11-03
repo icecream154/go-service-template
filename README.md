@@ -26,7 +26,7 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
 当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
 
@@ -44,10 +44,10 @@ curl -i http://localhost:8080/health
 
 健康检查表示 HTTP 进程存活；数据库在启动时校验，此接口不会持续探测数据库。
 
-`GET /users/:user_id` 按内部用户 ID 查询基本资料。路径参数须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
+`GET /api/v1/users/:user_id` 按内部用户 ID 查询基本资料。路径参数须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
 
 ```sh
-curl -i http://localhost:8080/users/1234567890123456789
+curl -i http://localhost:8080/api/v1/users/1234567890123456789
 ```
 
 查询成功返回 HTTP 200：
@@ -66,6 +66,10 @@ curl -i http://localhost:8080/users/1234567890123456789
 
 调用链为 Controller → Service → Repository。Controller 解析路径参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，仅输出用户 ID、昵称和头像。
 
+顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。`app/domains/user/routers/router.go` 创建并持有用户 Controller，在版本分组下挂载 `/users`。当前用户资料接口只注册版本化路径，不保留 `/users/:user_id` 别名；`/health` 位于版本分组之外。
+
+Controller 与 DTO 放在对应领域的 `controller/v1`、`dto/v1` 中，通用响应字段放在 `dto/v1/shared`。新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、DTO 和注册方法；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
+
 ## 数据库连接
 
 现有普通连接为 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。另有通用的 `transaction` 连接，不选择默认库，供同一 MySQL 实例中授权范围相同的跨库流程使用。即使地址和账号相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
@@ -76,7 +80,9 @@ curl -i http://localhost:8080/users/1234567890123456789
 profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(userID)
 ```
 
-Service 不保存 Repository 字段，使用无参构造函数 `userservice.NewUserProfileService()`；方法内获取默认仓储，执行查询并把表结构转为领域模型。Runtime 只管理 DB 和 Repository，Service、Controller 仍在启动入口装配。服务启动监听前完成初始化，停止业务访问后再调用返回实例的 `Close()`。
+Service 不保存 Repository 字段，方法内获取默认仓储，执行查询并把表结构转为领域模型。Runtime 只管理 DB 和 Repository；`bootstrap.Init` 在 Runtime 初始化后调用 `internal/composition.Init`，统一创建并发布默认 Service。Controller 不保存 Service 字段，处理请求时通过 `composition.Current().UserProfile` 调用默认服务；领域 Router 创建并复用无状态 Controller。`main` 调用无参 `routers.New()` 完成路由注册，不再逐个装配 Service 和 Controller。停止业务访问后，仍由启动入口调用 Runtime 的 `Close()`。
+
+`internal/composition` 只依赖 Service，Service 依赖 `internal/runtime`，Controller 依赖 composition；Runtime 不导入 Service，composition 不导入 Controller，保持包依赖单向。默认服务通过普通指针保存，只在启动阶段由单个协程初始化一次；初始化完成后才启动业务协程，运行期间只读、不替换实例或字段。未初始化时调用 `composition.Current()` 会用英文 panic 提示顺序错误。
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
 
@@ -131,8 +137,12 @@ Service 不保存 Repository 字段，使用无参构造函数 `userservice.NewU
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 加载环境和数据库配置，调用 Runtime 初始化并返回资源清理入口 |
+| `bootstrap` | 加载环境和数据库配置，依次初始化 Runtime、默认 Service，并返回资源清理入口 |
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
+| `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
+| `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
+| `app/domains/*/routers` | 创建领域 Controller，在指定版本组中注册领域接口 |
+| `app/domains/*/controller/v1`、`dto/v1` | V1 请求处理与请求、响应数据结构 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |
 | `internal/database/mysql/config.go` | 选择并解码 YAML、展开环境变量、组织校验 |
 | `internal/database/mysql/types.go` | 配置结构、YAML 字段映射与逐项含义 |
@@ -152,5 +162,3 @@ go vet ./...
 ```
 
 测试覆盖现有 YAML 的锚点继承、环境变量展开及错误脱敏、配置校验、驱动与 TLS 参数、失败资源释放和连接管理并发访问。单元测试不依赖正在运行的 MySQL；完整启动、HTTP 响应和退出清理还应使用实际 MySQL 8.4 验证。
-
-`user_profile_repository_test.go` 使用 sqlmock 和真实 GORM MySQL 方言，覆盖表结构直接读写、账户参数绑定、`NULL` 与空串、版本及启用条件、创建失败保护和错误原因保留，不依赖正在运行的数据库。

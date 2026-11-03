@@ -5,15 +5,17 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
 	"go-service-template/env"
+	"go-service-template/internal/composition"
 	"go-service-template/internal/database/mysql"
 	appruntime "go-service-template/internal/runtime"
 )
 
-// Init 按环境配置、数据库配置、数据库连接的顺序初始化应用依赖。
+// Init 按环境配置、数据库配置、数据库连接和业务服务的顺序初始化应用依赖。
 //
 // ctx 必须非 nil，启动入口负责为它设置初始化时限，并在初始化结束后释放计时器。
 // 此 context 会传递给数据库连接建立与连接检查，用于取消启动或限制等待时间；
@@ -27,6 +29,7 @@ import (
 // 必须先完成 env.Init 才能调用 env.Current。环境配置成功后即保存在环境单例中；
 // 后续数据库初始化失败不会回滚该单例，但不会返回部分可用的 Runtime。
 // Runtime 的创建、失败清理及默认实例发布由 appruntime.Init 完成。
+// 随后由 composition.Init 创建默认服务；该步骤失败时关闭已经创建的连接池。
 // 成功返回后，调用方负责最终 Close。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
 func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
@@ -42,5 +45,13 @@ func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load MySQL configuration: %w", err)
 	}
-	return appruntime.Init(ctx, config)
+	runtime, err := appruntime.Init(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	// 服务装配成功前不向调用方交付资源；装配失败仍须释放已初始化的连接池。
+	if err := composition.Init(); err != nil {
+		return nil, errors.Join(fmt.Errorf("initialize application services: %w", err), runtime.Close())
+	}
+	return runtime, nil
 }

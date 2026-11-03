@@ -1,5 +1,5 @@
-// Package controller 实现用户相关的 HTTP 请求处理。
-package controller
+// Package v1 实现用户 V1 接口的 HTTP 请求处理。
+package v1
 
 import (
 	"errors"
@@ -7,31 +7,28 @@ import (
 	"net/http"
 	"strconv"
 
-	"go-service-template/app/domains/user/dto"
-	"go-service-template/app/domains/user/service"
+	userv1dto "go-service-template/app/domains/user/dto/v1"
+	"go-service-template/internal/composition"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
 // UserProfileController 处理用户资料请求，并将领域模型转换为响应 DTO。
-type UserProfileController struct {
-	// userProfiles 提供按内部 ID 查询用户资料的业务操作。
-	userProfiles *service.UserProfileService
+// 结构体不保存 Service 引用或单次请求状态。
+type UserProfileController struct{}
+
+// NewUserProfileController 创建无状态的用户资料控制器，不执行查询。
+func NewUserProfileController() *UserProfileController {
+	return &UserProfileController{}
 }
 
-// NewUserProfileController 使用已有的用户资料服务创建控制器。
-// userProfiles 应为已初始化的有效服务，构造函数只保存依赖。
-func NewUserProfileController(userProfiles *service.UserProfileService) *UserProfileController {
-	return &UserProfileController{userProfiles: userProfiles}
-}
-
-// QueryUserProfileByUserID 处理 GET /users/:user_id。
+// QueryUserProfileByUserID 解析用户 ID、查询领域模型并构造用户资料响应。
 // 路径中的 user_id 按十进制解析为正 int64，格式错误、越界或非正数返回 400。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 	// 路径参数是字符串，显式解析后填入请求 DTO；解析错误时不会继续查询。
-	var request dto.QueryUserProfileByUserIDRequest
+	var request userv1dto.QueryUserProfileByUserIDRequest
 	userID, err := strconv.ParseInt(ctx.Param("user_id"), 10, 64)
 	if err != nil || userID <= 0 {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "user_id must be a positive 64-bit integer"})
@@ -39,7 +36,8 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 	}
 	request.UserID = userID
 
-	profile, err := c.userProfiles.QueryUserProfileByUserID(request.UserID)
+	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
+	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(request.UserID)
 	if err != nil {
 		// 未找到使用固定响应文案；其他错误的具体原因只写入服务端日志。
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -53,7 +51,7 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 
 	// 从领域模型选取响应字段，头像指针保留 nil 与空字符串的区别。
 	// UserID 的 JSON 字符串格式由响应 DTO 的字段标签确定。
-	response := dto.QueryUserProfileByUserIDResponse{
+	response := userv1dto.QueryUserProfileByUserIDResponse{
 		UserID:    profile.ID,
 		UserName:  profile.UserName,
 		AvatarURL: profile.AvatarURL,

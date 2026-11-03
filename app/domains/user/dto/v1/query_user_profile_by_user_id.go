@@ -1,7 +1,7 @@
-// Package dto 定义用户相关接口的请求和响应。
-package dto
+// Package v1 定义用户 V1 接口的请求和响应。
+package v1
 
-import "go-service-template/app/domains/user/dto/shared"
+import "go-service-template/app/domains/user/dto/v1/shared"
 
 // QueryUserProfileByUserIDRequest 表示按内部用户 ID 查询用户资料的请求参数。
 type QueryUserProfileByUserIDRequest struct {
