@@ -1,0 +1,69 @@
+# 生产环境：三个业务库位于同一 RDS 实例，与 dev、test 环境隔离。
+# ${...} 是环境变量占位符；加载器须显式展开字符串字段，缺失或为空时拒绝启动。
+# 此处仅声明配置；TLS、会话参数及 NowFunc 等新增字段须由本项目初始化组件实现。
+# 所有超时、连接寿命、空闲时间和 SlowThreshold 均以秒计。
+# 连接池为单进程、单业务连接的初始参考值；实例额度须覆盖所有应用副本及运维连接。
+Gormv2:
+  Mysql:
+    Connections:
+      user: &connection
+        Enabled: true
+        IsOpenReadDb: false # 当前未配置只读实例，全部查询使用主库。
+        SlowThreshold: 1
+        LogLevel: "warn"
+        Behavior:
+          SkipDefaultTransaction: false
+          PrepareStmt: false
+          SuppressRecordNotFound: false
+          TranslateError: false
+          SingularTable: true
+          DisableForeignKeyConstraintWhenMigrating: true
+          AutoMigrate: false
+          NowFunc:
+            Location: "UTC"
+            Precision: "millisecond"
+        Write: &writer
+          Host: "${PROD_MYSQL_HOST}"
+          Port: 3306
+          DataBase: "user_service"
+          User: "${PROD_MYSQL_USER_USERNAME}"
+          Pass: "${PROD_MYSQL_USER_PASSWORD}"
+          Charset: "utf8mb4"
+          Collation: "utf8mb4_0900_bin"
+          ParseTime: true
+          Loc: "UTC"
+          MultiStatements: false
+          Session:
+            TimeZone: "+00:00"
+            TransactionIsolation: "READ-COMMITTED"
+            Autocommit: 1
+            SQLMode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+          TLS:
+            Enabled: true
+            CAFile: "${PROD_MYSQL_CA_FILE}"
+            ServerName: "${PROD_MYSQL_HOST}"
+            MinVersion: "1.2"
+            InsecureSkipVerify: false
+            AllowFallbackToPlaintext: false
+          SetMaxOpenConns: 20
+          SetMaxIdleConns: 5
+          SetConnMaxLifetime: 180
+          SetConnMaxIdleTime: 60
+          ConnectTimeout: 5
+          ReadTimeout: 10
+          WriteTimeout: 10
+      # 复用连接行为及主库参数，按业务库覆盖库名与账号；账号仅授予本库所需权限。
+      post:
+        <<: *connection
+        Write:
+          <<: *writer
+          DataBase: "post_service"
+          User: "${PROD_MYSQL_POST_USERNAME}"
+          Pass: "${PROD_MYSQL_POST_PASSWORD}"
+      order:
+        <<: *connection
+        Write:
+          <<: *writer
+          DataBase: "order_service"
+          User: "${PROD_MYSQL_ORDER_USERNAME}"
+          Pass: "${PROD_MYSQL_ORDER_PASSWORD}"
