@@ -70,15 +70,17 @@ curl -i http://localhost:8080/users/1234567890123456789
 
 现有普通连接为 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。另有通用的 `transaction` 连接，不选择默认库，供同一 MySQL 实例中授权范围相同的跨库流程使用。即使地址和账号相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
 
-`bootstrap.Init(ctx, configDir)` 负责加载环境与配置，再由 `runtime.go` 内的 `newRuntime` 创建资源。`Runtime.DB` 保存 `User`、`Post`、`Order` 三个业务库入口，`Runtime.Repositories` 保存已初始化的用户领域仓储。装配服务时直接复用：
+`bootstrap.Init(ctx, configDir)` 负责加载环境与配置，再调用 `internal/runtime.Init` 创建资源，全部成功后发布默认实例。`Runtime.DB` 保存 `User`、`Post`、`Order` 三个业务库入口，`Runtime.Repositories` 保存已初始化的用户领域仓储。使用 `appruntime` 别名导入 `internal/runtime`，通过 `appruntime.Current()` 读取默认实例：
 
 ```go
-userProfileService := userservice.NewUserProfileService(runtime.Repositories.UserProfile)
+profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(userID)
 ```
+
+Service 不保存 Repository 字段，使用无参构造函数 `userservice.NewUserProfileService()`；方法内获取默认仓储，执行查询并把表结构转为领域模型。Runtime 只管理 DB 和 Repository，Service、Controller 仍在启动入口装配。服务启动监听前完成初始化，停止业务访问后再调用返回实例的 `Close()`。
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
 
-事务由每次业务操作显式 `Begin` 创建，将同一个 `tx` 传给所有参与的数据库操作，全部成功后 `Commit`，失败则 `Rollback`。连接池按进程复用，事务不保存在 `Runtime` 中。`NewUserProfileRepository(tx)` 由仓储内部定位用户表；直接使用 GORM 操作其他表时，需明确指定完整库表名，例如 `order_service.membership_order`。
+事务由每次业务操作显式 `Begin` 创建，将同一个 `tx` 传给所有参与的数据库操作，全部成功后 `Commit`，失败则 `Rollback`。连接池按进程复用，事务不保存在 `Runtime` 中。`NewUserProfileRepository(tx)` 由仓储内部定位用户表；直接使用 GORM 操作其他表时，需明确指定完整库表名，例如 `order_service.membership_order`。事务内使用局部创建的 Repository；通过 `Current().Repositories` 取得的默认仓储仍使用普通连接，不会自动加入当前事务。需要跨方法共享事务时，显式传递同一个 `tx` 或对应的局部 Repository。
 
 `DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
 
@@ -129,7 +131,8 @@ userProfileService := userservice.NewUserProfileService(runtime.Repositories.Use
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 组织初始化，返回 Runtime 和资源清理入口 |
+| `bootstrap` | 加载环境和数据库配置，调用 Runtime 初始化并返回资源清理入口 |
+| `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |
 | `internal/database/mysql/config.go` | 选择并解码 YAML、展开环境变量、组织校验 |
 | `internal/database/mysql/types.go` | 配置结构、YAML 字段映射与逐项含义 |

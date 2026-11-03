@@ -1,14 +1,24 @@
-package bootstrap
+// Package runtime 创建并保存进程共享的数据库连接和仓储实例。
+package runtime
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	userrepository "go-service-template/app/domains/user/repository"
 	"go-service-template/internal/database/mysql"
 
 	"gorm.io/gorm"
+)
+
+var (
+	// initMu 串行化初始化，防止重复创建连接池和覆盖已发布的实例。
+	initMu sync.Mutex
+	// current 只在完整初始化成功后发布，原子读取不会看到构建中的 Runtime。
+	current atomic.Pointer[Runtime]
 )
 
 // Runtime 按连接和仓储分组持有应用资源。
@@ -45,9 +55,16 @@ type Repositories struct {
 	MembershipChangeRecord *userrepository.MembershipChangeRecordRepository
 }
 
-// newRuntime 创建连接池，获取三个数据库入口，再创建用户领域的仓储。
-// 初始化失败时返回 nil，并关闭本次创建的全部连接池。
-func newRuntime(ctx context.Context, config mysql.Config) (_ *Runtime, err error) {
+// Init 创建连接池、获取三个数据库入口并创建仓储，全部成功后发布默认实例。
+// 每个进程只允许成功初始化一次，重复调用返回错误，不覆盖或关闭已有实例。
+// 初始化失败时返回 nil，释放本次创建的连接池；默认实例仍为空，可重新尝试。
+func Init(ctx context.Context, config mysql.Config) (_ *Runtime, err error) {
+	initMu.Lock()
+	defer initMu.Unlock()
+	if current.Load() != nil {
+		return nil, errors.New("runtime is already initialized")
+	}
+
 	databases, err := mysql.Open(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("initialize MySQL connections: %w", err)
@@ -81,14 +98,25 @@ func newRuntime(ctx context.Context, config mysql.Config) (_ *Runtime, err error
 		UserMembership:         userrepository.NewUserMembershipRepository(runtime.DB.User),
 		MembershipChangeRecord: userrepository.NewMembershipChangeRecordRepository(runtime.DB.User),
 	}
+	// 最后一步才公开默认实例，确保 Current 取得的连接和仓储均已就绪。
+	current.Store(runtime)
 	return runtime, nil
 }
 
-// Close 关闭本进程创建的数据库连接池；调用前应先停止 HTTP 请求和业务任务。
-//
-// 此方法不负责关闭 HTTP 服务，也不负责等待业务协程结束；这些先后关系由 main.run 管理。
-// nil Runtime 或尚无数据库资源时可安全调用，数据库管理器也允许重复关闭。
-// 关闭错误会返回给调用方，不能只依靠 defer 丢弃错误，否则可能掩盖资源释放故障。
+// Current 返回已发布的默认实例；Init 尚未成功时 panic，提示初始化顺序错误。
+// 返回的是共享指针，调用方只读取 DB 和 Repositories，不替换其中的字段。
+// 此函数只读取指针，不创建连接池或仓储，也不执行 SQL。
+func Current() *Runtime {
+	runtime := current.Load()
+	if runtime == nil {
+		panic("runtime is not initialized; call Init before Current")
+	}
+	return runtime
+}
+
+// Close 关闭本实例创建的全部连接池，并返回关闭错误。
+// nil 实例或未持有管理器时直接返回；重复调用由管理器返回首次关闭结果。
+// 调用方须先停止业务访问。关闭不会清空默认实例，也不允许重新初始化。
 func (r *Runtime) Close() error {
 	if r == nil || r.DB.manager == nil {
 		return nil

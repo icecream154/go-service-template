@@ -5,19 +5,16 @@ import (
 	"errors"
 
 	"go-service-template/app/domains/user/models"
-	"go-service-template/app/domains/user/repository"
+	appruntime "go-service-template/internal/runtime"
 )
 
 // UserProfileService 提供用户资料操作，使用领域模型表达查询结果。
-type UserProfileService struct {
-	// userProfiles 用于读取用户资料，查询条件由各业务方法传入。
-	userProfiles *repository.UserProfileRepository
-}
+// 结构体不保存仓储或本次查询的状态。
+type UserProfileService struct{}
 
-// NewUserProfileService 使用已有的用户资料仓储创建服务。
-// userProfiles 应为已初始化的有效仓储；构造函数只保存依赖，不执行查询。
-func NewUserProfileService(userProfiles *repository.UserProfileRepository) *UserProfileService {
-	return &UserProfileService{userProfiles: userProfiles}
+// NewUserProfileService 创建无状态的用户资料服务，不执行查询。
+func NewUserProfileService() *UserProfileService {
+	return &UserProfileService{}
 }
 
 // QueryUserProfileByUserID 按内部用户 ID 查询用户资料领域模型。
@@ -29,7 +26,8 @@ func (s *UserProfileService) QueryUserProfileByUserID(userID int64) (*models.Use
 		return nil, errors.New("user ID must be positive")
 	}
 
-	profile, err := s.userProfiles.GetProfileByID(userID)
+	// 从已初始化的 Runtime 取得普通连接仓储，本方法不创建或加入事务。
+	profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(userID)
 	if err != nil {
 		return nil, err
 	}

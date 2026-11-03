@@ -105,8 +105,8 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 复用 Runtime 中的用户资料仓储，创建 Service、Controller 并注册路由。
-	userProfileService := userservice.NewUserProfileService(runtime.Repositories.UserProfile)
+	// 创建 Service、Controller 并注册路由；Service 查询时自行读取默认 Runtime。
+	userProfileService := userservice.NewUserProfileService()
 	userProfileController := usercontroller.NewUserProfileController(userProfileService)
 	router := routers.New(userProfileController)
 

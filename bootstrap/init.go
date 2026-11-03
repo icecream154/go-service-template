@@ -10,6 +10,7 @@ import (
 
 	"go-service-template/env"
 	"go-service-template/internal/database/mysql"
+	appruntime "go-service-template/internal/runtime"
 )
 
 // Init 按环境配置、数据库配置、数据库连接的顺序初始化应用依赖。
@@ -25,10 +26,10 @@ import (
 //
 // 必须先完成 env.Init 才能调用 env.Current。环境配置成功后即保存在环境单例中；
 // 后续数据库初始化失败不会回滚该单例，但不会返回部分可用的 Runtime。
-// Runtime 的创建、连接入口获取和失败清理由 newRuntime 完成。
+// Runtime 的创建、失败清理及默认实例发布由 appruntime.Init 完成。
 // 成功返回后，调用方负责最终 Close。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
-func Init(ctx context.Context, configDir string) (*Runtime, error) {
+func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
 	// 已取消的启动无需继续读取配置或尝试联网；保留错误链供上层区分取消与普通故障。
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("initialize application: %w", err)
@@ -41,5 +42,5 @@ func Init(ctx context.Context, configDir string) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load MySQL configuration: %w", err)
 	}
-	return newRuntime(ctx, config)
+	return appruntime.Init(ctx, config)
 }
