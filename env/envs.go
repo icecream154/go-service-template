@@ -23,6 +23,7 @@
 //  1. 在环境常量中增加 StageEnv = "stage"，保持值与部署平台注入的 APP_ENV 一致。
 //  2. 在 LoadFromEnv 的 environment switch 白名单中增加 StageEnv。
 //     只声明常量不会使新环境自动通过校验。
+//     同步 internal/database/mysql.LoadConfig 的环境白名单，并增加对应的 stage.yml。
 //  3. 更新非法 APP_ENV 的英文错误文案，使允许值列表包含新环境。
 //  4. 如业务需要快捷判断，可增加 IsStage() 方法，直接比较 c.Environment == StageEnv。
 //     现有 IsDev、IsTest、IsProd 仍只判断各自环境，不应通过排除法识别新环境。
