@@ -242,6 +242,7 @@ func TestLoadRepositoryConfigs(t *testing.T) {
 	for _, environment := range []string{"dev", "test", "prod"} {
 		t.Run(environment, func(t *testing.T) {
 			prefix := strings.ToUpper(environment) + "_MYSQL_"
+			t.Setenv(prefix+"PASSWORD", "synthetic-password")
 			t.Setenv(prefix+"HOST", "db.example.invalid")
 			t.Setenv(prefix+"CA_FILE", "certs/ca.pem")
 			for _, name := range []string{"USER", "POST", "ORDER", "TRANSACTION"} {

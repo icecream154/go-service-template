@@ -22,6 +22,10 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试或生产部署先注入相应 YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。`${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
 
+测试环境的 RDS 地址、账号和 CA 路径已经配置在 `test.yml`；运行时设置 `TEST_MYSQL_PASSWORD` 注入密码，并通过 `APP_ENV=test` 选择此配置。四个命名连接继承同一测试账号和密码，CA 使用仓库中的 `ApsaraDB-CA-Chain/ApsaraDB-CA-Chain.pem`，路径相对于该 YAML 文件解析；部署配置文件时须一并包含这个证书目录。
+
+测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
+
 启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 临时插入及跨库事务示例 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
 当前 `bootstrap.Init` 保留临时写入：每次成功启动先独立新增一位用户，再通过一个跨库事务新增另一位用户及其待支付订单。事务内两条记录一起提交或回滚；前面的独立插入不属于该事务。验证结束后应移除这两段临时启动写入。
@@ -60,7 +64,7 @@ if err != nil {
 
 `DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
 
-独立连接池不要求独立账号。本地 `transaction` 通过 `*writer` 继承已有账号密码，无需额外创建账号。测试和生产保留通用事务凭据，分别使用 `TEST_MYSQL_TRANSACTION_USERNAME/PASSWORD`、`PROD_MYSQL_TRANSACTION_USERNAME/PASSWORD`，由部署方按获准流程配置库表权限；若现有账号的授权符合相同范围，也可以复用该账号。配置不会自动创建账号或扩大权限。
+独立连接池不要求独立账号。本地和测试环境的 `transaction` 都通过 `*writer` 继承已有账号密码，无需额外创建账号；测试环境只需注入一个 `TEST_MYSQL_PASSWORD`。生产保留通用事务凭据 `PROD_MYSQL_TRANSACTION_USERNAME/PASSWORD`，由部署方按获准流程配置库表权限；若现有账号的授权符合相同范围，也可以复用该账号。配置不会自动创建账号或扩大权限。
 
 新增同一实例内、权限范围相同的跨库流程时，复用 `transaction` 并在业务入口管理事务，无需按库表组合新增连接。目标实例或权限范围不同时，另配命名连接；多个连接分别开启的事务不会自动合并。
 

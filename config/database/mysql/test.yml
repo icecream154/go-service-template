@@ -1,9 +1,10 @@
-# 测试环境：三个业务库位于同一实例，与 dev、prod 环境隔离。
-# ${...} 是环境变量占位符；加载器须显式展开字符串字段，缺失或为空时拒绝启动。
+# 测试环境：三个业务库位于同一个阿里云 RDS 实例，与 dev、prod 环境隔离。
+# 四个连接共用当前测试账号和 TEST_MYSQL_PASSWORD，只按默认库区分，连接池仍各自独立。
+# 密码由运行环境注入，不写入配置文件；变量缺失或为空时拒绝启动。
 # 初始化组件应用 TLS、每个物理连接的会话参数及 GORM NowFunc，并校验实际连接。
 # 所有超时、连接寿命、空闲时间和 SlowThreshold 均以秒计。
 # 连接池为单进程、单业务连接的初始参考值，并行测试进程的总连接数也须计入预算。
-# 除三个普通业务连接外，transaction 使用独立权限配置，池容量先与本环境普通池保持一致。
+# transaction 复用当前账号的跨库权限，池容量先与本环境普通池保持一致。
 # 当前四个池各最多 10 个连接，合计最多 40 个连接/进程，不表示启动时预建全部连接。
 Gormv2:
   Mysql:
@@ -25,11 +26,11 @@ Gormv2:
             Location: "UTC"
             Precision: "millisecond"
         Write: &writer
-          Host: "${TEST_MYSQL_HOST}"
+          Host: "rm-wz94z8n0ac1rnc3teno.mysql.rds.aliyuncs.com"
           Port: 3306
           DataBase: "user_service"
-          User: "${TEST_MYSQL_USER_USERNAME}"
-          Pass: "${TEST_MYSQL_USER_PASSWORD}"
+          User: "moralspace_tennis_rds_default"
+          Pass: "gQpWMLcAOL23dkP8GxpIl"
           Charset: "utf8mb4"
           Collation: "utf8mb4_0900_bin"
           ParseTime: true
@@ -41,9 +42,12 @@ Gormv2:
             Autocommit: 1
             SQLMode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
           TLS:
+            # 此开关要求客户端使用 TLS；RDS 控制台还须为上述连接地址提前开启 SSL。
             Enabled: true
-            CAFile: "${TEST_MYSQL_CA_FILE}"
-            ServerName: "${TEST_MYSQL_HOST}"
+            # 相对路径以本 test.yml 所在目录解析，使用证书包中的 PEM 链；不使用 JKS 或 P7B。
+            CAFile: "Test-ApsaraDB-CA-Chain/Test-ApsaraDB-CA-Chain.pem"
+            # 校验实际连接域名的服务器证书，不能把 CA 证书的名称当成服务器主机名。
+            ServerName: "rm-wz94z8n0ac1rnc3teno.mysql.rds.aliyuncs.com"
             MinVersion: "1.2"
             InsecureSkipVerify: false
             AllowFallbackToPlaintext: false
@@ -54,34 +58,28 @@ Gormv2:
           ConnectTimeout: 5
           ReadTimeout: 10
           WriteTimeout: 10
-      # 复用连接行为及主库参数，按业务库覆盖库名与账号；账号仅授予本库所需权限。
+      # 当前测试实例共用一个账号；继承地址、凭据、TLS 与会话参数，只覆盖默认库名。
+      # 账号须预先具有这些业务表的权限；YAML 配置不会创建库表或扩大账号授权。
       post:
         <<: *connection
         Write:
           <<: *writer
           DataBase: "post_service"
-          User: "${TEST_MYSQL_POST_USERNAME}"
-          Pass: "${TEST_MYSQL_POST_PASSWORD}"
       order:
         <<: *connection
         Write:
           <<: *writer
           DataBase: "order_service"
-          User: "${TEST_MYSQL_ORDER_USERNAME}"
-          Pass: "${TEST_MYSQL_ORDER_PASSWORD}"
       # 通用事务池只在本环境同一 MySQL 主实例、账号获准权限相容的流程之间复用。
       # 目标表均须使用 InnoDB；不同实例或分别开启的事务不能自动合并为本地事务。
       transaction:
         <<: *connection
         Write:
-          # 复用主库地址、UTC 会话、CA 与服务器身份校验及超时，再覆盖独立权限账号与池容量。
+          # 复用同一实例地址、测试账号、UTC 会话和 TLS 配置，仍使用独立连接池。
           <<: *writer
           # 不设默认库；全部 SQL 显式使用 库名.表名，不执行 USE 切换池会话。
           DataBase: ""
-          # 变量注入本环境获准跨库账号和密码；权限按实际流程授予，不因池名而自动扩大。
-          # 不复用开发密码；缺失或为空时加载失败，YAML 声明不会创建账号或授予权限。
-          User: "${TEST_MYSQL_TRANSACTION_USERNAME}"
-          Pass: "${TEST_MYSQL_TRANSACTION_PASSWORD}"
+          # 跨库操作依赖继承账号已有的目标表权限，不再单独要求另一套事务账号凭据。
           # 独立连接池只是连接资源；同池每次 Begin 都是独立事务，并非共用一个全局事务。
           # 容量先与本环境普通池保持一致，后续按事务负载和实例总连接预算调整。
           # 同次事务的所有操作须使用同一个 tx，再统一 Commit/Rollback。
