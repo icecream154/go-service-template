@@ -7,7 +7,8 @@ import (
 
 // UserProfile 严格映射 user_service.user_profile 表。
 // 表结构、默认值和唯一索引以 database/user/mysql/user_profile.sql 为准。
-// 该模型用于持久化，内部业务处理使用 models.UserProfile。
+// 对应的 UserProfileRepository 直接使用本结构进行数据库读写。
+// 业务层如需其他模型，由业务层自行转换，仓储不依赖 DDD 模型。
 type UserProfile struct {
 	// ID 由应用通过统一雪花组件生成，写入前须验证为正数。
 	ID int64 `gorm:"column:id;type:bigint;primaryKey;autoIncrement:false;not null"`
