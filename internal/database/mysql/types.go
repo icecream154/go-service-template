@@ -74,9 +74,12 @@ type EndpointConfig struct {
 	Host string `yaml:"Host"`
 	// Port 是 TCP 端口，必须在 1–65535 范围内。
 	Port int `yaml:"Port"`
-	// DataBase 是该连接访问未限定表名时的默认业务库，使用小写 snake_case。
+	// DataBase 是该连接访问未限定表名时的默认业务库，有值时使用小写 snake_case。
+	// 可以留空表示不选择默认库，适用于同一实例上的通用跨库连接；此时 SQL 必须指定库名。
+	// 使用未限定表名的操作仍应配置对应业务库；仓储已指定完整库表名的操作不依赖默认库。
 	DataBase string `yaml:"DataBase"`
-	// User 是数据库账号，应仅具备本业务需要的访问权限。
+	// User 是数据库账号，应仅具备该连接所承载流程需要的访问权限。
+	// 独立连接池不要求独立账号；是否复用账号取决于实际授权范围。
 	User string `yaml:"User"`
 	// Pass 是数据库密码；仅用于驱动配置，不记录值，也不递归展开替换结果。
 	Pass string `yaml:"Pass"`

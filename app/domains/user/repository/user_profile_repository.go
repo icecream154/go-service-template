@@ -11,20 +11,28 @@ import (
 	"gorm.io/gorm"
 )
 
+// userProfileTable 统一维护用户资料表的完整库表名，不让业务层或事务入口拼接表名。
+// 普通连接与跨库事务都访问这个表，因此不依赖注入连接是否选择了默认数据库。
+// 库或表重命名时同步维护这里、tables 模型及受控 SQL；连接账号仍须具备目标表权限。
+const userProfileTable = "user_service.user_profile"
+
 // UserProfileRepository 只负责 user_profile 表的数据操作。
 // 连接由构造函数注入，可用于服务、脚本或后台任务，不要求存在 Web 应用。
 // 查询条件在每次调用时建立，不在仓储对象中保存用户或当前查询状态。
 type UserProfileRepository struct {
-	// db 的默认数据库应为 user_service，也可传入该连接开启的事务。
+	// db 保存注入连接或事务上的干净会话；每次操作自行指定完整库表名和查询条件。
+	// 不另取全局连接，也不改变连接的默认库，因此可直接接收没有默认库的跨库 tx。
 	// 连接池的创建、关闭以及事务的提交、回滚由持有连接的调用方负责。
 	db *gorm.DB
 }
 
 // NewUserProfileRepository 使用已初始化的数据库连接创建单表仓储，不执行 SQL。
-// 同库事务中传入 tx 后，全部方法都复用该事务，不切换到其他全局连接。
+// 同库或跨库事务中直接传入 tx，全部方法都复用该事务，不切换到其他全局连接。
 // 调用方负责传入有效连接；仓储不重复检查装配或领域参数的合法性。
 func NewUserProfileRepository(db *gorm.DB) *UserProfileRepository {
-	return &UserProfileRepository{db: db}
+	// NewDB 只清除 GORM 语句状态，保留原连接或事务、context 和 NowFunc 等配置；
+	// 它不会新建连接池或开启事务。后续每次 Table 调用生成独立语句，避免条件串入下一次操作。
+	return &UserProfileRepository{db: db.Session(&gorm.Session{NewDB: true})}
 }
 
 // GetProfileByID 按内部 ID 读取表结构，参数合法性由调用方保证。
@@ -32,7 +40,7 @@ func NewUserProfileRepository(db *gorm.DB) *UserProfileRepository {
 // 不默认过滤停用用户；数据库中的 sql.NullString 等字段直接返回给调用方。
 func (r *UserProfileRepository) GetProfileByID(id int64) (*tables.UserProfile, error) {
 	var profile tables.UserProfile
-	if err := r.db.Where("id = ?", id).Take(&profile).Error; err != nil {
+	if err := r.db.Table(userProfileTable).Where("id = ?", id).Take(&profile).Error; err != nil {
 		return nil, err
 	}
 	return &profile, nil
@@ -43,7 +51,7 @@ func (r *UserProfileRepository) GetProfileByID(id int64) (*tables.UserProfile, e
 // 账户是否可信、非空和符合长度要求由领域模型或调用方校验。
 func (r *UserProfileRepository) GetProfileByAccount(source, externalID string) (*tables.UserProfile, error) {
 	var profile tables.UserProfile
-	if err := r.db.Where("account_source = ? AND external_account_id = ?", source, externalID).Take(&profile).Error; err != nil {
+	if err := r.db.Table(userProfileTable).Where("account_source = ? AND external_account_id = ?", source, externalID).Take(&profile).Error; err != nil {
 		return nil, err
 	}
 	return &profile, nil
@@ -60,7 +68,7 @@ func (r *UserProfileRepository) GetProfileByAccount(source, externalID string) (
 func (r *UserProfileRepository) CreateProfile(profile *tables.UserProfile) error {
 	// 让 GORM 自身处理空指针，避免在构造写入副本时先解引用，也不自定义参数错误。
 	if profile == nil {
-		return r.db.Create(profile).Error
+		return r.db.Table(userProfileTable).Create(profile).Error
 	}
 	row := *profile
 	now := r.db.NowFunc().UTC().Truncate(time.Millisecond)
@@ -72,7 +80,7 @@ func (r *UserProfileRepository) CreateProfile(profile *tables.UserProfile) error
 	}
 	row.CreatedAt = row.CreatedAt.UTC().Truncate(time.Millisecond)
 	row.UpdatedAt = row.UpdatedAt.UTC().Truncate(time.Millisecond)
-	if err := r.db.Create(&row).Error; err != nil {
+	if err := r.db.Table(userProfileTable).Create(&row).Error; err != nil {
 		return err
 	}
 	*profile = row
@@ -90,7 +98,7 @@ func (r *UserProfileRepository) CreateProfile(profile *tables.UserProfile) error
 // 外部事务中一行且无错误只表示该语句成功，最终提交仍由事务发起方负责。
 // 本方法不改动传入的 changes，调用方需要最新资料时重新查询。
 func (r *UserProfileRepository) UpdateProfile(id, expectedVersion int64, changes tables.UserProfile) (int64, error) {
-	result := r.db.Model(&tables.UserProfile{}).
+	result := r.db.Table(userProfileTable).Model(&tables.UserProfile{}).
 		Where("id = ? AND version = ? AND is_enabled = ?", id, expectedVersion, true).
 		Updates(map[string]any{
 			"user_name":  changes.UserName,

@@ -244,7 +244,7 @@ func TestLoadRepositoryConfigs(t *testing.T) {
 			prefix := strings.ToUpper(environment) + "_MYSQL_"
 			t.Setenv(prefix+"HOST", "db.example.invalid")
 			t.Setenv(prefix+"CA_FILE", "certs/ca.pem")
-			for _, name := range []string{"USER", "POST", "ORDER"} {
+			for _, name := range []string{"USER", "POST", "ORDER", "TRANSACTION"} {
 				t.Setenv(prefix+name+"_USERNAME", "synthetic_user")
 				t.Setenv(prefix+name+"_PASSWORD", "synthetic-password")
 			}

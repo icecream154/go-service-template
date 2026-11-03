@@ -330,17 +330,23 @@ func verifySession(ctx context.Context, pool *sql.DB, endpoint EndpointConfig) e
 		return fmt.Errorf("acquire MySQL connection for session verification: %w", err)
 	}
 	defer connection.Close()
-	var database, clientCharset, connectionCharset, resultsCharset, collation, zone, isolation, mode string
+	// 未设置默认库时 DATABASE() 返回 SQL NULL，不能直接扫描到 string。
+	// NullString 保留其空值状态，确保配置留空时实际也没有选中任何默认库。
+	var database sql.NullString
+	var clientCharset, connectionCharset, resultsCharset, collation, zone, isolation, mode string
 	var autocommit int
 	if err := connection.QueryRowContext(ctx, sessionQuery).Scan(&database, &clientCharset, &connectionCharset, &resultsCharset, &collation, &zone, &isolation, &autocommit, &mode); err != nil {
 		return fmt.Errorf("verify MySQL session: %w", err)
+	}
+	// 空配置要求返回 SQL NULL；非空配置要求返回有效且一致的库名，不能把 NULL 当作普通字符串。
+	if database.Valid != (endpoint.DataBase != "") || database.String != endpoint.DataBase {
+		return errors.New("MySQL session database does not match configured value")
 	}
 	// 除 SQLMode 按集合比较外，其他字段要求与已校验配置一致。
 	// 错误只标出字段，不把配置值或查询结果整段写入日志。
 	checks := []struct {
 		name, actual, expected string
 	}{
-		{"database", database, endpoint.DataBase},
 		{"character_set_client", clientCharset, endpoint.Charset},
 		{"character_set_connection", connectionCharset, endpoint.Charset},
 		{"character_set_results", resultsCharset, endpoint.Charset},

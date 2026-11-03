@@ -68,8 +68,10 @@ func (e EndpointConfig) validate(path string) error {
 	if strings.TrimSpace(e.Host) == "" || strings.TrimSpace(e.User) == "" || e.Pass == "" {
 		return invalidField(path, "Host, User and Pass are required")
 	}
-	if !identifierPattern.MatchString(e.DataBase) {
-		return invalidField(path+".DataBase", "must use lowercase snake_case")
+	// 允许不选择默认数据库，供同一实例上的通用跨库连接使用。
+	// 留空时每条业务 SQL 都须指定完整库表名；有值时仍严格校验，不把空白当作空配置。
+	if e.DataBase != "" && !identifierPattern.MatchString(e.DataBase) {
+		return invalidField(path+".DataBase", "must be empty or use lowercase snake_case")
 	}
 	if e.Port < 1 || e.Port > 65535 {
 		return invalidField(path+".Port", "must be between 1 and 65535")

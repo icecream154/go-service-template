@@ -22,7 +22,9 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试或生产部署先注入相应 YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。`${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
 
-启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建所有启用的数据库连接池 → 连接和会话校验 → 临时插入及跨库事务示例 → 打印环境、区域 → 监听 HTTP。任一步失败均释放已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+
+当前 `bootstrap.Init` 保留临时写入：每次成功启动先独立新增一位用户，再通过一个跨库事务新增另一位用户及其待支付订单。事务内两条记录一起提交或回滚；前面的独立插入不属于该事务。验证结束后应移除这两段临时启动写入。
 
 ## 请求与响应
 
@@ -40,7 +42,7 @@ curl -i http://localhost:8080/health
 
 ## 数据库连接
 
-现有配置声明 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。即使地址相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
+现有普通连接为 `user`、`post`、`order`，分别默认访问 `user_service`、`post_service`、`order_service`。另有通用的 `transaction` 连接，不选择默认库，供同一 MySQL 实例中授权范围相同的跨库流程使用。即使地址和账号相同，各命名连接也拥有独立连接池；仓储必须明确选择连接。
 
 `bootstrap.Init(ctx, configDir)` 成功返回 `Runtime`，装配业务服务时传入相应连接：
 
@@ -54,6 +56,16 @@ if err != nil {
 
 未知、禁用或已关闭的连接返回错误，不回退其他连接。普通业务连接不会自动组成跨库事务，需要跨库的流程遵守专用连接和同一事务的规范。
 
+`init` 中的跨库示例从 `Get("transaction")` 取得连接，再按 `Begin → 插入用户 → 插入订单 → Commit` 的过程式顺序执行；任一步写入失败则显式 `Rollback`。两个写入均使用同一个 `tx`；用户表由 `UserProfileRepository` 内部定位，调用方直接 `NewUserProfileRepository(tx)`，无需拼接库表名。订单目前是直接使用 GORM 的临时示例，仍显式指定 `order_service.membership_order`。其他获准的跨库流程可以复用这个池；每次 `Begin` 都是独立事务，各自提交和回滚。
+
+`DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
+
+独立连接池不要求独立账号。本地 `transaction` 通过 `*writer` 继承已有账号密码，无需额外创建账号。测试和生产保留通用事务凭据，分别使用 `TEST_MYSQL_TRANSACTION_USERNAME/PASSWORD`、`PROD_MYSQL_TRANSACTION_USERNAME/PASSWORD`，由部署方按获准流程配置库表权限；若现有账号的授权符合相同范围，也可以复用该账号。配置不会自动创建账号或扩大权限。
+
+新增同一实例内、权限范围相同的跨库流程时，复用 `transaction` 并在业务入口管理事务，无需按库表组合新增连接。目标实例或权限范围不同时，另配命名连接；多个连接分别开启的事务不会自动合并。
+
+通用事务池的初始容量与各环境普通业务池一致：dev/test 为最大连接数 10、最大空闲连接数 2，prod 为 20 和 5。四个池合计的上限分别为每进程 40、40、80 条连接；部署时仍须结合副本数、事务耗时、连接等待情况和数据库额度调整。
+
 初始化会应用连接池与网络超时、每个新物理连接的字符集/比较规则/UTC 时区/隔离级别/SQL 模式，以及 GORM 行为和 UTC 毫秒时间函数。开发环境只允许本地回环连接关闭 TLS；测试和生产必须验证 CA 及服务器身份，禁止跳过验证或回退明文。
 
 当前只支持 `Write` 主库。`IsOpenReadDb`、`SuppressRecordNotFound` 和 `AutoMigrate` 开启时明确报错；其余已有 GORM 开关按配置应用。未知字段、无法解码为目标字段的值及不符合基线的参数会在建立连接前被拒绝。
@@ -66,7 +78,9 @@ if err != nil {
 
 仓储按表组织：`tables/user_profile.go` 声明表结构，`repository/user_profile_repository.go` 定义 `UserProfileRepository`、构造函数及该表的数据操作。后续其他表也使用各自的 `XxxRepository` 和 `xxx_repository.go`，按实际需要增加方法。
 
-`repository.NewUserProfileRepository(userDB)` 接收已初始化的 `user` 连接，提供 `GetProfileByID(id)`、`GetProfileByAccount(source, externalID)`、`CreateProfile(profile)` 和 `UpdateProfile(id, expectedVersion, changes)`。方法直接接收或返回 `tables.UserProfile`，不做 DDD 模型转换，不接收 `context.Context`，不依赖 Web 请求。连接可以来自普通服务、脚本或后台任务；连接池由持有方统一管理。
+`repository.NewUserProfileRepository(db)` 接收已初始化的连接或事务，提供 `GetProfileByID(id)`、`GetProfileByAccount(source, externalID)`、`CreateProfile(profile)` 和 `UpdateProfile(id, expectedVersion, changes)`。完整库表名 `user_service.user_profile` 由仓储文件内的私有常量统一维护，普通访问与跨库事务使用相同的方法，不要求调用方指定表名。构造函数只派生干净的 GORM 会话，不建立新连接或开启事务；每次方法调用自行建立表和查询条件，保留注入连接的事务、context 和时间配置。
+
+方法直接接收或返回 `tables.UserProfile`，不做 DDD 模型转换，不接收 `context.Context`，不依赖 Web 请求。连接可以来自普通服务、脚本或后台任务，账号须具备目标表权限；连接池由持有方统一管理。
 
 账户查询同时匹配来源和外部标识，保留原字符串，不默认过滤停用用户。参数合法性统一由外层领域模型或调用方保证，仓储不重复校验 ID、初始版本、UTF-8、长度或字段内容。注册业务明确设置初始版本和 `IsEnabled=true`，持久化方法也支持显式保存停用状态。新增成功后回填自动时间，失败不修改传入对象。
 
@@ -76,7 +90,7 @@ if err != nil {
 
 `UpdateProfile` 返回 `(rowsAffected int64, err error)`。调用方先处理 `err`，再判断影响行数；`0, nil` 表示 SQL 执行正常但条件未匹配，可能是用户不存在、停用或版本过期，由外层决定业务含义。版本和启用条件仍在 SQL 中原子判断，不能仅依赖写入前的内存检查。
 
-同库事务中可将 `tx` 传给 `NewUserProfileRepository`，由事务发起方统一提交或回滚；仓储不会切换回普通连接。事务中的创建回填仅表示该语句成功，调用方须在最终提交成功后再对外使用结果；回滚不会自动恢复内存对象。跨库流程仍遵守专用连接和同一事务的规范。
+同库或跨库事务中都可直接将 `tx` 传给 `NewUserProfileRepository`，由事务发起方统一提交或回滚；仓储不会切换回普通连接。事务中的创建回填仅表示该语句成功，调用方须在最终提交成功后再对外使用结果；回滚不会自动恢复内存对象。跨库流程仍遵守专用连接和同一事务的规范。
 
 ## 职责与扩展
 

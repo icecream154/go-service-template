@@ -3,6 +3,8 @@
 # 初始化组件应用 TLS、每个物理连接的会话参数及 GORM NowFunc，并校验实际连接。
 # 所有超时、连接寿命、空闲时间和 SlowThreshold 均以秒计。
 # 连接池为单进程、单业务连接的初始参考值；实例额度须覆盖所有应用副本及运维连接。
+# 除三个普通业务连接外，transaction 使用独立权限配置，池容量先与本环境普通池保持一致。
+# 当前四个池各最多 20 个连接，合计最多 80 个连接/进程，不表示启动时预建全部连接。
 Gormv2:
   Mysql:
     Connections:
@@ -67,3 +69,21 @@ Gormv2:
           DataBase: "order_service"
           User: "${PROD_MYSQL_ORDER_USERNAME}"
           Pass: "${PROD_MYSQL_ORDER_PASSWORD}"
+      # 通用事务池只在本环境同一 RDS 主实例、账号获准权限相容的流程之间复用。
+      # 目标表均须使用 InnoDB；跨实例操作不能通过共享池或分别 Begin 获得本地事务原子性。
+      transaction:
+        <<: *connection
+        Write:
+          # 复用主库地址、UTC 会话、CA 与服务器身份校验及超时，继续强制 TLS。
+          <<: *writer
+          # 不设置默认库，所有 SQL 必须完整指定 库名.表名，不通过 USE 改变池会话状态。
+          DataBase: ""
+          # 注入生产环境获准跨库账号；按实例和实际流程所需目标表、操作设置最小权限。
+          # 不复用开发密码或其他环境账号；变量缺失或为空时拒绝启动，不自动创建或授权账号。
+          User: "${PROD_MYSQL_TRANSACTION_USERNAME}"
+          Pass: "${PROD_MYSQL_TRANSACTION_PASSWORD}"
+          # 本连接单独建池；每次 Begin 都是独立事务，也不会与普通业务池的事务自动合并。
+          # 容量先与本环境普通池保持一致，后续按事务负载、应用副本数和实例额度调整。
+          # 同次事务的操作传递同一个 tx，最终统一 Commit/Rollback，不能跨实例或越权使用。
+          SetMaxOpenConns: 20
+          SetMaxIdleConns: 5

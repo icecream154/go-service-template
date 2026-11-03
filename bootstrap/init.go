@@ -17,8 +17,10 @@ import (
 // 将资源放在 Runtime 中便于明确资源归属，避免各业务模块自行创建或关闭连接池。
 type Runtime struct {
 	// Databases 管理本进程已初始化的 MySQL 命名连接及各自的底层连接池。
-	// 仓储通过 Get("user")、Get("post") 或 Get("order") 明确选择连接；
-	// 模型所在目录不会自动决定使用哪个数据库，也不会自动建立跨库事务。
+	// 装配仓储时通过 Get("user")、Get("post") 或 Get("order") 明确选择连接；
+	// 同一实例、授权范围相同的跨库流程使用 Get("transaction")，不按库表组合各建一个池。
+	// 每次 Begin 都是独立事务；共享连接池不意味着多个业务流程共用同一个 tx。
+	// 模型所在目录不会自动选择连接池；仓储负责定位目标表，事务仍须由调用方显式管理。
 	// 业务可以使用取得的连接，但连接池的关闭统一由 Runtime.Close 负责。
 	Databases *mysql.Manager
 }
@@ -26,7 +28,7 @@ type Runtime struct {
 // Init 按环境配置、数据库配置、数据库连接的顺序初始化应用依赖。
 //
 // ctx 必须非 nil，启动入口负责为它设置初始化时限，并在初始化结束后释放计时器。
-// 此 context 会传递给数据库连接建立与连接检查，用于取消启动或控制网络等待时间；
+// 此 context 会传递给数据库连接建立、连接检查及临时记录插入，用于取消启动或限制等待时间；
 // 它不作为服务运行期间每次数据库操作的 context，业务请求应另行传入自身的 context。
 //
 // configDir 是配置根目录，例如 config 或 /opt/service/config，而不是 MySQL 叶子目录。
@@ -36,8 +38,8 @@ type Runtime struct {
 //
 // 必须先完成 env.Init 才能调用 env.Current。环境配置成功后即保存在环境单例中；
 // 后续数据库初始化失败不会回滚该单例，但不会返回部分可用的 Runtime。
-// mysql.Open 负责在中途失败时关闭本次已创建的连接池，因此失败时无资源移交给调用方。
-// 只有全部启用连接都通过检查后才返回 Runtime，此时调用方负责最终 Close。
+// mysql.Open 负责清理连接初始化失败的资源；之后的临时写入失败由本函数关闭连接池。
+// 全部连接检查和临时写入成功后才返回 Runtime，此时调用方负责最终 Close。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
 func Init(ctx context.Context, configDir string) (*Runtime, error) {
 	// 已取消的启动无需继续读取配置或尝试联网；保留错误链供上层区分取消与普通故障。
@@ -57,6 +59,7 @@ func Init(ctx context.Context, configDir string) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize MySQL connections: %w", err)
 	}
+
 	return &Runtime{Databases: databases}, nil
 }
 
