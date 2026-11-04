@@ -4,11 +4,11 @@ package v1
 import (
 	"errors"
 	"log"
-	"net/http"
 	"strconv"
 
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/internal/composition"
+	"go-service-template/internal/response"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -31,7 +31,9 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 	var request userv1dto.QueryUserProfileByUserIDRequest
 	userID, err := strconv.ParseInt(ctx.Query("user_id"), 10, 64)
 	if err != nil || userID <= 0 {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "user_id must be a positive 64-bit integer"})
+		response.Fail(ctx, response.InvalidArgument("", response.FieldError{
+			Field: "user_id", Reason: "must be a positive 64-bit integer",
+		}))
 		return
 	}
 	request.UserID = userID
@@ -41,20 +43,20 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 	if err != nil {
 		// 未找到使用固定响应文案；其他错误的具体原因只写入服务端日志。
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			ctx.JSON(http.StatusNotFound, gin.H{"error": "user profile not found"})
+			response.Fail(ctx, response.NotFound("user profile not found"))
 			return
 		}
 		log.Printf("Query user profile failed: user_id=%d error=%v", request.UserID, err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		response.Fail(ctx, response.InternalError())
 		return
 	}
 
 	// 从领域模型选取响应字段，头像指针保留 nil 与空字符串的区别。
 	// UserID 的 JSON 字符串格式由响应 DTO 的字段标签确定。
-	response := userv1dto.QueryUserProfileByUserIDResponse{
+	result := userv1dto.QueryUserProfileByUserIDResponse{
 		UserID:    profile.ID,
 		UserName:  profile.UserName,
 		AvatarURL: profile.AvatarURL,
 	}
-	ctx.JSON(http.StatusOK, response)
+	response.Success(ctx, result)
 }

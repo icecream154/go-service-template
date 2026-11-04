@@ -10,5 +10,5 @@ type QueryUserProfileByUserIDRequest struct {
 }
 
 // QueryUserProfileByUserIDResponse 表示查询成功后返回的用户基本资料。
-// 通过类型别名复用 shared.UserProfile，JSON 直接包含其字段。
+// 通过类型别名复用 shared.UserProfile，作为统一响应的 data 字段输出。
 type QueryUserProfileByUserIDResponse = shared.UserProfile

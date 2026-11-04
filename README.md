@@ -57,20 +57,30 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 查询成功返回 HTTP 200：
 
 ```json
-{"user_id":"1234567890123456789","user_name":"Example User","avatar_url":null}
+{
+  "data": {
+    "user_id": "1234567890123456789",
+    "user_name": "Example User",
+    "avatar_url": null
+  },
+  "error": null
+}
 ```
 
-`user_id` 在 JSON 中使用十进制字符串，避免雪花 ID 精度丢失。`avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。
+顶层 `data`、`error` 始终存在：成功时 `data` 是该用例的 Response DTO，`error` 为 `null`；失败时 `data` 为 `null`，`error` 是统一错误对象。相对于原先直接返回业务字段的格式，调用方现在从 `data` 读取业务结果，从 `error.code`、`error.message` 和可选的 `error.details` 读取错误信息。已有调用方需要同步调整解析逻辑。
+
+`data.user_id` 使用十进制字符串，避免雪花 ID 精度丢失。`data.avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。
 
 | 情况 | HTTP 状态 | JSON 响应 |
 | --- | --- | --- |
-| ID 缺失、格式错误、非正数或超出 int64 范围 | 400 | `{"error":"user_id must be a positive 64-bit integer"}` |
-| 用户资料不存在 | 404 | `{"error":"user profile not found"}` |
-| 查询或其他内部错误 | 500 | `{"error":"internal server error"}` |
+| ID 缺失、格式错误、非正数或超出 int64 范围 | 400 | `{"data":null,"error":{"code":"INVALID_ARGUMENT","message":"invalid request parameters","details":[{"field":"user_id","reason":"must be a positive 64-bit integer"}]}}` |
+| 用户资料不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","message":"user profile not found"}}` |
+| 路由不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","message":"route not found"}}` |
+| 查询、未处理异常或其他内部错误 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
-调用链为 Controller → Service → Repository。Controller 解析 Query 参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，仅输出用户 ID、昵称和头像。
+调用链为 Controller → Service → Repository。Controller 解析 Query 参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，通过 `response.Success` 放入 `data`，业务字段仅输出用户 ID、昵称和头像。参数错误、未找到和内部错误通过 `response.Fail` 输出；原始内部错误只记录服务端日志。
 
-顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，依次挂载 `/user`、`/userProfile` 和 `/queryUserProfileByUserId`。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)。
+顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，依次挂载 `/user`、`/userProfile` 和 `/queryUserProfileByUserId`。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
 Controller 与 DTO 放在对应领域的 `controller/v1`、`dto/v1` 中，通用响应字段放在 `dto/v1/shared`。新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、DTO 和注册方法；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
 
@@ -144,6 +154,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `bootstrap` | 加载环境、雪花和数据库配置，依次初始化发号器、Runtime、默认 Service，并返回资源清理入口 |
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
+| `internal/response` | 定义统一响应外层、通用错误和 Gin 输出函数 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
 | `app/domains/*/controller/v1`、`dto/v1` | V1 请求处理与请求、响应数据结构 |
