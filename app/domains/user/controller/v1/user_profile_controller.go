@@ -2,16 +2,15 @@
 package v1
 
 import (
-	"errors"
 	"log"
 	"strconv"
 
+	userapierror "go-service-template/app/domains/user/apierror"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/internal/composition"
 	"go-service-template/internal/response"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 // UserProfileController 处理用户资料请求，并将领域模型转换为响应 DTO。
@@ -41,13 +40,13 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
 	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(request.UserID)
 	if err != nil {
-		// 未找到使用固定响应文案；其他错误的具体原因只写入服务端日志。
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			response.Fail(ctx, response.NotFound("user profile not found"))
-			return
+		// 领域统一映射通用码、可选业务码和对外文案，Controller 不直接识别持久化错误。
+		failure := userapierror.FromError(err)
+		if failure.Code == response.CodeInternalError {
+			// 未预期错误的具体原因只写入服务端日志，不拼入响应。
+			log.Printf("Query user profile failed: user_id=%d error=%v", request.UserID, err)
 		}
-		log.Printf("Query user profile failed: user_id=%d error=%v", request.UserID, err)
-		response.Fail(ctx, response.InternalError())
+		response.Fail(ctx, failure)
 		return
 	}
 

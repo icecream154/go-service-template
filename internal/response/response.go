@@ -21,11 +21,15 @@ func Success[T any](ctx *gin.Context, data T) {
 }
 
 // Fail 输出结构化错误并终止后续 Gin 处理链；调用方仍须 return 结束当前函数。
-// 无效错误定义属于服务端错误，不将其原文案或详情暴露给调用方。
+// 通用类别必须已登记，HTTP 状态码由类别的固定映射决定。
+// 无效错误定义及内部错误统一输出固定内容，不暴露原文案、业务码或详情。
 func Fail(ctx *gin.Context, failure ErrorInfo) {
-	if failure.HTTPStatus < http.StatusBadRequest || failure.HTTPStatus > 599 ||
-		strings.TrimSpace(string(failure.Code)) == "" || strings.TrimSpace(failure.Message) == "" {
+	definition, valid := failure.Code.definition()
+	if !valid || strings.TrimSpace(failure.Message) == "" ||
+		(failure.BusinessCode != "" && strings.TrimSpace(string(failure.BusinessCode)) == "") ||
+		failure.Code == CodeInternalError {
 		failure = InternalError()
+		definition, _ = failure.Code.definition()
 	}
-	ctx.AbortWithStatusJSON(failure.HTTPStatus, Response[any]{Data: nil, Error: &failure})
+	ctx.AbortWithStatusJSON(definition.httpStatus, Response[any]{Data: nil, Error: &failure})
 }

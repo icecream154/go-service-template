@@ -4,8 +4,11 @@ package service
 import (
 	"errors"
 
+	usererrors "go-service-template/app/domains/user/errors"
 	"go-service-template/app/domains/user/models"
 	appruntime "go-service-template/internal/runtime"
+
+	"gorm.io/gorm"
 )
 
 // UserProfileService 提供用户资料操作，使用领域模型表达查询结果。
@@ -18,17 +21,22 @@ func NewUserProfileService() *UserProfileService {
 }
 
 // QueryUserProfileByUserID 按内部用户 ID 查询用户资料领域模型。
-// userID 必须大于 0，非法参数直接返回错误，不调用仓储。
+// userID 必须大于 0，非法参数直接返回 ErrInvalidUserID，不调用仓储。
 // 查询成功时返回完整资料，保留账户身份、启用状态、版本和时间，不额外过滤停用用户。
-// 查询未命中或失败时返回 nil 和仓储的原始错误，包括 gorm.ErrRecordNotFound。
+// 查询未命中转换为 ErrUserProfileNotFound，其他仓储错误原样返回供上层记录。
+// 本层不构造 HTTP 响应，也不决定对外业务错误码。
 func (s *UserProfileService) QueryUserProfileByUserID(userID int64) (*models.UserProfile, error) {
 	if userID <= 0 {
-		return nil, errors.New("user ID must be positive")
+		return nil, usererrors.ErrInvalidUserID
 	}
 
 	// 从已初始化的 Runtime 取得普通连接仓储，本方法不创建或加入事务。
 	profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(userID)
 	if err != nil {
+		// 将持久化层的未命中语义转换为领域错误，Controller 无需识别 GORM 错误。
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, usererrors.ErrUserProfileNotFound
+		}
 		return nil, err
 	}
 
