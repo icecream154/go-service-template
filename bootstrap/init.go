@@ -13,21 +13,22 @@ import (
 	"go-service-template/internal/composition"
 	"go-service-template/internal/database/mysql"
 	appruntime "go-service-template/internal/runtime"
+	"go-service-template/internal/snowflake"
 )
 
-// Init 按环境配置、数据库配置、数据库连接和业务服务的顺序初始化应用依赖。
+// Init 按部署环境、雪花发号器、数据库和业务服务的顺序初始化应用依赖。
 //
 // ctx 必须非 nil，启动入口负责为它设置初始化时限，并在初始化结束后释放计时器。
 // 此 context 会传递给数据库连接建立与连接检查，用于取消启动或限制等待时间；
 // 它不作为服务运行期间每次数据库操作的 context，业务请求应另行传入自身的 context。
 //
 // configDir 是配置根目录，例如 config 或 /opt/service/config，而不是 MySQL 叶子目录。
-// 本函数在其下追加 database/mysql，再由 LoadConfig 根据已校验的部署环境选择
-// dev.yml、test.yml 或 prod.yml。相对路径相对于进程工作目录，加载器最终转换为绝对路径。
-// 部署区域当前不参与文件选择，仍由 env 管理并供后续日志及业务读取。
+// 本函数分别在其下追加 snowflake、database/mysql，按已校验的部署环境选择
+// dev.yml、test.yml 或 prod.yml。部署区域由 env 映射为雪花数据中心号。
 //
 // 必须先完成 env.Init 才能调用 env.Current。环境配置成功后即保存在环境单例中；
-// 后续数据库初始化失败不会回滚该单例，但不会返回部分可用的 Runtime。
+// 雪花发号器也只初始化一次；后续数据库初始化失败不会重置环境或发号序列，
+// 但不会返回部分可用的 Runtime。启动失败由 main 退出进程，不在原进程重新初始化。
 // Runtime 的创建、失败清理及默认实例发布由 appruntime.Init 完成。
 // 随后由 composition.Init 创建默认服务；该步骤失败时关闭已经创建的连接池。
 // 成功返回后，调用方负责最终 Close。
@@ -40,8 +41,20 @@ func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
 	if err := env.Init(); err != nil {
 		return nil, fmt.Errorf("initialize deployment environment: %w", err)
 	}
+	deployment := env.Current()
+	dataCenterID, err := deployment.DataCenterID()
+	if err != nil {
+		return nil, fmt.Errorf("resolve snowflake data center ID: %w", err)
+	}
+	snowflakeConfig, err := snowflake.LoadConfig(filepath.Join(configDir, "snowflake"), deployment.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("load snowflake configuration: %w", err)
+	}
+	if err := snowflake.Init(dataCenterID, snowflakeConfig.MachineID); err != nil {
+		return nil, fmt.Errorf("initialize snowflake generator: %w", err)
+	}
 	// 显式拼接根目录与固定子目录，不搜索其他环境文件，也不在缺文件时回退到 dev。
-	config, err := mysql.LoadConfig(filepath.Join(configDir, "database", "mysql"), env.Current().Environment)
+	config, err := mysql.LoadConfig(filepath.Join(configDir, "database", "mysql"), deployment.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("load MySQL configuration: %w", err)
 	}

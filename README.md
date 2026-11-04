@@ -1,10 +1,10 @@
 # Go 后端工程规范与框架示例
 
-提供部署环境读取、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。
+提供部署环境读取、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。
 
 ## 启动
 
-使用 Go 1.25 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置后，在项目根目录执行：
+使用 Go 1.25 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置，以及 `config/snowflake/dev.yml` 中为本进程分配的机器号后，在项目根目录执行：
 
 ```sh
 go run ./cmd/web
@@ -18,17 +18,33 @@ go run ./cmd/web
 go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeout 30s -shutdown-timeout 10s
 ```
 
-`-config-dir` 是包含 `database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
+`-config-dir` 是包含 `snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
 
-测试或生产部署先注入相应 YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。`${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
+测试或生产部署先注入 MySQL YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。MySQL 配置中的 `${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
 
 测试环境的 RDS 地址、账号和 CA 路径已经配置在 `test.yml`；运行时设置 `TEST_MYSQL_PASSWORD` 注入密码，并通过 `APP_ENV=test` 选择此配置。四个命名连接继承同一测试账号和密码，CA 使用仓库中的 `ApsaraDB-CA-Chain/ApsaraDB-CA-Chain.pem`，路径相对于该 YAML 文件解析；部署配置文件时须一并包含这个证书目录。
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
 
 当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
+
+## 雪花 ID
+
+`internal/snowflake` 参考 tennis 的生成方式，使用固定纪元 `2017-01-01T00:00:00Z`（1483228800000 毫秒）。ID 为正 int64：最高符号位为 0，其余依次为 41 位毫秒时间差、3 位数据中心编号、7 位机器编号、12 位同毫秒序列。数据中心编号由 `env.Current().DataCenterID()` 提供，范围 0～7，当前 `cn` 对应 0；与机器编号组合后形成 10 位节点编号。
+
+机器编号只从 `config/snowflake/<environment>.yml` 读取，不使用默认值、随机值或环境变量覆盖。`LoadConfig` 接收直接包含这些文件的 `snowflake` 叶子目录，环境仅支持 `dev/test/prod`，只读取所选文件，缺失或无效时停止启动，不回退其他环境。配置必须是单份非空 YAML 文档，只能显式填写 `machine_id` 整数字段，范围 0～127，0 有效；遗漏、null、浮点数、未知字段、重复字段及多文档均拒绝。
+
+```yaml
+machine_id: 1
+```
+
+仓库三个环境文件中的 `1` 是部署模板，不能直接复制给多个进程。同一 ID 分配范围、同一数据中心内，所有运行进程（包括跨服务、后台任务及共享此范围的不同环境）必须分配不同的机器编号。部署方负责该分配，组件不提供分布式租约。
+
+`bootstrap.Init` 在数据库初始化前调用 `snowflake.Init(dataCenterID, machineID)`，成功发布进程共享的发号器；重复初始化会返回错误，运行中不重新加载配置。调用方通过 `snowflake.NextID() (int64, error)` 取得 ID，并处理错误。互斥锁保护同一进程内的并发调用，同一毫秒序列范围为 0～4095，耗尽后每次等待 1 毫秒、最多重试 10 次，时钟仍未推进则返回序列耗尽错误；时钟回拨、时间早于纪元或超出时间位容量时也返回错误。
+
+节点复用与跨重启的历史时钟高水位由部署方保障：复用同一数据中心及机器编号前，须确认旧进程已停止，并确保当前时间严格超过此前成功发号的最高毫秒。当前组件不持久化该高水位，不会自动保证跨重启避碰。
 
 ## 请求与响应
 
@@ -125,13 +141,15 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 加载环境和数据库配置，依次初始化 Runtime、默认 Service，并返回资源清理入口 |
+| `bootstrap` | 加载环境、雪花和数据库配置，依次初始化发号器、Runtime、默认 Service，并返回资源清理入口 |
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
 | `app/domains/*/controller/v1`、`dto/v1` | V1 请求处理与请求、响应数据结构 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |
+| `internal/snowflake` | 严格加载机器号配置，初始化并提供进程共享的雪花发号器 |
+| `config/snowflake` | 各部署环境的机器号配置模板，部署时按进程分配 |
 | `internal/database/mysql/config.go` | 选择并解码 YAML、展开环境变量、组织校验 |
 | `internal/database/mysql/types.go` | 配置结构、YAML 字段映射与逐项含义 |
 | `internal/database/mysql/validation.go` | 必填值、连接池、时间、TLS 及行为约束校验 |
@@ -140,7 +158,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/models`、`tables` | 业务对象与数据库表映射 |
 | `app/domains/user/repository/*_repository.go` | 每张表独立的仓储结构和数据库操作，直接使用 tables 结构 |
 
-新增环境时同步维护 `env` 和 MySQL 加载器的环境白名单，并增加对应 YAML；新增命名连接时增加 YAML 配置并由仓储显式获取。`env/envs.go` 中记录了环境和区域扩展步骤。
+新增环境时同步维护 `env`、雪花配置加载器和 MySQL 加载器的环境白名单，并增加对应 YAML；新增命名连接时增加 YAML 配置并由仓储显式获取。`env/envs.go` 中记录了环境和区域扩展步骤。
 
 ## 验证
 
