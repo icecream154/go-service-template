@@ -8,7 +8,7 @@ type UserProfile struct {
 	// ID 是用户的内部标识，由应用通过统一雪花组件生成。
 	ID int64
 
-	// AccountSource 是可信外部账户的完整身份命名空间。
+	// AccountSource 是外部账户的完整身份命名空间，与外部标识共同表达注册身份。
 	AccountSource string
 
 	// ExternalAccountID 是该来源内的外部账户原始标识。

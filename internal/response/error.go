@@ -36,10 +36,22 @@ type BusinessErrorCode string
 // ErrorInfo 是对外错误结构，不直接序列化内部 error 或数据库驱动错误。
 // Code 必填；BusinessCode 可选，未设置时不输出该字段。
 type ErrorInfo struct {
-	Code         ErrorCode         `json:"code"`
+	// Code 必填，表示跨领域通用的错误类别，供调用方执行统一错误处理。
+	// 必须使用本组件登记的枚举；HTTP 状态码由该类别的固定映射决定。
+	Code ErrorCode `json:"code"`
+
+	// BusinessCode 可选，表示该类别下需要对外区分的具体业务失败原因，空值时省略。
+	// 与 Code 的通用分类不同，业务码及其归属由所属领域的接口适配层集中定义。
+	// 同一业务码固定归属一个 Code，不要求与内部领域 error 一一对应。
 	BusinessCode BusinessErrorCode `json:"business_code,omitempty"`
-	Message      string            `json:"message"`
-	Details      []FieldError      `json:"details,omitempty"`
+
+	// Message 必填，使用非空白英文说明失败原因，供人阅读，不作为程序判断错误的依据。
+	// 内部错误统一使用固定文案，不包含底层错误或其他内部信息。
+	Message string `json:"message"`
+
+	// Details 可选，提供请求参数校验的字段明细，包括参数名和违反的约束。
+	// 没有明细时省略；内部错误不输出该字段。
+	Details []FieldError `json:"details,omitempty"`
 }
 
 // WithBusinessCode 返回附带业务码的错误副本，不修改原错误定义。

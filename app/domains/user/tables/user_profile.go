@@ -13,10 +13,11 @@ type UserProfile struct {
 	// ID 由应用通过统一雪花组件生成，写入前须验证为正数。
 	ID int64 `gorm:"column:id;type:bigint;primaryKey;autoIncrement:false;not null"`
 
-	// AccountSource 是服务端配置的完整外部身份命名空间。
+	// AccountSource 是外部账户的完整身份命名空间，当前首次注册时由请求声明。
+	// 外部身份凭证及来源可信性由认证接入校验，表结构本身不执行认证。
 	AccountSource string `gorm:"column:account_source;type:varchar(32);not null"`
 
-	// ExternalAccountID 保留可信来源中的原始标识，不转为数字。
+	// ExternalAccountID 保留该来源中的原始账户标识，不转为数字。
 	ExternalAccountID string `gorm:"column:external_account_id;type:varchar(128);not null"`
 
 	// UserName 是展示昵称，允许重复。

@@ -48,6 +48,18 @@ machine_id: 1
 
 ## 请求与响应
 
+用户资料接口统一位于 `/api/v1/user/userProfile` 下：
+
+| HTTP 方法 | 业务用例 | 用途 |
+| --- | --- | --- |
+| GET | `queryUserProfileByUserId` | 按内部用户 ID 查询资料 |
+| POST | `createUser` | 以外部账户身份首次注册，生成内部用户 ID |
+| POST | `updateUserProfile` | 检查版本并完整替换昵称、头像 |
+| POST | `batchQueryUserProfiles` | 按 ID 批量查询，返回已存在资料和缺失 ID |
+| GET | `queryUserProfilePage` | 按昵称、启用状态筛选并分页查询 |
+
+完整的请求字段、响应、并发处理与错误码见[用户资料接口](specifications/application/user-profile-api.md)。创建为首次自注册，不要求已有发起方用户 ID；更新显式提供 `operator_user_id` 和目标 `user_id`，当前限定本人修改。认证尚未接入，来源、外部账户及发起方 ID 都由请求声明，不代表已验证身份。
+
 `GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
 
 ```sh
@@ -61,7 +73,9 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
   "data": {
     "user_id": "1234567890123456789",
     "user_name": "Example User",
-    "avatar_url": null
+    "avatar_url": null,
+    "is_enabled": true,
+    "version": 0
   },
   "error": null
 }
@@ -69,7 +83,7 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 
 顶层 `data`、`error` 始终存在：成功时 `data` 是该用例的 Response DTO，`error` 为 `null`；失败时 `data` 为 `null`，`error` 是统一错误对象。调用方从 `data` 读取业务结果，从必填的 `error.code` 判断通用错误类别，按需使用可选的 `error.business_code` 识别具体业务原因；`error.message` 为英文说明，`error.details` 为可选字段明细。HTTP 状态码由通用码的固定映射决定，Controller 不独立设置状态码。
 
-`data.user_id` 使用十进制字符串，避免雪花 ID 精度丢失。`data.avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。
+`data.user_id` 使用十进制字符串，避免雪花 ID 精度丢失。`data.avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。`data.is_enabled` 表示当前启用状态，`data.version` 用于下一次更新时提交 `expected_version`。
 
 | 情况 | HTTP 状态 | JSON 响应 |
 | --- | --- | --- |
@@ -78,11 +92,11 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 | 路由不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","message":"route not found"}}` |
 | 查询、未处理异常或其他内部错误 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
-调用链为 Controller → Service → Repository。Controller 解析 Query 参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，通过 `response.Success` 放入 `data`，业务字段仅输出用户 ID、昵称和头像。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的领域错误；Controller 复用 `user/apierror` 的映射，通过 `response.Fail` 返回 `NOT_FOUND` 和 `USER_PROFILE_NOT_FOUND`。参数格式错误只返回通用 `INVALID_ARGUMENT`，未知查询异常和未处理异常统一返回不带业务码的 `INTERNAL_ERROR`；原始内部错误只记录服务端日志。
+调用链为 Controller → Service → Repository。Controller 解析请求并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造用例专属响应 DTO，通过 `response.Success` 放入 `data`，资料字段包含用户 ID、昵称、头像、启用状态和版本。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的领域错误；Controller 复用 `user/apierror` 的映射，通过 `response.Fail` 返回通用码和可选业务码。参数格式错误只返回通用 `INVALID_ARGUMENT`，未知查询异常和未处理异常统一返回不带业务码的 `INTERNAL_ERROR`；原始内部错误只记录服务端日志。
 
 `user/errors` 声明 Service 使用的内部领域错误，`user/apierror` 声明对外业务码并维护错误映射；Service 不依赖 Gin 或通用响应组件。内部错误与对外业务码不要求一一对应，多个内部错误可以对应同一个业务码；同一个业务码的通用错误类别保持固定。通用响应组件集中提供 `INVALID_ARGUMENT`、`UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`CONFLICT`、`RATE_LIMITED`、`INTERNAL_ERROR`、`SERVICE_UNAVAILABLE` 八个类别及对应构造器，具体约定见[接口返回规范](specifications/application/api-response.md)。
 
-顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，依次挂载 `/user`、`/userProfile` 和 `/queryUserProfileByUserId`。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
+顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
 Controller 与 DTO 放在对应领域的 `controller/v1`、`dto/v1` 中，领域内复用的业务响应字段放在 `dto/v1/shared`，统一响应外层由 `internal/response` 提供。新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、DTO 和注册方法；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
 
@@ -124,7 +138,19 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 
 仓储按表组织：`tables/user_profile.go` 声明表结构，`repository/user_profile_repository.go` 定义 `UserProfileRepository`、构造函数及该表的数据操作。后续其他表也使用各自的 `XxxRepository` 和 `xxx_repository.go`，按实际需要增加方法。
 
-`repository.NewUserProfileRepository(db)` 接收已初始化的连接或事务，提供 `GetProfileByID(id)`、`GetProfileByAccount(source, externalID)`、`CreateProfile(profile)` 和 `UpdateProfile(id, expectedVersion, changes)`。完整库表名 `user_service.user_profile` 由仓储文件内的私有常量统一维护，普通访问与跨库事务使用相同的方法，不要求调用方指定表名。构造函数只派生干净的 GORM 会话，不建立新连接或开启事务；每次方法调用自行建立表和查询条件，保留注入连接的事务、context 和时间配置。
+`repository.NewUserProfileRepository(db)` 接收已初始化的连接或事务，提供以下数据操作：
+
+| 方法 | 用途 |
+| --- | --- |
+| `GetProfileByID(id)` | 按内部 ID 查询 |
+| `GetProfileByIDForUpdate(id)` | 在调用方事务中锁定目标记录，供版本校验和更新使用 |
+| `GetProfileByAccount(source, externalID)` | 按来源及外部标识查询，作为内部能力 |
+| `GetProfilesByIDs(ids)` | 按一组内部 ID 查询，由 Service 整理输入顺序和缺失项 |
+| `QueryProfilePage(...)` | 应用筛选、ID 降序及分页，返回匹配总数和本页记录 |
+| `CreateProfile(profile)` | 新增资料记录 |
+| `UpdateProfile(id, expectedVersion, changes)` | 检查启用状态与旧版本，替换昵称、头像并递增版本 |
+
+完整库表名 `user_service.user_profile` 由仓储文件内的私有常量统一维护，普通访问与跨库事务使用相同的方法，不要求调用方指定表名。构造函数只派生干净的 GORM 会话，不建立新连接或开启事务；每次方法调用自行建立表和查询条件，保留注入连接的事务、context 和时间配置。
 
 方法直接接收或返回 `tables.UserProfile`，不做 DDD 模型转换，不接收 `context.Context`，不依赖 Web 请求。连接可以来自普通服务、脚本或后台任务，账号须具备目标表权限；连接池由持有方统一管理。
 
@@ -135,6 +161,8 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 仓储不维护自定义错误层，直接返回 GORM 或驱动提供的原始错误。查询未命中可检查 `gorm.ErrRecordNotFound`，重复键按当前数据库配置检查驱动错误或 GORM 翻译结果；仓储不额外分类、包装或记录业务日志。
 
 `UpdateProfile` 返回 `(rowsAffected int64, err error)`。调用方先处理 `err`，再判断影响行数；`0, nil` 表示 SQL 执行正常但条件未匹配，可能是用户不存在、停用或版本过期，由外层决定业务含义。版本和启用条件仍在 SQL 中原子判断，不能仅依赖写入前的内存检查。
+
+用户资料更新 Service 在同一事务中锁读目标记录、检查启用状态及版本、执行受保护更新，再读取本次更新结果。事务提交成功后才返回资料；失败则回滚。分页仓储分别读取匹配总数及本页记录，不承诺并发写入时的快照一致性。
 
 同库或跨库事务中都可直接将 `tx` 传给 `NewUserProfileRepository`，由事务发起方统一提交或回滚；仓储不会切换回普通连接。事务中的创建回填仅表示该语句成功，调用方须在最终提交成功后再对外使用结果；回滚不会自动恢复内存对象。跨库流程仍遵守专用连接和同一事务的规范。
 
@@ -182,4 +210,4 @@ go test -race ./...
 go vet ./...
 ```
 
-测试覆盖现有 YAML 的锚点继承、环境变量展开及错误脱敏、配置校验、驱动与 TLS 参数、失败资源释放和连接管理并发访问。单元测试不依赖正在运行的 MySQL；完整启动、HTTP 响应和退出清理还应使用实际 MySQL 8.4 验证。
+现有测试覆盖统一响应、路由错误、查询参数校验和领域错误映射，不依赖正在运行的 MySQL。实际 MySQL 8.4 的约束、事务行为与完整启动链路仍需数据库联调验证。

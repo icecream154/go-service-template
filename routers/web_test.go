@@ -112,8 +112,10 @@ func TestSuccessPreservesUserProfileDTO(t *testing.T) {
 	router := routers.New()
 	router.GET("/test/profile-success", func(ctx *gin.Context) {
 		response.Success(ctx, userv1dto.QueryUserProfileByUserIDResponse{
-			UserID:   9223372036854775807,
-			UserName: "example",
+			UserID:    9223372036854775807,
+			UserName:  "example",
+			IsEnabled: true,
+			Version:   3,
 		})
 	})
 	recorder := httptest.NewRecorder()
@@ -132,7 +134,7 @@ func TestSuccessPreservesUserProfileDTO(t *testing.T) {
 	if err := json.Unmarshal(envelope["data"], &data); err != nil {
 		t.Fatalf("decode profile: %v", err)
 	}
-	if len(data) != 3 || string(data["user_id"]) != `"9223372036854775807"` || string(data["user_name"]) != `"example"` || string(data["avatar_url"]) != "null" {
+	if len(data) != 5 || string(data["user_id"]) != `"9223372036854775807"` || string(data["user_name"]) != `"example"` || string(data["avatar_url"]) != "null" || string(data["is_enabled"]) != "true" || string(data["version"]) != "3" {
 		t.Fatalf("user profile DTO changed: %s", envelope["data"])
 	}
 }

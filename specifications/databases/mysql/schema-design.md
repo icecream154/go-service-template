@@ -1194,7 +1194,7 @@ CREATE DATABASE order_service
 ```sql
 CREATE TABLE user_service.user_profile (
     id BIGINT NOT NULL COMMENT '用户内部标识，应用生成的正数雪花ID',
-    account_source VARCHAR(32) NOT NULL COMMENT '可信外部账户的完整身份命名空间代码，由服务端配置确定',
+    account_source VARCHAR(32) NOT NULL COMMENT '外部账户的完整身份命名空间代码，与来源内标识共同确定注册身份',
     external_account_id VARCHAR(128) NOT NULL COMMENT '来源内唯一的外部账户原始标识，按字符串保留，非本系统雪花ID',
     user_name VARCHAR(64) NOT NULL COMMENT '用户展示昵称，允许重名',
     avatar_url VARCHAR(512) NULL DEFAULT NULL COMMENT '用户头像URL；NULL表示尚未提供',

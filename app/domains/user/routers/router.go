@@ -19,9 +19,13 @@ func NewRouter() *UserRouter {
 }
 
 // RegisterV1Routes 在传入的 V1 分组下按领域、Controller 和业务用例注册路由。
-// user_id 是必填 Query 参数，交给控制器解析并输出响应。
+// 简单查询使用 Query 参数，创建、更新和批量查询使用 JSON 请求体。
 func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	user := v1.Group("/user")
 	userProfile := user.Group("/userProfile")
 	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
+	userProfile.GET("/queryUserProfilePage", r.userProfiles.QueryUserProfilePage)
+	userProfile.POST("/createUser", r.userProfiles.CreateUser)
+	userProfile.POST("/updateUserProfile", r.userProfiles.UpdateUserProfile)
+	userProfile.POST("/batchQueryUserProfiles", r.userProfiles.BatchQueryUserProfiles)
 }

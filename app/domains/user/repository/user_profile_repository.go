@@ -9,6 +9,7 @@ import (
 	"go-service-template/app/domains/user/tables"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // userProfileTable 统一维护用户资料表的完整库表名，不让业务层或事务入口拼接表名。
@@ -44,6 +45,51 @@ func (r *UserProfileRepository) GetProfileByID(id int64) (*tables.UserProfile, e
 		return nil, err
 	}
 	return &profile, nil
+}
+
+// GetProfileByIDForUpdate 在调用方提供的事务内读取并锁定用户资料。
+// 行锁由外层事务释放，供业务层在同一事务中判断状态、版本并完成更新。
+func (r *UserProfileRepository) GetProfileByIDForUpdate(id int64) (*tables.UserProfile, error) {
+	var profile tables.UserProfile
+	if err := r.db.Table(userProfileTable).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", id).Take(&profile).Error; err != nil {
+		return nil, err
+	}
+	return &profile, nil
+}
+
+// GetProfilesByIDs 查询指定 ID 集合，不承诺数据库返回顺序，也不排除停用用户。
+// 数量、去重和缺失结果的解释由业务层负责；空结果返回空切片。
+func (r *UserProfileRepository) GetProfilesByIDs(ids []int64) ([]tables.UserProfile, error) {
+	profiles := make([]tables.UserProfile, 0)
+	if len(ids) == 0 {
+		return profiles, nil
+	}
+	err := r.db.Table(userProfileTable).Where("id IN ?", ids).Find(&profiles).Error
+	return profiles, err
+}
+
+// QueryProfilePage 按昵称精确匹配及启用状态筛选，并按 ID 降序返回指定页。
+// 空昵称或 nil 状态表示不筛选；页码、每页数量和偏移量由调用方预先校验。
+// 总数与页面分别读取，不承诺并发写入期间的快照一致性。
+func (r *UserProfileRepository) QueryProfilePage(userName string, isEnabled *bool, pageNumber, pageSize int) ([]tables.UserProfile, int64, error) {
+	query := func() *gorm.DB {
+		db := r.db.Table(userProfileTable)
+		if userName != "" {
+			db = db.Where("user_name = ?", userName)
+		}
+		if isEnabled != nil {
+			db = db.Where("is_enabled = ?", *isEnabled)
+		}
+		return db
+	}
+	var total int64
+	if err := query().Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	profiles := make([]tables.UserProfile, 0)
+	err := query().Order("id DESC").Offset((pageNumber - 1) * pageSize).Limit(pageSize).Find(&profiles).Error
+	return profiles, total, err
 }
 
 // GetProfileByAccount 按账户来源和外部标识的联合唯一键查询。
