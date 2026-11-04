@@ -1,0 +1,297 @@
+# 接口路由与命名规范
+
+## 1. 适用范围与统一风格
+
+本项目自行设计的所有 HTTP 接口统一采用按业务用例命名的路由，包括业务接口、内部接口、管理接口和系统接口。接口按业务领域、Controller 两级分组，以明确的动作名称表达业务能力。
+
+统一格式：
+
+```text
+/{api前缀}/{主版本}/{业务领域}/{Controller分组}/{业务用例}
+```
+
+例如：
+
+```http
+GET  /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123
+GET  /api/v1/user/userProfile/queryUserPage?page_number=1&page_size=20
+POST /api/v1/user/userProfile/updateUserProfile
+POST /api/v1/order/order/cancelOrder
+GET  /api/v1/system/health/queryHealth
+```
+
+普通增删改查也使用上述格式，不与 `/user/{user_id}`、`POST /user` 等资源式路由混用。本规范中的示例表示应采用的命名，不表示对应接口已经实现。
+
+本文规定路由格式、HTTP 方法、参数命名、常用动作和业务概念用词，以及路由与 Controller、DTO 的名称对应关系。响应外层结构、业务错误码和具体响应字段另行规范。
+
+## 2. 路径格式
+
+| 组成部分 | 规则 | 示例 |
+| --- | --- | --- |
+| API 前缀 | 固定为 `/api` | `/api` |
+| 主版本 | 使用小写 `v` 加主版本号，不使用 `V1`、`version1` 等其他写法 | `/v1`、`/v2` |
+| 业务领域 | 严格使用 `app/domains/<domain>` 中的 domain 目录名，保留其单复数、大小写及分隔格式，不另行转换 | `/user`、`/order`、`/post` |
+| Controller 分组 | 严格依据处理该接口的 Controller 类型名，去除固定 `Controller` 后缀后转为 lowerCamelCase | `UserProfileController` 对应 `/userProfile` |
+| 业务用例 | 使用英文 lowerCamelCase，按“动作 + 业务对象或结果 + 必要限定”命名 | `queryUserProfileByUserId`、`cancelOrder` |
+
+具体约束：
+
+1. 业务用例必须显式包含动作，即使 HTTP 方法已经表达读取或提交，仍保留 `query`、`create` 等动作词。
+2. 业务用例直接位于所属 Controller 分组下。每个接口必须具有领域、Controller 两级分组，不增加 `/query`、`/commands`、Service 名等其他中间层级。
+3. 不将业务标识放入路径。用户 ID、订单 ID 等通过 GET 的 Query 参数或 POST 的请求体传递。
+4. 不使用下划线、连字符或全小写拼接来替代用例的 lowerCamelCase，例如不使用 `query_user_profile`、`query-user-profile`、`queryuserprofile`。
+5. 不添加尾部 `/`。不同大小写、不同尾部斜线不能作为两个业务接口的区分方式。
+6. 领域分组、Controller 分组和业务用例共同表达完整含义。即使已位于 `/user/userProfile` 分组，仍使用 `queryUserProfileByUserId`，不缩写成 `queryProfile` 或 `queryByUserId`。
+7. 领域段、Controller 段按本规范对应代码结构；业务用例描述对外业务能力，不引入表名、SQL、GORM、缓存实现或其他内部实现类型名称。
+
+领域路径以代码中的 domain 目录名为准，目录名为单数就使用单数，为复数就使用复数；多词目录名也原样使用，不单独转换成 lowerCamelCase。同一 domain 不得另设复数名、缩写或其他别名。当前代码的对应关系如下：
+
+| 领域 | 代码中的 domain 目录 | 路径分组 | 用例中的业务对象词 |
+| --- | --- | --- | --- |
+| 用户 | `app/domains/user` | `/user` | `User` |
+| 订单 | `app/domains/order` | `/order` | `Order` |
+| 帖子 | `app/domains/post` | `/post` | `Post` |
+
+新增或重命名 domain 时，须同步维护领域路径及相关文档。系统能力同样遵守此规则；本文 `/system/health/queryHealth` 的目标路由以新增 `app/domains/system` 及其 `HealthController` 为前提，当前代码尚无该 domain 和 Controller。
+
+会员权益等归属用户领域的能力，可以由 `UserMembershipController` 处理，对应 `/user/userMembership/renewUserMembership`；不因增加一个 Controller 就必须新增一级领域分组。
+
+Controller 分组按以下规则确定：
+
+1. 以对应版本下实际处理请求的 Controller 类型名为准，不按文件名、Service 名或自行指定的简称命名。
+2. 仅去除结尾的固定 `Controller` 后缀，保留业务名称中的其他词和单复数，如 `UserProfileController` 对应 `userProfile`，不能另写为 `profile`、`profiles`。
+3. 剩余业务名称按单词转换为 lowerCamelCase，缩写统一按普通单词处理，如 `UserIDController` 对应 `userId`、`HTTPProxyController` 对应 `httpProxy`。
+4. 同一版本、同一 domain 下，一个 Controller 对应一个固定分组。不同 Controller 转换后的分组名称不得冲突，也不为同一个 Controller 注册多个分组别名。
+5. 即使某个 domain 当前只有一个 Controller，也保留 Controller 层级。Controller 的所有对外方法注册到其所属分组下，不将部分方法直接挂在 domain 下。
+6. Controller 名称和接口归属构成对外路由的一部分。重命名 Controller 或将接口迁移到其他 Controller 时，必须同步处理路由、接口文档和调用方的迁移，不得将其视为不影响接口的内部重构。
+
+## 3. HTTP 方法与参数位置
+
+| 场景 | HTTP 方法 | 业务参数位置 |
+| --- | --- | --- |
+| 简单读取、条件查询、统计、只读检查 | `GET` | Query 参数 |
+| 输入包含复杂条件组、嵌套对象或批量目标集合的读取 | `POST` | 请求体 |
+| 创建、修改、删除、关系变更和其他业务写操作 | `POST` | 请求体 |
+
+本项目业务路由统一使用上述 GET、POST 约定，不额外使用 PUT、PATCH、DELETE 表达同类业务用例。
+
+具体约束：
+
+1. GET 不得执行业务写入、状态迁移、验证码发送、支付发起等操作，也不通过请求体承载业务参数。
+2. POST 读取接口仍按读取语义命名，例如需要复杂条件组的订单分页查询使用 `POST /api/v1/order/order/queryOrderPage`，不因使用 POST 就改成 `create`，也不因参数复杂就改成 `search`。
+3. 一个版本内，同一领域的对外用例名称保持唯一，并对应明确的 Controller、HTTP 方法及请求、响应契约。不得通过不同 Controller 分组或 GET、POST 承载同名但业务含义不同的接口。
+4. 同一业务参数只约定一个位置，不同时从 Query 和请求体读取后决定优先级。鉴权信息等公共请求头按其专门约定处理。
+5. POST 默认使用 JSON 请求体；文件上传等需要其他媒体类型的接口，单独明确请求格式，路由名称仍遵守本规范。
+6. 批量原子性、部分成功规则以及写操作重试、幂等要求，必须由具体接口契约说明，不能只根据 POST 或 `batch` 名称推断。
+
+## 4. 用例边界与名称组成
+
+### 4.1 按业务契约划分接口
+
+一个接口对应一个明确的业务用例，并定义稳定的请求、响应契约。
+
+| 情况 | 组织规则 |
+| --- | --- |
+| 业务目的、权限和响应结构一致，仅筛选条件、排序或分页输入不同 | 在同一个用例中扩展请求参数，如用户分页查询增加状态筛选 |
+| 业务目的、权限、校验流程或响应语义存在独立差异 | 拆分为独立用例，如用户公开资料、运营用户概览、可领取权益查询 |
+| 合并后需要大量互斥参数，或根据参数返回完全不同的响应结构 | 拆分用例，分别定义请求和响应 DTO |
+| 多个用例内部查询同一张表，或复用同一个 Service 方法 | 不据此合并对外接口 |
+| 仅为现有用例换一种同义名称 | 不新增别名接口，继续使用已有名称 |
+
+每个业务用例必须声明一对专属命名的请求、响应 DTO，与完整用例名严格对应，具体规则见第 8 节；语义一致的子结构可以复用。先确定业务用例边界，再定义对应 DTO，不按数据库表的数量划分接口，也不使用一个通用入口配合 `action` 或 `type` 参数分发多个独立业务用例。
+
+### 4.2 动作、对象与限定
+
+普通用例按以下顺序命名：
+
+```text
+动作 + 业务对象或结果 + 必要限定
+```
+
+例如：
+
+```text
+query + UserProfile + ByUserId = queryUserProfileByUserId
+query + User + Page           = queryUserPage
+query + User + Overview       = queryUserOverview
+cancel + Order                = cancelOrder
+```
+
+`By` 只用于表达需要区分的定位依据或业务查询维度，例如 `queryUserProfileByUserId` 和 `queryUserProfileByAccount`。普通可选筛选项放入请求参数，不为每种组合创建 `queryUserPageByStatusAndMembershipAndCreatedAt`。
+
+同一用例确定名称后，不再同时提供省略对象、增加 `By` 或替换同义词的多个别名。已有用户 ID 查询统一命名为 `queryUserProfileByUserId`。
+
+### 4.3 缩写与单复数
+
+1. Controller 段和业务用例段中的缩写按普通单词参与 lowerCamelCase：`Id`、`Url`、`Http`，如 `userId`、`queryUserProfileByUserId`、`queryUserAvatarUrl`。领域段仍原样使用 domain 目录名。
+2. Go 导出标识符沿用 Go 的缩写写法：`ID`、`IDs`、`URL`、`HTTP`，如 `QueryUserProfileByUserID`。
+3. 业务用例中的对象名称通常使用单数，如 `createUser`、`updateUserProfile`。集合查询使用第 5 节约定的 `List`、`Page`，不再用对象复数创造另一套普通列表查询格式；此规则不改变领域段的 domain 原名。
+4. 对多个独立目标执行同一种操作时，使用 `batch` 前缀及复数目标，如 `batchQueryUserProfiles`、`batchDeleteOrders`。
+5. 不使用含义不明的缩写或编号，如 `qryUser`、`updProfile`、`queryUserInfo2`、`doOrder`。
+
+## 5. 查询、检索与批量操作用词
+
+| 语义 | 统一格式 | 示例 | 不混用的表达 |
+| --- | --- | --- | --- |
+| 查询一个对象或一份业务结果 | `query<ObjectOrResult>` | `queryUserProfileByUserId`、`queryUserOverview` | 不用 `get`、`fetch`、`find` 作为同义查询动作 |
+| 查询不分页集合 | `query<Object>List` | `queryUserList`、`queryUserRoleList` | 不另用 `listUsers`、`getUsers`、`queryUsers` 表达相同含义 |
+| 分页查询集合 | `query<Object>Page` | `queryUserPage`、`queryOrderPage` | 不另用 `pageUsers`、`queryUserListPage`、`queryPagedUsers` |
+| 关键词、全文或相关性检索 | `search<Object>List` 或 `search<Object>Page` | `searchPostPage` | 普通字段筛选仍用 `query`；不将 `search` 与 `query` 随意互换 |
+| 只获取数量 | `count<Objects>` | `countUsers`、`countOrders` | 不用 `queryUserCount` 表达同一类计数用例 |
+| 查询统计指标 | `query<Object>Statistics` | `queryOrderStatistics` | 不用 `stats`、`statistic`、`report` 替代同一统计概念 |
+| 只读判断存在性、资格或业务条件 | `check<Condition>` | `checkUserExists`、`checkOrderCancelable` | 不使用含义模糊的 `validateUser`；凭证核验见第 6 节 |
+| 对明确的一组目标执行同一操作 | `batch<Action><Objects>` | `batchQueryUserProfiles`、`batchUpdateUserProfiles` | 不用 `bulk`、`multi` 作为同义批量前缀 |
+
+补充要求：
+
+- `List` 表示不分页，不表示可以无限量返回；具体接口必须明确适用范围或数量限制。
+- `Page` 表示具有分页契约。页码与游标两种分页方式都使用 `Page`，具体采用哪一种必须在接口中明确。
+- `search` 表达检索业务语义，不由 HTTP 方法、数据库查询复杂度或返回条数决定。
+- `batch` 表达对多个明确目标执行同一种操作。普通分页查询不因返回多条记录就使用 `batch`。
+- 只读检查的结果不保证后续写操作一定成功；写操作仍须校验执行时的业务条件。
+
+## 6. 写操作与业务动作用词
+
+| 语义 | 统一动作 | 示例 | 使用边界 |
+| --- | --- | --- | --- |
+| 创建业务对象 | `create` | `createUser`、`createOrder` | 不用 `add`、`insert`、`save` 表达创建实体 |
+| 修改已有对象的一般信息 | `update` | `updateUserProfile` | 不用 `edit`、`modify`、`change` 作为一般更新的同义词；修改范围由请求契约明确 |
+| 删除业务对象 | `delete` | `deletePost` | 不用 `remove`、`drop` 替代；是否软删除由具体契约定义 |
+| 恢复已删除或已归档对象 | `restore` | `restorePost` | 不用 `recover` 与其混用；不表示解冻或重新启用 |
+| 向集合增加成员或条目 | `add` | `addUserToGroup` | 表达集合成员变化，不等于创建用户 |
+| 从集合移除成员或条目 | `remove` | `removeUserFromGroup` | 不等于删除成员对象 |
+| 建立、解除明确的绑定关系 | `bind`、`unbind` | `bindUserAccount`、`unbindUserAccount` | 不与集合成员操作或领域已有动作随意互换 |
+| 启用、停用对象或能力 | `enable`、`disable` | `enableUser`、`disableUser` | 不等于冻结、取消、关闭或删除 |
+| 业务冻结、解除冻结 | `freeze`、`unfreeze` | `freezeUser`、`unfreezeUser` | 与一般启停区分；适用状态和限制由领域规则定义 |
+| 加锁、解锁 | `lock`、`unlock` | `lockOrder`、`unlockOrder` | 仅用于对外存在的业务锁定能力，不将内部数据库锁暴露为业务接口 |
+| 取消可撤回的请求或流程 | `cancel` | `cancelOrder` | 不表示删除记录或任意结束流程 |
+| 按业务规则结束对象或流程 | `close` | `closeOrder` | 与取消区分；取消和关闭不得作为同义接口同时存在 |
+| 提交待处理或待审批的业务申请 | `submit` | `submitRefundApplication` | 不与审批决定混用 |
+| 审批通过、驳回 | `approve`、`reject` | `approveRefundApplication`、`rejectRefundApplication` | 表达审批决定，不用通用 `updateStatus` 代替 |
+| 完成业务流程 | `complete` | `completeOrder` | 表达业务完成，不用 `finish`、`done` 作为同义动作 |
+| 确认明确的业务事实 | `confirm` | `confirmOrderReceipt` | 必须写出确认对象或事实，不使用 `confirmOrder` 表达所有确认操作 |
+| 发布、撤下发布内容 | `publish`、`unpublish` | `publishPost`、`unpublishPost` | 不等于创建、删除帖子 |
+| 发送消息、通知或验证码 | `send` | `sendVerificationCode` | 是业务操作，使用 POST，不使用 GET |
+| 核验凭证、验证码等证明材料 | `verify` | `verifyVerificationCode` | 核验可能消耗凭证或次数，统一使用 POST；不同于只读资格检查 `check` |
+| 续期、续费 | `renew` | `renewUserMembership` | 不用 `extend`、`recharge` 与同一会员续期语义混用 |
+| 关注、取消关注 | `follow`、`unfollow` | `followUser`、`unfollowUser` | 采用明确领域动作，不使用 `createFollow`、`cancelFollow` 作为同义入口 |
+| 点赞、取消点赞 | `like`、`unlike` | `likePost`、`unlikePost` | 与关注分别命名，不以通用 `addRelation` 代替 |
+| 导入、导出 | `import`、`export` | `importUsers`、`exportOrders` | 说明实际执行、任务创建及下载方式，不根据名称推断同步或异步 |
+
+以上动词的不同含义必须保留。例如，删除订单、取消订单和关闭订单是不同的业务能力；业务明确区分时分别使用 `deleteOrder`、`cancelOrder`、`closeOrder`。
+
+有明确业务含义的操作优先使用具体动作。不得通过 `updateOrderStatus` 加任意目标状态，绕过取消、审批、完成等各自不同的校验和处理流程。
+
+同一能力不同时提供 `enableUser`、`disableUser` 和 `toggleUserEnabled` 等相互重叠的入口。状态操作名称应表达明确目标，避免使用依赖当前状态翻转结果的 `toggle`。
+
+新增动作前先检查本表。确实属于新的业务语义时，补充其固定英文词、适用边界和示例，再在各接口中统一使用；不因某个开发者习惯不同而新增同义词。
+
+## 7. 常见业务概念与参数用词
+
+### 7.1 业务概念
+
+接口与存储共用的业务概念沿用[库表设计规范](../databases/mysql/schema-design.md)中的业务概念用词表，Controller 分组、业务用例和参数按各自约定转换命名格式；领域路径严格沿用 domain 目录原名。不得在接口层另换同义词。本表列出常见概念并补充接口视图用词。
+
+| 中文概念 | 统一英文 | 说明 |
+| --- | --- | --- |
+| 用户 | `User` | 不使用 `Customer`、`Member` 作为用户的同义名称；独立客户、成员概念须另行定义 |
+| 用户资料 | `UserProfile` | 不使用 `UserInfo`、`UserData` 替代同一份资料 |
+| 账户 | `Account` | 表达账户身份，不与展示资料 `Profile` 混用 |
+| 会员权益 | `Membership` | 如 `UserMembership`；不使用 `Vip`、`MemberInfo` 表达相同权益概念 |
+| 订单 | `Order` | 会员订单使用 `MembershipOrder`，不随意改称 `Trade`、`Transaction` |
+| 帖子 | `Post` | 不使用 `Article`、`Feed` 替代同一业务对象；独立内容类型另行定义 |
+| 详情 | `Detail` | 单个对象的详细业务视图；与列表项、概览按实际语义区分 |
+| 摘要 | `Summary` | 精简的业务结果，不与 `Overview` 随意互换 |
+| 概览 | `Overview` | 聚合呈现对象及相关指标、状态等信息 |
+| 列表 | `List` | 不分页集合，统一作为查询名称的结果后缀 |
+| 分页结果 | `Page` | 分页集合，统一作为查询名称的结果后缀 |
+| 统计 | `Statistics` | 多项统计指标；单一对象数量使用 `count` |
+| 业务状态 | `Status` | 相同业务状态不混用 `State`；独立状态机概念另行定义 |
+| 验证码 | `VerificationCode` | 不使用 `Captcha` 表达所有验证码；图形验证码是独立概念 |
+
+### 7.2 参数名称与格式
+
+业务请求参数统一使用英文 snake_case。相同含义的字段，在 Query 参数和 JSON 请求体中使用相同名称，不能一处写 `user_id`、另一处写 `uid` 或 `userId`。集合参数沿用库表规范中的 `_list`、`_set` 等语义后缀；批量目标使用请求体数组，不使用逗号拼接字符串。
+
+| 参数概念 | 统一名称 | 说明 |
+| --- | --- | --- |
+| 内部用户标识 | `user_id` | 与账户标识、展示名称区分 |
+| 内部订单标识 | `order_id` | 与业务订单编号 `order_no` 区分 |
+| 内部帖子标识 | `post_id` | 不使用 `pid` 等缩写 |
+| 用户标识列表 | `user_id_list` | 请求体中使用数组，说明顺序与重复值规则，不混用 `user_ids` |
+| 订单标识列表 | `order_id_list` | 与单个 `order_id` 区分，不混用 `order_ids` |
+| 用户展示昵称 | `user_name` | 沿用项目现有含义，不代表登录账户，不与 `nickname` 混用 |
+| 账户来源 | `account_source` | 与外部账户标识共同表达账户身份 |
+| 外部账户标识 | `external_account_id` | 沿用现有模型和库表用词，不与内部 `user_id` 混用 |
+| 头像地址 | `avatar_url` | 不使用 `avatar`、`head_img` 替代同一参数 |
+| 页码 | `page_number` | 页码分页统一使用此名称，不混用 `page`、`page_no`、`page_index`；从 1 开始 |
+| 每页数量 | `page_size` | 页码分页、游标分页均使用此名称 |
+| 翻页令牌 | `page_token` | 用于游标分页，不与 `page_number` 在同一接口中混用 |
+| 检索关键词 | `keyword` | 不混用 `q`、`key` 等别名 |
+
+分页接口必须明确默认值、数量上限和翻页规则。统一参数名称不表示所有接口都必须支持这些参数；单条查询不增加无意义的分页参数。
+
+## 8. 业务用例与 DTO 的严格对应关系
+
+路由最后一段的完整业务用例名是命名基准。每个业务用例必须且只能对应一对专属命名的请求、响应 DTO；请求 DTO 和响应 DTO 分别与该业务用例一一对应。Controller 方法、DTO 类型和 DTO 文件均由该用例名按固定规则确定，不允许各自起名。
+
+一一对应及名称唯一性以同一领域、同一主版本为范围；不同领域或不同主版本可以在各自的包中使用相同的 DTO 名，不额外拼接版本号。
+
+```text
+Go 用例名       = 完整业务用例名转为 Go 导出标识符形式
+Controller 方法 = Go 用例名
+请求 DTO 名     = Go 用例名 + Request
+响应 DTO 名     = Go 用例名 + Response
+DTO 文件名      = 完整业务用例名转为 snake_case + .go
+```
+
+转换时只改变命名格式和第 4.3 节约定的缩写写法，如路由中的 `Id` 对应 Go 标识符中的 `ID`；业务词、单复数及限定部分必须全部保留。
+
+| 项目 | 示例 |
+| --- | --- |
+| domain 目录与领域分组 | `app/domains/user` 对应 `/user` |
+| Controller 类型与 Controller 分组 | `UserProfileController` 对应 `/userProfile` |
+| 路由用例 | `queryUserProfileByUserId` |
+| 完整路由 | `/api/v1/user/userProfile/queryUserProfileByUserId` |
+| Controller 方法 | `QueryUserProfileByUserID` |
+| 请求 DTO | `QueryUserProfileByUserIDRequest` |
+| 响应 DTO | `QueryUserProfileByUserIDResponse` |
+| DTO 文件 | `query_user_profile_by_user_id.go` |
+
+必须遵守以下约束：
+
+1. 动作、业务对象、`List`、`Page`、`batch` 前缀、`By...` 限定等都是完整用例名的一部分。不得在 DTO 名中省略、替换同义词或增添另一套业务限定。
+2. 例如 `queryUserProfileByUserId` 必须使用 `QueryUserProfileByUserIDRequest` 和 `QueryUserProfileByUserIDResponse`，不能改用 `GetUserRequest`、`UserProfileRequest` 或 `QueryUserProfileResponse`。
+3. 不同业务用例必须分别声明自己的请求、响应 DTO 名称，即使当前字段完全相同，也不能共用某个用例的顶层 DTO 名，或共用 `CommonRequest`、`CommonResponse` 代替各自的 DTO。
+4. 共享字段可以通过 `shared` 子结构、组合或指向共享结构的类型别名复用，但必须保留各用例专属的 DTO 声明和名称。“专属”约束顶层声明名和用途，不要求复制相同字段。不能直接以 `shared.UserProfile` 等共享结构名代替用例对应的 Response 名。
+5. 没有业务入参或没有业务返回字段时，也声明对应命名的空 Request 或 Response DTO。空 DTO 不改变 GET 参数位置，也不要求增加无意义的请求体或响应字段；GET 的空 Request 不表示客户端需要发送 `{}`。
+6. 业务用例改名时，必须同步修改 Controller 方法、Request、Response、DTO 文件名及相关引用、文档，不能只修改路由末段或其中一个 DTO 名。
+
+请求和响应 DTO 放在对应领域的 `dto/v{主版本号}` 中，语义一致的共享结构放在该版本的 `shared` 中，如 `dto/v1`、`dto/v1/shared`。V2 接口使用 `dto/v2`、`dto/v2/shared`，不复用 V1 目录承载新的版本契约。一个 DTO 文件组织同一用例的请求、响应定义。
+
+Controller 分组用于组织路由，DTO 继续按完整业务用例命名，不额外拼接 `Controller`。不同 Controller 承载的独立业务契约必须使用可区分的用例名称，避免在同一版本的 DTO 目录中产生同名但含义不同的类型。
+
+领域 Router 在已有版本分组下，依次注册 domain、Controller 和业务用例，不重复拼接 `/api/v1`：
+
+```go
+func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
+	user := v1.Group("/user")
+	userProfile := user.Group("/userProfile")
+	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
+}
+```
+
+Controller 从 Query 参数解析 `user_id`，校验后填充请求 DTO。路由、方法、DTO 的名称对齐要求不扩展为必须将 Repository 的数据库操作名称也改成对外接口名。
+
+## 9. 现有接口的对齐
+
+现有路由与目标路由的对应关系：
+
+| 现有路由 | 规范目标路由 |
+| --- | --- |
+| `GET /api/v1/users/:user_id` | `GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` |
+| `GET /health` | `GET /api/v1/system/health/queryHealth`，须先建立对应的 `system` domain 和 `HealthController` |
+
+路由迁移必须同步调整参数读取、接口说明、调用示例及调用方，不能只替换路由字符串。用户资料接口迁移时，须将 Controller 中的 `ctx.Param("user_id")` 同步改为读取 Query 参数，并继续执行原有 ID 校验。
+
+本文新增的是接口规范；现有路由在完成相应实现调整前仍按当前代码运行。新接口及后续路由调整统一遵守本文，不再增加另一套资源式路由。
