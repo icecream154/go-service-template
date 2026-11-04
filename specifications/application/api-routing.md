@@ -17,7 +17,6 @@ GET  /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123
 GET  /api/v1/user/userProfile/queryUserPage?page_number=1&page_size=20
 POST /api/v1/user/userProfile/updateUserProfile
 POST /api/v1/order/order/cancelOrder
-GET  /api/v1/system/health/queryHealth
 ```
 
 普通增删改查也使用上述格式，不与 `/user/{user_id}`、`POST /user` 等资源式路由混用。本规范中的示例表示应采用的命名，不表示对应接口已经实现。
@@ -52,7 +51,7 @@ GET  /api/v1/system/health/queryHealth
 | 订单 | `app/domains/order` | `/order` | `Order` |
 | 帖子 | `app/domains/post` | `/post` | `Post` |
 
-新增或重命名 domain 时，须同步维护领域路径及相关文档。系统能力同样遵守此规则；本文 `/system/health/queryHealth` 的目标路由以新增 `app/domains/system` 及其 `HealthController` 为前提，当前代码尚无该 domain 和 Controller。
+新增或重命名 domain 时，须同步维护领域路径及相关文档。系统接口同样按实际 domain 目录和 Controller 类型确定路由，遵守统一的路径格式。
 
 会员权益等归属用户领域的能力，可以由 `UserMembershipController` 处理，对应 `/user/userMembership/renewUserMembership`；不因增加一个 Controller 就必须新增一级领域分组。
 
@@ -182,54 +181,70 @@ cancel + Order                = cancelOrder
 
 有明确业务含义的操作优先使用具体动作。不得通过 `updateOrderStatus` 加任意目标状态，绕过取消、审批、完成等各自不同的校验和处理流程。
 
-同一能力不同时提供 `enableUser`、`disableUser` 和 `toggleUserEnabled` 等相互重叠的入口。状态操作名称应表达明确目标，避免使用依赖当前状态翻转结果的 `toggle`。
+状态变更接口应明确表达目标状态。例如，`enableUser` 将用户设为启用，`disableUser` 将用户设为停用，这两个接口可以同时提供。避免使用 `toggleUserEnabled` 等翻转当前状态的接口，以免重复请求时再次翻转状态，产生与调用方预期不一致的结果。
 
 新增动作前先检查本表。确实属于新的业务语义时，补充其固定英文词、适用边界和示例，再在各接口中统一使用；不因某个开发者习惯不同而新增同义词。
 
-## 7. 常见业务概念与参数用词
+## 7. 通用概念与参数命名
 
-### 7.1 业务概念
+### 7.1 通用概念用词
 
-接口与存储共用的业务概念沿用[库表设计规范](../databases/mysql/schema-design.md)中的业务概念用词表，Controller 分组、业务用例和参数按各自约定转换命名格式；领域路径严格沿用 domain 目录原名。不得在接口层另换同义词。本表列出常见概念并补充接口视图用词。
+本节统一跨业务通用概念的英文词根和语义边界。具体领域对象、业务身份、字段含义及对象关系由各业务定义，并在接口中使用一致的术语。
 
-| 中文概念 | 统一英文 | 说明 |
+下表中的词根按使用位置转换命名格式：Controller 分组、业务用例使用 lowerCamelCase，Go 导出标识符按第 4.3 节处理，请求参数使用 snake_case；领域段仍严格沿用 domain 目录原名。
+
+| 通用概念 | 统一英文词根 | 语义边界 |
 | --- | --- | --- |
-| 用户 | `User` | 不使用 `Customer`、`Member` 作为用户的同义名称；独立客户、成员概念须另行定义 |
-| 用户资料 | `UserProfile` | 不使用 `UserInfo`、`UserData` 替代同一份资料 |
-| 账户 | `Account` | 表达账户身份，不与展示资料 `Profile` 混用 |
-| 会员权益 | `Membership` | 如 `UserMembership`；不使用 `Vip`、`MemberInfo` 表达相同权益概念 |
-| 订单 | `Order` | 会员订单使用 `MembershipOrder`，不随意改称 `Trade`、`Transaction` |
-| 帖子 | `Post` | 不使用 `Article`、`Feed` 替代同一业务对象；独立内容类型另行定义 |
-| 详情 | `Detail` | 单个对象的详细业务视图；与列表项、概览按实际语义区分 |
-| 摘要 | `Summary` | 精简的业务结果，不与 `Overview` 随意互换 |
-| 概览 | `Overview` | 聚合呈现对象及相关指标、状态等信息 |
-| 列表 | `List` | 不分页集合，统一作为查询名称的结果后缀 |
-| 分页结果 | `Page` | 分页集合，统一作为查询名称的结果后缀 |
-| 统计 | `Statistics` | 多项统计指标；单一对象数量使用 `count` |
-| 业务状态 | `Status` | 相同业务状态不混用 `State`；独立状态机概念另行定义 |
-| 验证码 | `VerificationCode` | 不使用 `Captcha` 表达所有验证码；图形验证码是独立概念 |
+| 对象标识 | `id` | 标识对象身份，与业务编号、编码区分；Go 标识符中写为 `ID` |
+| 业务编号 | `no` | 表达业务使用的编号，同一含义不混用 `num`、`number`；页码等数值位置不属于业务编号 |
+| 编码 | `code` | 表达约定编码体系中的代码，与对象标识 `id` 区分 |
+| 状态 | `status` | 表达对象的业务状态，不用 `state` 替代同一概念；独立状态机概念另行定义 |
+| 类型 | `type` | 表达对象或操作的类型，不与分类 `category` 混用 |
+| 分类 | `category` | 表达分类归属，不作为 `type` 的同义词 |
+| 名称 | `name` | 表达对象名称，不与内容标题 `title` 混用 |
+| 标题 | `title` | 表达内容或展示单元的标题，不作为 `name` 的随意替换 |
+| 详情 | `detail` | 单个对象的详细业务视图，与摘要、概览区分 |
+| 摘要 | `summary` | 对明确对象或内容的精简表达，不与概览随意互换 |
+| 概览 | `overview` | 对一个业务范围内的对象、状态或指标进行综合呈现 |
+| 列表 | `list` | 保留元素顺序的集合；作为查询用例后缀时，按第 5 节表示不分页结果 |
+| 集合 | `set` | 元素唯一，业务语义不依赖顺序 |
+| 键值映射 | `map` | 通过明确的键定位值，须说明键和值的含义 |
+| 分页结果 | `page` | 具有明确分页契约的集合，作为查询用例的结果后缀 |
+| 统计结果 | `statistics` | 一份统计结果，可包含多个指标；单一对象个数按第 5 节使用 `count` 动作 |
+| 对象个数 | `count` | 表达统计范围内的对象个数，不与业务计量数量混用 |
+| 业务计量数量 | `quantity` | 表达带业务单位的数量，须明确单位，不作为 `count` 的同义词 |
+| 金额 | `amount` | 表达金额，须明确币种和计价单位，不与对象个数或单价混用 |
+| 单价 | `price` | 表达每个计量单位的价格，与总金额区分 |
+
+具体接口按实际业务语义选用词根；视图的划分依据业务目的和契约，字段数量不直接决定其名称。
 
 ### 7.2 参数名称与格式
 
-业务请求参数统一使用英文 snake_case。相同含义的字段，在 Query 参数和 JSON 请求体中使用相同名称，不能一处写 `user_id`、另一处写 `uid` 或 `userId`。集合参数沿用库表规范中的 `_list`、`_set` 等语义后缀；批量目标使用请求体数组，不使用逗号拼接字符串。
+业务请求参数统一使用英文 snake_case。相同含义的参数在不同接口、Query 参数和 JSON 请求体中使用相同名称，不因所属 Controller 或传递位置不同而另起简称。
 
-| 参数概念 | 统一名称 | 说明 |
+下表中的 `<object>` 表示具体业务对象的统一英文名称，按 snake_case 填写，实际参数中不保留尖括号。对象名称由业务术语确定，本规范不预设具体业务实体。
+
+| 参数概念 | 统一名称或格式 | 说明 |
 | --- | --- | --- |
-| 内部用户标识 | `user_id` | 与账户标识、展示名称区分 |
-| 内部订单标识 | `order_id` | 与业务订单编号 `order_no` 区分 |
-| 内部帖子标识 | `post_id` | 不使用 `pid` 等缩写 |
-| 用户标识列表 | `user_id_list` | 请求体中使用数组，说明顺序与重复值规则，不混用 `user_ids` |
-| 订单标识列表 | `order_id_list` | 与单个 `order_id` 区分，不混用 `order_ids` |
-| 用户展示昵称 | `user_name` | 沿用项目现有含义，不代表登录账户，不与 `nickname` 混用 |
-| 账户来源 | `account_source` | 与外部账户标识共同表达账户身份 |
-| 外部账户标识 | `external_account_id` | 沿用现有模型和库表用词，不与内部 `user_id` 混用 |
-| 头像地址 | `avatar_url` | 不使用 `avatar`、`head_img` 替代同一参数 |
+| 对象标识 | `<object>_id` | 说明标识的对象、范围和取值约束，不与业务编号混用 |
+| 业务编号 | `<object>_no` | 与对象标识 `<object>_id` 区分 |
+| 业务编码 | `<object>_code` | 与业务编号、对象标识分别定义 |
+| 对象标识列表 | `<object>_id_list` | 使用数组，说明顺序和重复值规则，不另用复数形式作为同义名称 |
+| 对象标识集合 | `<object>_id_set` | 使用数组，元素唯一，业务不依赖顺序；明确重复值的校验或去重规则 |
 | 页码 | `page_number` | 页码分页统一使用此名称，不混用 `page`、`page_no`、`page_index`；从 1 开始 |
 | 每页数量 | `page_size` | 页码分页、游标分页均使用此名称 |
-| 翻页令牌 | `page_token` | 用于游标分页，不与 `page_number` 在同一接口中混用 |
+| 翻页令牌 | `page_token` | 用于游标分页，作为不透明令牌传递，不依赖内部编码；不与 `page_number` 在同一接口中混用 |
 | 检索关键词 | `keyword` | 不混用 `q`、`key` 等别名 |
 
-分页接口必须明确默认值、数量上限和翻页规则。统一参数名称不表示所有接口都必须支持这些参数；单条查询不增加无意义的分页参数。
+批量目标按第 3 节通过 POST 请求体中的数组传递，不使用逗号拼接字符串。参数包含多个相同类型但角色不同的对象时，须在名称中写明角色，避免使用含义不明的编号后缀区分。
+
+分页接口必须明确默认值、数量上限和翻页规则。具体接口按业务需要选择参数，单条查询不增加分页参数，页码分页与游标分页分别采用各自约定的输入。
+
+### 7.3 业务术语的维护
+
+1. 同一业务概念使用相同英文词根和命名格式；含义不同的概念分别定义，不能仅因中文称呼相近就共用一个词。
+2. 新增领域概念时，在对应业务的接口说明中记录中文含义、统一英文词、适用边界及命名示例，供该业务的各接口共同遵守。
+3. 跨业务共用的通用概念统一维护其词汇约定，不在单个接口中重新定义。本节不依据示例代码或数据库表推导通用于所有业务的实体含义和字段语义。
 
 ## 8. 业务用例与 DTO 的严格对应关系
 
@@ -282,16 +297,3 @@ func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 ```
 
 Controller 从 Query 参数解析 `user_id`，校验后填充请求 DTO。路由、方法、DTO 的名称对齐要求不扩展为必须将 Repository 的数据库操作名称也改成对外接口名。
-
-## 9. 现有接口的对齐
-
-现有路由与目标路由的对应关系：
-
-| 现有路由 | 规范目标路由 |
-| --- | --- |
-| `GET /api/v1/users/:user_id` | `GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` |
-| `GET /health` | `GET /api/v1/system/health/queryHealth`，须先建立对应的 `system` domain 和 `HealthController` |
-
-路由迁移必须同步调整参数读取、接口说明、调用示例及调用方，不能只替换路由字符串。用户资料接口迁移时，须将 Controller 中的 `ctx.Param("user_id")` 同步改为读取 Query 参数，并继续执行原有 ID 校验。
-
-本文新增的是接口规范；现有路由在完成相应实现调整前仍按当前代码运行。新接口及后续路由调整统一遵守本文，不再增加另一套资源式路由。

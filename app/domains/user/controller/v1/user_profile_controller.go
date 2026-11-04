@@ -24,12 +24,12 @@ func NewUserProfileController() *UserProfileController {
 }
 
 // QueryUserProfileByUserID 解析用户 ID、查询领域模型并构造用户资料响应。
-// 路径中的 user_id 按十进制解析为正 int64，格式错误、越界或非正数返回 400。
+// Query 参数 user_id 必填，按十进制解析为正 int64，缺失、格式错误、越界或非正数返回 400。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
-	// 路径参数是字符串，显式解析后填入请求 DTO；解析错误时不会继续查询。
+	// Query 参数是字符串，显式解析后填入请求 DTO；解析错误时不会继续查询。
 	var request userv1dto.QueryUserProfileByUserIDRequest
-	userID, err := strconv.ParseInt(ctx.Param("user_id"), 10, 64)
+	userID, err := strconv.ParseInt(ctx.Query("user_id"), 10, 64)
 	if err != nil || userID <= 0 {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "user_id must be a positive 64-bit integer"})
 		return

@@ -18,9 +18,10 @@ func NewRouter() *UserRouter {
 	return &UserRouter{userProfiles: userv1controller.NewUserProfileController()}
 }
 
-// RegisterV1Routes 在传入的 V1 分组下注册用户资源路由。
-// user_id 是必填路径参数，交给控制器解析并输出响应。
+// RegisterV1Routes 在传入的 V1 分组下按领域、Controller 和业务用例注册路由。
+// user_id 是必填 Query 参数，交给控制器解析并输出响应。
 func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
-	users := v1.Group("/users")
-	users.GET("/:user_id", r.userProfiles.QueryUserProfileByUserID)
+	user := v1.Group("/user")
+	userProfile := user.Group("/userProfile")
+	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
 }

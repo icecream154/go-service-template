@@ -32,22 +32,10 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 ## 请求与响应
 
-```sh
-curl -i http://localhost:8080/health
-```
-
-`GET /health` 返回 HTTP 200：
-
-```json
-{"status":"ok"}
-```
-
-健康检查表示 HTTP 进程存活；数据库在启动时校验，此接口不会持续探测数据库。
-
-`GET /api/v1/users/:user_id` 按内部用户 ID 查询基本资料。路径参数须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
+`GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
 
 ```sh
-curl -i http://localhost:8080/api/v1/users/1234567890123456789
+curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?user_id=1234567890123456789"
 ```
 
 查询成功返回 HTTP 200：
@@ -60,13 +48,13 @@ curl -i http://localhost:8080/api/v1/users/1234567890123456789
 
 | 情况 | HTTP 状态 | JSON 响应 |
 | --- | --- | --- |
-| ID 格式错误、非正数或超出 int64 范围 | 400 | `{"error":"user_id must be a positive 64-bit integer"}` |
+| ID 缺失、格式错误、非正数或超出 int64 范围 | 400 | `{"error":"user_id must be a positive 64-bit integer"}` |
 | 用户资料不存在 | 404 | `{"error":"user profile not found"}` |
 | 查询或其他内部错误 | 500 | `{"error":"internal server error"}` |
 
-调用链为 Controller → Service → Repository。Controller 解析路径参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，仅输出用户 ID、昵称和头像。
+调用链为 Controller → Service → Repository。Controller 解析 Query 参数并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造查询响应 DTO，仅输出用户 ID、昵称和头像。
 
-顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。`app/domains/user/routers/router.go` 创建并持有用户 Controller，在版本分组下挂载 `/users`。当前用户资料接口只注册版本化路径，不保留 `/users/:user_id` 别名；`/health` 位于版本分组之外。
+顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，依次挂载 `/user`、`/userProfile` 和 `/queryUserProfileByUserId`。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)。
 
 Controller 与 DTO 放在对应领域的 `controller/v1`、`dto/v1` 中，通用响应字段放在 `dto/v1/shared`。新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、DTO 和注册方法；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
 
@@ -141,7 +129,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
-| `app/domains/*/routers` | 创建领域 Controller，在指定版本组中注册领域接口 |
+| `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
 | `app/domains/*/controller/v1`、`dto/v1` | V1 请求处理与请求、响应数据结构 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |
 | `internal/database/mysql/config.go` | 选择并解码 YAML、展开环境变量、组织校验 |
