@@ -1,13 +1,15 @@
 package v1
 
 import (
-	"math"
-	"net/url"
-	"strings"
-	"unicode/utf8"
+	"fmt"
 
+	userapierror "go-service-template/app/domains/user/apierror"
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
+	"go-service-template/app/domains/user/models"
+	userservice "go-service-template/app/domains/user/service"
+	"go-service-template/internal/check/relation"
+	"go-service-template/internal/check/scalar"
 	"go-service-template/internal/response"
 	commonvalidator "go-service-template/internal/validator"
 
@@ -40,53 +42,32 @@ func (v *UpdateUserProfileValidator) UpdateUserProfile(ctx *gin.Context) {
 	v.controller.UpdateUserProfile(ctx, &request)
 }
 
-// validateUpdateUserProfileRequest 在函数内完整校验更新输入，不改写 DTO 或读取业务状态。
+// validateUpdateUserProfileRequest 组合数值检查、用例版本边界和完整领域字段规则。
 // 按请求字段顺序汇总问题，每个字段最多一条；头像必须是非空的 HTTP/HTTPS 地址。
 func validateUpdateUserProfileRequest(request *userv1dto.UpdateUserProfileRequest) []response.FieldError {
 	details := make([]response.FieldError, 0, 5)
-	if request.OperatorUserID <= 0 {
+	if err := scalar.PositiveInt64(request.OperatorUserID); err != nil {
 		details = append(details, response.FieldError{Field: "operator_user_id", Reason: "must be a positive 64-bit integer"})
 	}
-	if request.UserID <= 0 {
+	if err := scalar.PositiveInt64(request.UserID); err != nil {
 		details = append(details, response.FieldError{Field: "user_id", Reason: "must be a positive 64-bit integer"})
 	}
-	if request.ExpectedVersion == nil {
+	if err := relation.NotNil(request.ExpectedVersion); err != nil {
 		details = append(details, response.FieldError{Field: "expected_version", Reason: "must be explicitly provided with a non-null integer"})
-	} else if *request.ExpectedVersion < 0 || *request.ExpectedVersion == math.MaxInt64 {
-		details = append(details, response.FieldError{Field: "expected_version", Reason: "must be between 0 and 9223372036854775806"})
+	} else if err := scalar.Int64InRange(*request.ExpectedVersion, userservice.MinUserProfileExpectedVersion, userservice.MaxUserProfileExpectedVersion); err != nil {
+		details = append(details, response.FieldError{
+			Field:  "expected_version",
+			Reason: fmt.Sprintf("must be between %d and %d", userservice.MinUserProfileExpectedVersion, userservice.MaxUserProfileExpectedVersion),
+		})
 	}
 
-	var nameReason string
-	switch {
-	case !utf8.ValidString(request.UserName):
-		nameReason = "must be valid UTF-8 text"
-	case strings.TrimSpace(request.UserName) == "":
-		nameReason = "must not be blank"
-	case utf8.RuneCountInString(request.UserName) > 64:
-		nameReason = "must contain at most 64 Unicode code points"
-	}
-	if nameReason != "" {
-		details = append(details, response.FieldError{Field: "user_name", Reason: nameReason})
+	if err := models.ValidateUserName(request.UserName); err != nil {
+		details = append(details, userapierror.FieldValidationDetail(err))
 	}
 
-	avatarURL := request.AvatarURL
-	var avatarReason string
-	switch {
-	case !utf8.ValidString(avatarURL):
-		avatarReason = "must be valid UTF-8 text"
-	case strings.TrimSpace(avatarURL) == "":
-		// 标准绑定下，缺失、null 和空字符串都按未提供有效头像处理。
-		avatarReason = "must not be blank"
-	case utf8.RuneCountInString(avatarURL) > 512:
-		avatarReason = "must contain at most 512 Unicode code points"
-	default:
-		parsed, err := url.Parse(avatarURL)
-		if err != nil || parsed == nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
-			avatarReason = "must be an absolute HTTP(S) URL with a hostname"
-		}
-	}
-	if avatarReason != "" {
-		details = append(details, response.FieldError{Field: "avatar_url", Reason: avatarReason})
+	// 更新接口要求有效头像，缺失、null 和空字符串都由有值规则拒绝。
+	if err := models.ValidateAvatarURL(request.AvatarURL); err != nil {
+		details = append(details, userapierror.FieldValidationDetail(err))
 	}
 	return details
 }

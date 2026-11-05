@@ -153,7 +153,7 @@ Gin 根据标签把 JSON 字段填入 DTO，并完成类型转换。解析或类
 
 ### 3.4 私有校验函数判断输入是否有效
 
-同一个 validator 文件内的 `validateCreateUserRequest` 完整实现该用例的字段校验：
+同一个 validator 文件内的 `validateCreateUserRequest` 组织该用例的字段校验，创建头像的可选分支在这里处理。账户、昵称和头像的完整字段规则统一调用 [models 的领域规则](../../app/domains/user/models/user_profile_validation.go)，由领域规则组合公共数据检查：
 
 | 字段 | 当前规则 |
 | --- | --- |
@@ -162,7 +162,7 @@ Gin 根据标签把 JSON 字段填入 DTO，并完成类型转换。解析或类
 | `user_name` | 非空白、合法 UTF-8，最多 64 个 Unicode 码点 |
 | `avatar_url` | 创建时可省略、为 `null` 或空字符串；非空时须为有效 HTTP/HTTPS 地址，最多 512 个 Unicode 码点 |
 
-校验针对绑定后的字段，不改变原值，也不查询数据库。问题按字段顺序汇总为 `[]response.FieldError`，每个字段最多一条。
+校验针对绑定后的字段，不改变原值，也不查询数据库。领域规则返回带内部字段标识的 `FieldValidationError`，由 [FieldValidationDetail](../../app/domains/user/apierror/field_validation.go) 映射为 HTTP 字段名和公开原因。问题按字段顺序汇总为 `[]response.FieldError`，每个字段最多一条。
 
 入口方法根据校验结果决定是否继续：
 
@@ -205,7 +205,7 @@ Controller 将请求字段组织为 [CreateUserParams](../../app/domains/user/se
 
 [UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用现有的私有 `validateCreateUser`。这些 Service 输入检查位于 [user_profile_validation.go](../../app/domains/user/service/user_profile_validation.go)，用于保障非 HTTP 调用也遵守输入约束。
 
-HTTP 请求校验在对应 Validator 的私有函数中独立实现，Service 保留自己的输入防御和业务判断。
+Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值集中声明在 [Service Params](../../app/domains/user/service/user_profile_params.go)，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
 
 输入通过后，Service 从 `appruntime.Current().Repositories.UserProfile` 取得共享仓储，并执行创建流程：
 
@@ -350,7 +350,7 @@ HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体
 
 ## 6. 其余接口如何套用这条链路
 
-当前五个用户资料接口都注册到各自的 Validator，文件均按“结构体、构造函数、入口方法、私有校验函数”组织。各 `validateXxxRequest` 在函数内部完整实现自身规则。
+当前五个用户资料接口都注册到各自的 Validator，文件均按“结构体、构造函数、入口方法、私有校验函数”组织。各 `validateXxxRequest` 完整组合自身接口规则，基础类型检查复用 `internal/check`，领域字段复用 models，用例边界和默认值引用 Service Params 的声明。
 
 | 接口 | Validator 入口 | 相比创建接口的主要差异 |
 | --- | --- | --- |

@@ -11,8 +11,14 @@ import (
 // 未识别的错误（包括 nil）统一回退为内部错误，不暴露原始错误信息。
 // 调用方仅在业务操作失败时调用；内部错误的原始详情由调用方记录到服务端日志。
 func FromError(err error) response.ErrorInfo {
+	var fieldValidation *usererrors.FieldValidationError
 	var invalidArgument *usererrors.InvalidArgumentError
 	switch {
+	case errors.As(err, &fieldValidation) && fieldValidation != nil:
+		if detail, ok := fieldValidationDetail(fieldValidation); ok {
+			return response.InvalidArgument("", detail)
+		}
+		return response.InternalError()
 	case errors.As(err, &invalidArgument) && invalidArgument != nil:
 		return response.InvalidArgument("", response.FieldError{
 			Field: invalidArgument.Field, Reason: invalidArgument.Reason,

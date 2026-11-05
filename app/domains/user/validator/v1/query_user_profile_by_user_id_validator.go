@@ -1,10 +1,9 @@
 package v1
 
 import (
-	"strconv"
-
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
+	"go-service-template/internal/check/scalar"
 	"go-service-template/internal/response"
 	commonvalidator "go-service-template/internal/validator"
 
@@ -36,12 +35,11 @@ func (v *QueryUserProfileByUserIDValidator) QueryUserProfileByUserID(ctx *gin.Co
 	v.controller.QueryUserProfileByUserID(ctx, &request)
 }
 
-// validateQueryUserProfileByUserIDRequest 在函数内部完成 ID 格式、范围和正数校验。
+// validateQueryUserProfileByUserIDRequest 复用公共检查验证 ID 文本的格式、范围和正数要求。
 // 请求文本保持原值，用户是否存在由 Service 查询时判断。
 func validateQueryUserProfileByUserIDRequest(request *userv1dto.QueryUserProfileByUserIDRequest) []response.FieldError {
 	details := make([]response.FieldError, 0, 1)
-	userID, err := strconv.ParseInt(request.UserID, 10, 64)
-	if err != nil || userID <= 0 {
+	if _, err := scalar.ParsePositiveInt64(request.UserID); err != nil {
 		details = append(details, response.FieldError{
 			Field: "user_id", Reason: "must be a positive 64-bit integer",
 		})

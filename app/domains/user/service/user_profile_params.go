@@ -1,10 +1,26 @@
 package service
 
+import "math"
+
 const (
-	// MaxUserProfileBatchSize 限制一次批量查询提交的 ID 数量，包含重复项。
+	// MinUserProfileBatchSize 表示单次批量查询提交的 ID 数量下限，包含重复项，允许等于该值。
+	MinUserProfileBatchSize = 1
+	// MaxUserProfileBatchSize 表示单次批量查询提交的 ID 数量上限，包含重复项，允许等于该值。
 	MaxUserProfileBatchSize = 100
-	// MaxUserProfilePageSize 限制分页查询每页最多返回的用户数量。
+	// MinUserProfilePageNumber 表示有效页码的下限，允许等于该值。
+	MinUserProfilePageNumber = 1
+	// DefaultUserProfilePageNumber 供入口在未提供页码时准备输入，不覆盖显式非法值。
+	DefaultUserProfilePageNumber = 1
+	// MinUserProfilePageSize 表示每页返回条数的下限，允许等于该值。
+	MinUserProfilePageSize = 1
+	// DefaultUserProfilePageSize 供入口在未提供每页条数时准备输入，不覆盖显式非法值。
+	DefaultUserProfilePageSize = 20
+	// MaxUserProfilePageSize 表示每页返回条数的上限，允许等于该值。
 	MaxUserProfilePageSize = 100
+	// MinUserProfileExpectedVersion 表示更新资料时允许提交的版本下限，允许等于该值。
+	MinUserProfileExpectedVersion int64 = 0
+	// MaxUserProfileExpectedVersion 表示允许提交的版本上限，包含边界，并为成功后的版本递增保留空间。
+	MaxUserProfileExpectedVersion int64 = math.MaxInt64 - 1
 )
 
 // CreateUserParams 表示首次注册所需的外部账户身份与初始资料。
@@ -26,19 +42,19 @@ type UpdateUserProfileParams struct {
 	OperatorUserID int64
 	// UserID 是本次修改的目标用户。
 	UserID int64
-	// ExpectedVersion 是读取资料时取得的旧版本，成功后递增。
+	// ExpectedVersion 是读取资料时取得的旧版本，成功后递增，取值位于公开版本边界内。
 	ExpectedVersion int64
 	// UserName 是替换后的昵称，不能只包含空白。
 	UserName string
-	// AvatarURL 是替换后的头像；nil 明确表示清空头像。
+	// AvatarURL 是替换后的非空头像地址，必须非 nil；本用例不支持清空头像。
 	AvatarURL *string
 }
 
 // QueryUserProfilePageParams 表示页码分页与可选的精确筛选条件。
 type QueryUserProfilePageParams struct {
-	// PageNumber 从 1 开始，调用方负责填入接口约定的默认值。
+	// PageNumber 不小于 MinUserProfilePageNumber，调用方在未提供时显式采用默认值。
 	PageNumber int
-	// PageSize 取值为 1～MaxUserProfilePageSize。
+	// PageSize 取值位于 MinUserProfilePageSize～MaxUserProfilePageSize，包含边界。
 	PageSize int
 	// UserName 非空时按完整昵称精确匹配。
 	UserName string

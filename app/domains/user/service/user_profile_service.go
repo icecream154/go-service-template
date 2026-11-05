@@ -2,7 +2,6 @@
 package service
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 
@@ -10,6 +9,8 @@ import (
 	"go-service-template/app/domains/user/models"
 	"go-service-template/app/domains/user/repository"
 	"go-service-template/app/domains/user/tables"
+	"go-service-template/internal/check/scalar"
+	"go-service-template/internal/database/sqlvalue"
 	appruntime "go-service-template/internal/runtime"
 	"go-service-template/internal/snowflake"
 
@@ -32,7 +33,7 @@ func NewUserProfileService() *UserProfileService {
 // 查询未命中转换为 ErrUserProfileNotFound，其他仓储错误原样返回供上层记录。
 // 本层不构造 HTTP 响应，也不决定对外业务错误码。
 func (s *UserProfileService) QueryUserProfileByUserID(userID int64) (*models.UserProfile, error) {
-	if userID <= 0 {
+	if err := scalar.PositiveInt64(userID); err != nil {
 		return nil, usererrors.ErrInvalidUserID
 	}
 
@@ -69,7 +70,7 @@ func createUser(params CreateUserParams, profiles *repository.UserProfileReposit
 	}
 	profile := &tables.UserProfile{
 		ID: id, AccountSource: params.AccountSource, ExternalAccountID: params.ExternalAccountID,
-		UserName: params.UserName, AvatarURL: avatarValue(params.AvatarURL), IsEnabled: true, Version: 0,
+		UserName: params.UserName, AvatarURL: sqlvalue.ToNullString(params.AvatarURL), IsEnabled: true, Version: 0,
 	}
 	if err := profiles.CreateProfile(profile); err != nil {
 		var driverError *mysqldriver.MySQLError
@@ -92,6 +93,10 @@ func (s *UserProfileService) UpdateUserProfile(params UpdateUserProfileParams) (
 	if err := validateUpdateUserProfile(params); err != nil {
 		return nil, err
 	}
+	// 纯输入规则通过后，再判断当前用例的本人操作约束；身份真实性仍由认证入口负责。
+	if params.OperatorUserID != params.UserID {
+		return nil, usererrors.ErrUserProfilePermissionDenied
+	}
 	return updateUserProfile(params, appruntime.Current().DB.User)
 }
 
@@ -113,7 +118,7 @@ func updateUserProfile(params UpdateUserProfileParams, db *gorm.DB) (*models.Use
 			return usererrors.ErrUserProfileVersionConflict
 		}
 		affected, err := profiles.UpdateProfile(params.UserID, params.ExpectedVersion, tables.UserProfile{
-			UserName: params.UserName, AvatarURL: avatarValue(params.AvatarURL),
+			UserName: params.UserName, AvatarURL: sqlvalue.ToNullString(params.AvatarURL),
 		})
 		if err != nil {
 			return err
@@ -211,12 +216,4 @@ func profileModel(profile *tables.UserProfile) *models.UserProfile {
 		userProfile.AvatarURL = &avatarURL
 	}
 	return userProfile
-}
-
-// avatarValue 保留未提供、空字符串以及具体 URL 三种状态。
-func avatarValue(avatar *string) sql.NullString {
-	if avatar == nil {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: *avatar, Valid: true}
 }

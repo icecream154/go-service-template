@@ -1,10 +1,13 @@
 package v1
 
 import (
-	"strconv"
+	"fmt"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userservice "go-service-template/app/domains/user/service"
+	"go-service-template/internal/check/collection"
+	"go-service-template/internal/check/scalar"
 	"go-service-template/internal/response"
 	commonvalidator "go-service-template/internal/validator"
 
@@ -37,20 +40,22 @@ func (v *BatchQueryUserProfilesValidator) BatchQueryUserProfiles(ctx *gin.Contex
 	v.controller.BatchQueryUserProfiles(ctx, &request)
 }
 
-// validateBatchQueryUserProfilesRequest 在函数内完整校验列表数量和每项的正 int64 编码。
+// validateBatchQueryUserProfilesRequest 先按用例契约检查数量，再复用公共检查验证元素。
 // 数量按去重前计算，不改写输入顺序；列表字段最多返回一条问题。
 func validateBatchQueryUserProfilesRequest(request *userv1dto.BatchQueryUserProfilesRequest) []response.FieldError {
 	details := make([]response.FieldError, 0, 1)
-	if len(request.UserIDList) == 0 || len(request.UserIDList) > 100 {
-		details = append(details, response.FieldError{Field: "user_id_list", Reason: "must contain between 1 and 100 user IDs"})
+	if err := collection.SliceLengthInRange(request.UserIDList, userservice.MinUserProfileBatchSize, userservice.MaxUserProfileBatchSize); err != nil {
+		details = append(details, response.FieldError{
+			Field:  "user_id_list",
+			Reason: fmt.Sprintf("must contain between %d and %d user IDs", userservice.MinUserProfileBatchSize, userservice.MaxUserProfileBatchSize),
+		})
 		return details
 	}
-	for _, value := range request.UserIDList {
-		userID, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || userID <= 0 {
-			details = append(details, response.FieldError{Field: "user_id_list", Reason: "each item must be a positive 64-bit integer string"})
-			break
-		}
+	if err := collection.Each(request.UserIDList, func(value string) error {
+		_, err := scalar.ParsePositiveInt64(value)
+		return err
+	}); err != nil {
+		details = append(details, response.FieldError{Field: "user_id_list", Reason: "each item must be a positive 64-bit integer string"})
 	}
 	return details
 }
