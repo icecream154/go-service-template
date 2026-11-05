@@ -36,123 +36,105 @@
 
 同一校验相关常量只集中声明一次。领域规则的校验相关常量归属 models；接口专属的校验相关常量归属对应 Validator；业务用例输入契约的校验相关常量归属 Service Params。各包需要复用时，引用所属包公开的契约或调用其规则函数，不重新声明同义常量。
 
-### 2.3 三类校验相关常量的声明位置与命名
+### 2.3 三类校验相关常量的声明位置
 
 **声明位置由业务归属决定；是否导出由跨包使用需求决定。** 下表说明各类常量的典型使用方式，不按所在层统一规定该包内所有常量的可见性。
 
-| 校验相关常量类别 | 声明文件 | 命名及可见性 | 引用方式 |
+| 校验相关常量类别 | 声明文件 | 可见性与示例 | 引用方式 |
 | --- | --- | --- | --- |
 | 领域规则 | `app/domains/<domain>/models/<entity>_validation.go`，与对应实体的领域规则放在一起 | 只供规则内部使用时保持包内可见，例如 `minUserNameRuneCount`、`userNamePattern`；需要跨包公开规则元数据时可以导出，例如 `MaxUserNameRuneCount` | models 的规则函数引用同包声明；Validator 和 Service 调用领域规则函数。需要规则元数据的调用方可以读取公开常量，不重复实现已有领域规则 |
 | 接口专属 | `app/domains/<domain>/validator/v<version>/<use_case>_validator.go`，与该用例 Validator 放在一起 | 仅供本包使用时采用包含完整用例名的包内常量，例如 `maxQueryOrderPageConditionCount`；同一 HTTP 适配层确有合法跨包使用需求时可以按需导出 | 私有校验函数引用约束和格式常量，入口方法在绑定前引用默认值；Service 不反向引用这些接口专属常量 |
 | 业务用例输入契约 | `app/domains/<domain>/service/<object>_params.go`，与该业务对象的 Service Params 放在一起 | 需要 Validator 等其他包直接引用时导出，例如 `MinUserProfilePageNumber`、`MaxUserProfileBatchSize`；只在 Service 包内部使用时保持包内可见 | 跨包调用方通过 Service 包名引用导出常量；Service 在同包内引用所属声明，不重复定义 |
 
-这里的“用例输入契约”具体指 **Service 的 Params 及其配套校验相关常量**。用户资料用例统一放在 [service/user_profile_params.go](../../app/domains/user/service/user_profile_params.go)，不为这类常量额外增加目录。
+1. **用例输入契约描述 Service 接受的参数及其共同约束。** 它由 Service 的 Params 及其配套校验相关常量组成。相关常量与所属 Params 放在一起，不为这类常量额外增加目录。
 
-“校验相关常量”覆盖上下限、默认值、固定格式等输入契约使用的固定值。默认值参与输入准备，本身不是有效性判断；具体使用步骤见第 2.6 节。
+2. **校验相关常量覆盖上下限、默认值和固定格式等固定值。** 上下限和固定格式用于判断输入是否符合要求，默认值用于准备未提供的输入，本身不执行有效性判断。具体使用步骤见第 2.5 节。
 
-校验相关常量统一使用 Go 的大小写及缩写习惯，不使用全大写下划线风格。名称需要表达业务对象和具体含义：
+3. **命名与注释统一遵守第 2.5 节。** 常量的前缀、业务对象、计量单位和格式后缀按同一套规则组合；注释补充边界、默认值应用条件等信息，不因声明位置不同而另设命名方式。
 
-- 下限、上限分别使用 `Min`、`Max`，包内常量对应使用 `min`、`max`。文本长度明确计量方式，例如 `minUserNameRuneCount`、`maxUserNameWeightedLength`，避免含义不明的 `minLength`、`maxLength`。
-- 集合个数使用 `Count` 等明确名称；批量数量和分页大小沿用用例契约中的 `BatchSize`、`PageSize`。
-- 默认值使用 `Default` 或 `default`，例如 `DefaultUserProfilePageSize`；正则模式使用 `Pattern`，Go 时间格式使用 `Layout`，不为固定格式强加 `Min`、`Max` 前缀。
-- 注释说明适用对象及语义。数量和长度说明计量单位、是否包含边界、是否按去重前计算；默认值说明应用条件；固定格式说明解析或匹配方式。
-- 小写开头表示包内可见，不是仅在本文件可见。同一个版本目录的 Validator 属于同一个包，因此接口专属常量包含完整用例名，避免不同文件声明同名常量。
+4. **常量可见性由合法的跨包使用需求决定。** 小写开头表示整个包内可见，而非仅在声明文件内可见；大写开头表示允许其他包引用，不按 Service、Validator 或 models 统一规定可见性。具体导出判断和引用方式见第 2.4 节。
 
-大写开头使常量成为其他包可以引用的标识符。是否采用大写取决于合法的跨包使用需求，不因常量放在 Service 就一律导出，也不因放在 Validator 就一律禁止导出。具体判断及 models 的导出场景见第 2.7 节。
+5. **业务含义不同的常量应分别声明。** 例如，批量数量限制与分页大小即使都为 100，也保留各自的常量。“集中声明一次”针对同一条规则或默认约定，不要求合并所有取值相同的数值或字符串。
 
-取值相同但业务含义不同的校验相关常量仍分别声明。例如批量数量和分页大小即使都为 100，也保留两个独立常量；“集中声明一次”约束同一条规则或默认约定，不要求合并所有相同的数值或字符串。
+### 2.4 校验相关常量的可见性与引用方式
 
-### 2.4 校验相关常量与领域规则的引用方式
-
-**本节说明校验时应该调用哪个规则函数、从哪个包引用常量。** 领域规则通过函数复用；接口专属常量和用例输入契约常量，分别按其归属在相应的输入准备或校验步骤中引用。
+**本节统一说明常量如何公开、规则如何复用，以及各层从哪里引用常量。** 先按业务含义确定归属，再按合法的跨包使用需求决定是否导出；只需执行规则时调用规则函数，不额外公开其全部实现常量。
 
 1. **领域校验统一调用完整的领域规则函数。** 例如，`models.ValidateUserName` 在内部引用昵称长度边界和字符格式常量，完成统一检查。Validator 和 Service 都调用该函数，不各自重新实现昵称的长度或格式判断；规则可以在不同入口执行，实现只维护一份。
 
-2. **领域常量按需公开，公开后仍由规则函数承担实际校验。** 仅供领域规则内部使用的常量保持包内可见；其他包需要读取规则元数据时，可以导出相应常量。例如，Controller 可以读取 `models.MaxUserNameRuneCount` 生成输入规则说明，但 Validator 和 Service 校验昵称时仍调用 `models.ValidateUserName`。具体可见性判断见第 2.7 节。
+2. **领域常量按合法的跨包使用需求公开。** 仅供领域规则内部使用的常量保持包内可见；其他包确实需要直接读取规则元数据或使用领域枚举时，导出相应标识符。是否导出不改变领域规则的归属，也不要求公开实体的所有限制或状态。
 
-3. **接口专属常量由对应 Validator 在适用步骤中引用。** 例如，在 `query_order_page_validator.go` 中声明筛选条件数量限制 `maxQueryOrderPageConditionCount`、日期输入格式 `queryOrderPageDateLayout` 和默认排序字段 `defaultQueryOrderPageSortBy`。私有校验函数引用数量与格式常量，入口方法在绑定前引用默认值；只供本包使用的常量保持包内可见。
+   **规则元数据用于说明输入要求，实际校验仍调用领域规则函数。** 例如，Controller 可以读取 `models.MaxUserNameRuneCount` 生成输入规则说明，但 Validator 和 Service 校验昵称时仍调用 `models.ValidateUserName`，不各自重新实现长度判断。
 
-4. **需要跨包共享的用例输入契约常量，由 Validator 和 Service 引用同一份声明。** 例如，Validator 引用 `userservice.MaxUserProfileBatchSize`，Service 在同包内直接引用 `MaxUserProfileBatchSize`。因此，Validator 既会使用本包声明的接口专属常量，也会使用其他包导出的契约常量，并非其使用的所有常量都保持包内可见。
+   **领域枚举作为领域类型的公开契约，供其他包表达业务状态。** 例如，Service 可以使用 `MembershipStatusActive` 这样的会员状态常量，不各自声明同义字符串或数字。枚举按所属模型类型组织，不因可以参与校验就全部放入字段校验文件。
 
-5. **共享常量仍按业务含义确定归属，并保持单向依赖。** 约束、默认值或固定格式属于业务用例输入约定，且适用于 HTTP、脚本、后台任务等入口时，在 Service Params 文件中声明。领域对象自身规则的常量仍归 models，HTTP 接口专属常量仍归对应 Validator；Service 不反向导入 Validator 取得常量。
+   **Go 标识符导出不等于通过 HTTP 公开。** 是否向调用方提供规则元数据，仍由 Controller 和 DTO 显式映射；领域枚举与对外业务错误码也分别按各自契约维护。
 
-### 2.5 Service 输入契约中校验相关常量的声明与引用
+3. **只属于 HTTP 接口输入约定的常量，由对应 Validator 声明和使用。** 例如，某个接口约定一个数组参数最多提交 3 项，且这个数量限制只适用于该 HTTP 入口，就在其 Validator 中声明数量常量，由私有校验函数检查数组长度。仅供本包使用的常量保持包内可见；如果“最多 3 项”是所有调用入口都必须遵守的业务用例约束，则应归属 Service 输入契约。
 
-业务用例输入契约的校验相关常量与 Params 放在同一个 Service 包。下例中的常量需要被 Validator 等其他包引用，因此使用导出名称；只供 Service 内部实现使用的常量保持包内可见。示例数值用于展示声明方式，实际取值由相应用例契约确定：
+   **接口元数据需要被合法的 HTTP 上层读取时，可以按需导出。** 例如，Router 或其他 HTTP 适配代码需要读取接口约束时，可以引用对应公开常量。Service 需要同一个值时，应检查它是否实际属于领域规则或用例输入契约，不能通过导出 Validator 常量让 Service 反向依赖 HTTP 层。
 
-```go
-package service
+4. **需要跨包共享的用例输入契约常量，由 Validator 和 Service 引用同一份声明。** 这些常量与 Params 放在同一个 Service 包，需要被其他包引用时使用导出名称，只供 Service 内部使用时保持包内可见。Validator 读取输入契约，不在校验过程中调用 Service 的业务方法。
 
-const (
-	// MinUserProfilePageNumber 表示有效页码的下限，允许等于该值。
-	MinUserProfilePageNumber = 1
-	// DefaultUserProfilePageNumber 表示入口未指定页码时采用的默认值。
-	DefaultUserProfilePageNumber = 1
-	// DefaultUserProfilePageSize 表示入口未指定每页条数时采用的默认值。
-	DefaultUserProfilePageSize = 20
-	// MaxUserProfileBatchSize 表示单次提交的 ID 数量上限，包含重复项，允许等于该值。
-	MaxUserProfileBatchSize = 100
-	// MaxUserProfilePageSize 表示每页返回条数的上限，允许等于该值。
-	MaxUserProfilePageSize = 100
-)
-```
+   **声明示例：Service 集中声明需要跨入口共享的常量。** 下例同时展示下限、默认值和上限；数值仅用于说明声明方式，实际取值由相应用例契约确定。
 
-Validator 使用明确的包别名导入 Service：
+   ```go
+   package service
 
-```go
-import userservice "go-service-template/app/domains/user/service"
-```
+   const (
+       // MinUserProfilePageNumber 表示有效页码的下限，允许等于该值。
+       MinUserProfilePageNumber = 1
+       // DefaultUserProfilePageNumber 表示入口未指定页码时采用的默认值。
+       DefaultUserProfilePageNumber = 1
+       // DefaultUserProfilePageSize 表示入口未指定每页条数时采用的默认值。
+       DefaultUserProfilePageSize = 20
+       // MaxUserProfileBatchSize 表示单次提交的 ID 数量上限，包含重复项，允许等于该值。
+       MaxUserProfileBatchSize = 100
+       // MaxUserProfilePageSize 表示每页返回条数的上限，允许等于该值。
+       MaxUserProfilePageSize = 100
+   )
+   ```
 
-引用方式按使用步骤区分：
+   **引用示例：Validator 按输入准备和校验步骤使用导出常量。** 假设调用方将 Service 包命名为 `userservice`，分页入口在绑定前用 `userservice.DefaultUserProfilePageNumber`、`userservice.DefaultUserProfilePageSize` 初始化 DTO。分页校验使用 `request.PageNumber < userservice.MinUserProfilePageNumber` 判断下限；批量校验使用 `len(request.UserIDList) > userservice.MaxUserProfileBatchSize` 判断上限。这里引用的是包的公开标识符，不依赖具体代码文件。
 
-- Validator 在绑定前使用 `userservice.DefaultUserProfilePageNumber`、`userservice.DefaultUserProfilePageSize` 初始化 DTO。
-- 私有校验函数使用 `request.PageNumber < userservice.MinUserProfilePageNumber` 判断是否低于下限，使用 `len(request.UserIDList) > userservice.MaxUserProfileBatchSize` 判断是否超出上限。
-- Service 在同包内直接引用 `MinUserProfilePageNumber`、`MaxUserProfileBatchSize` 等常量；其他入口使用统一默认值准备 Params，不再次声明同义常量。
+   **同包引用：Service 直接使用已有声明，不再定义同义常量。** 例如，Service 使用 `MinUserProfilePageNumber`、`MaxUserProfileBatchSize` 执行用例输入检查。其他入口使用同一组默认值准备 Params，默认值的应用条件见第 2.5 节。
 
-Validator 引用输入契约中的校验相关常量，不在校验过程中调用 Service 的业务方法。如果 HTTP 接口确实有更严格的约束或独立的默认约定，可以另有接口专属常量，但必须说明各自的适用范围，不能将独立规则混称为同一个约定。
+5. **共享常量仍按业务含义确定归属，并保持单向依赖。** 约束、默认值或固定格式属于业务用例输入约定，且适用于 HTTP、脚本、后台任务等入口时，与 Service Params 放在一起。领域对象自身规则的常量仍归 models，HTTP 接口专属常量仍归对应 Validator；Service 不反向导入 Validator 取得常量。HTTP 接口有更严格的约束或独立默认约定时，另行维护接口专属常量，并说明其适用范围。
 
-### 2.6 下限、默认值与固定格式的使用
+6. **常量从包内可见改为导出后，仍只维护一份声明。** 所属包内部和外部调用方都引用同一名称。例如，公开昵称长度元数据后，`models.ValidateUserName` 和元数据调用方均引用 `MaxUserNameRuneCount`，不同时维护一个 `maxUserNameRuneCount` 副本。导出只改变可见性，不改变业务归属和既定依赖方向。
 
-校验相关常量的具体用法包括：
+### 2.5 校验相关常量的命名与使用规范
 
-| 含义 | 示例 | 使用方式 |
-| --- | --- | --- |
-| 下限 | `minUserNameRuneCount`、`MinUserProfilePageNumber` | 按明确计量方式判断是否低于边界；允许等于边界时使用 `<` 判断无效值 |
-| 上限 | `maxUserNameRuneCount`、`MaxUserProfileBatchSize` | 判断是否超过边界；允许等于边界时使用 `>` 判断无效值 |
-| 默认值 | `DefaultUserProfilePageSize`、`defaultQueryOrderPageSortBy` | 在对应入口准备输入时应用，再对最终输入执行完整校验 |
-| 固定格式 | `userNamePattern`、`queryOrderPageDateLayout` | 领域规则或 Validator 引用固定模式进行完整匹配，或按约定时间格式解析 |
+**本节统一规定校验相关常量如何命名、注释和使用。** 上下限、默认值和固定格式分别采用表达自身含义的名称；声明归属遵守第 2.3 节，可见性与引用方式遵守第 2.4 节。以下名称仅用于说明命名方式，不增加新的业务规则或字段。
 
-默认值只处理未提供或契约视为未提供的输入，不能覆盖绑定失败或显式非法输入。例如，分页大小缺失时可以采用默认值，显式传入 `0` 时应按分页约束处理，不能静默替换成默认值。缺失与 `null` 等状态按第 8 节的标准绑定及输入语义约定处理。
+1. **名称应表达业务对象或字段及其用途，并遵循 Go 命名习惯。** 导出名称使用 PascalCase，包内名称使用 lowerCamelCase，不使用全大写下划线风格。缩写沿用 `ID`、`URL`、`HTTP`、`UTF8` 等 Go 写法，例如 `maxAvatarURLByteCount`、`requestIDPattern`；缩写位于名称开头时按可见性处理，例如 `URLPattern` 与 `urlPattern`。接口专属常量包含完整用例限定，避免同包不同接口重名；领域共用常量围绕领域概念命名，不附加某个 HTTP 接口名。
 
-默认值的声明位置不等于其自动生效位置：跨入口共享的默认值声明在 Service Params 文件中，HTTP 入口在绑定前初始化 DTO，其他入口在构造 Params 时显式采用。声明 `DefaultUserProfilePageSize` 不表示 Service 收到 `0` 后会自动改写参数。各入口准备的默认值本身也必须符合相应领域和用例约束。
+2. **上下限与默认值采用统一的语义前缀。** 数值类名称按“前缀 + 业务对象或字段 + 指标或单位”组合：下限使用 `Min`，上限使用 `Max`，默认值使用 `Default`；包内名称相应以 `min`、`max`、`default` 开头。同一语义是否导出只影响名称的可见性写法，不改变其含义。
 
-固定格式同样按语义归属。昵称允许字符的正则模式归属 models；仅用于某个接口日期文本的布局归属该 Validator。例如 `queryOrderPageDateLayout` 可以声明为字符串常量 `"2006-01-02"`，由该接口按约定解析日期，而 Service 接收已经映射的业务输入。
+   | 含义 | 包内名称示例 | 导出名称示例 |
+   | --- | --- | --- |
+   | 下限 | `minUserNameRuneCount` | `MinUserNameRuneCount` |
+   | 上限 | `maxUserNameRuneCount` | `MaxUserNameRuneCount` |
+   | 默认值 | `defaultUserProfilePageSize` | `DefaultUserProfilePageSize` |
 
-Go `const` 用于可编译期确定的数值、字符串等值。正则模式字符串可以是常量，编译后的正则对象、切片、map 和运行期来源策略不属于常量；这些对象按既有规则或策略职责组织，不为统一术语而伪装成常量。固定格式示例用于说明声明方式，不据此增加新的业务格式要求。
+3. **计量名称必须明确数量的计算方式。** 集合元素个数使用 `Count`；文本码点数、字节数、加权长度分别使用 `RuneCount`、`ByteCount`、`WeightedLength`。批量数量和分页大小沿用 `BatchSize`、`PageSize`，并在注释中明确表示条数。避免缺少对象或单位的 `maxLength`、`maxSize`，名称中的计量方式必须与实际检查算法一致。
 
-### 2.7 常量可见性与 models 的导出场景
+4. **固定格式按实际匹配或解析方式使用后缀。** 正则模式字符串使用“对象或字段 + `Pattern`”，Go 时间布局使用“对象或字段 + `Layout`”，不为它们增加表示数值边界的 `Min`、`Max` 前缀。其他固定字符串按自身用途命名，不一律命名为 `Pattern` 或含义模糊的 `Format`。
 
-确定一个常量时，按以下顺序判断：
+   | 固定格式 | 包内名称示例 | 导出名称示例 | 使用约定 |
+   | --- | --- | --- | --- |
+   | 字段的正则模式 | `userNamePattern` | `UserNamePattern` | 校验字段整体合法性时，匹配完整输入，不仅判断某个片段是否命中 |
+   | Go 时间布局 | `inputDateLayout` | `InputDateLayout` | 使用对应布局解析，例如布局字符串 `"2006-01-02"` 表示日期文本 |
 
-1. 按业务含义确定归属和声明文件，不为方便某个调用方而改变其业务归属。
-2. 只在所属包内部使用时，采用小写开头的包内名称。
-3. 其他包确实需要直接依赖该值，且依赖方向符合第 3.3 节时，采用大写开头的导出名称。
-4. 调用方只需执行规则时，公开规则函数即可，不为调用函数而额外导出其全部实现常量。
+   **固定格式的声明位置仍由其业务含义决定。** 领域字段的字符模式归属 models，仅用于某个接口日期文本的布局归属该 Validator；属于跨入口业务用例输入约定的格式，与 Service Params 放在一起。选择 `Pattern` 或 `Layout` 后缀不改变归属和依赖方向。
 
-models 中常见的导出场景如下：
+5. **默认值显式用于输入准备，不能覆盖非法输入。** 默认值只处理未提供或契约视为未提供的输入，不能掩盖绑定失败或显式非法值。例如，分页大小缺失时可以采用默认值，显式传入 `0` 时仍按分页约束处理。缺失与 `null` 等状态按第 8 节的标准绑定及输入语义约定处理。
 
-| 场景 | 示例 | 调用约定 |
-| --- | --- | --- |
-| 公开规则元数据 | `MaxUserNameRuneCount` | Controller 或接口文档装配代码读取昵称限制，明确提供给调用方；Validator 和 Service 校验昵称时仍调用 `models.ValidateUserName` |
-| 公开领域枚举 | `MembershipStatusActive` 这样的会员状态常量 | Service 等包使用明确的领域值表达业务状态或进行判断，不各自声明同义字符串或数字 |
+   **声明默认值不代表 Service 自动改写参数。** 跨入口共享的默认值与 Service Params 放在一起，HTTP 入口在绑定前初始化 DTO，其他入口在构造 Params 时显式采用。声明 `DefaultUserProfilePageSize` 不表示 Service 收到 `0` 后会自动替换它；各入口采用的默认值本身也必须满足领域和用例约束。
 
-领域枚举属于领域类型的公开契约，按所属模型类型组织，不因枚举值可参与校验就全部放入字段校验文件。上述示例说明导出条件，不要求把每个实体字段的限制或状态都公开。
+6. **注释补足名称不能完整表达的规则条件。** 数量、长度常量说明计量单位、边界是否包含及数量按去重前还是去重后计算；默认值说明何时应用；格式常量说明完整匹配、解析方式及适用范围。允许等于下限时，用 `<` 判断无效值；允许等于上限时，用 `>` 判断无效值，不能只靠 `Min`、`Max` 名称推断边界行为。
 
-包内常量需要改为导出时，保留同一个语义的一份声明，所属包内部也引用该导出名称。例如，公开昵称长度元数据后，`models.ValidateUserName` 和元数据调用方均引用 `MaxUserNameRuneCount`，不同时维护一个 `maxUserNameRuneCount` 副本。
-
-Go 标识符导出后，其他包可以引用，但不会自动成为 HTTP 参数或响应字段。是否向接口调用方公开规则元数据，仍由 Controller 和 DTO 的显式映射决定；领域枚举与对外业务错误码也分别按各自契约维护。
-
-Validator 包如果确有被 Router 或其他 HTTP 适配代码读取接口元数据的需求，可以公开相应常量。Service 需要同一个值时，应重新检查它是否实际属于领域规则或用例输入契约，不能通过导出 Validator 常量让 Service 反向依赖 HTTP 层。导出可见性不改变声明归属，也不改变既定的依赖方向。
+7. **常量与编译后的规则对象、运行期策略分别组织。** Go `const` 用于可编译期确定的数值、字符串等值。正则模式字符串可以是常量，编译后的正则对象、切片、map 和运行期来源策略不属于常量；这些对象按所属规则或策略的职责维护，不因统一命名规范而改变其性质。
 
 ## 3. 完整调用链与规则依赖
 
@@ -195,7 +177,7 @@ Validator 和 Service 可以在不同入口执行同一份领域规则。重复�
 
 **Validator 引用 Service 输入契约中的校验相关常量不会自行产生循环依赖，前提是 Service 的直接和间接依赖都不返回 Validator。**
 
-Go 按包管理依赖。引用 `user_profile_params.go` 中的常量，实际导入的是整个 `service` 包，并不存在只依赖某一个文件或某一条常量的独立边界。将常量移动到同包的另一个文件，也不能解决包循环问题。Go 禁止包直接或间接导入自身，见 [Go 语言规范：导入声明](https://go.dev/ref/spec#Import_declarations)。
+Go 按包管理依赖。即使只引用与 Params 放在一起的某个常量，实际导入的仍是整个 Service 包，并不存在只依赖某一个文件或某一条常量的独立边界。将常量移动到同包的另一个文件，也不能解决包循环问题。Go 禁止包直接或间接导入自身，见 [Go 语言规范：导入声明](https://go.dev/ref/spec#Import_declarations)。
 
 允许的包依赖方向如下，箭头表示导入关系：
 
@@ -240,12 +222,8 @@ composition → Service → composition
 
 ```text
 internal/
-  check/
-    number.go       # 数值范围、数字文本解析
-    text.go         # 编码、明确计量方式的文本长度检查
-    url.go          # URL 结构及通用协议检查
-  validator/
-    bind.go         # HTTP 参数到 Request DTO 的绑定
+  check/            # 按数值、文本、URL 等能力组织纯检查方法
+  validator/        # HTTP 参数到 Request DTO 的通用绑定入口
 ```
 
 `internal/validator` 是 HTTP 参数绑定入口，依赖 Gin；`internal/check` 只处理普通 Go 值，不依赖 HTTP。二者分别承担数据映射和纯数据检查，不将业务字段规则放入通用绑定器。
@@ -290,16 +268,15 @@ func RuneCountAtMost(value string, maximum int) error
 领域规则放在所属 domain 的 `models` 中，与对应实体保持一致的文件组织：
 
 ```text
-app/domains/user/
+app/domains/<domain>/
   models/
-    user_profile.go
-    user_profile_validation.go
-  validator/v1/
-    create_user_validator.go
-    update_user_profile_validator.go
+    <entity>.go
+    <entity>_validation.go
+  validator/v<version>/
+    <use_case>_validator.go
 ```
 
-`user_profile_validation.go` 只包含与用户资料相关的共同规则，不成为整个项目的校验工具集合。其他领域维护自己的规则，不因字段都叫“名称”或“URL”就共用用户领域的业务规则。
+`<entity>_validation.go` 只包含对应实体的共同规则，不成为整个项目的校验工具集合。其他领域维护自己的规则，不因字段都叫“名称”或“URL”就共用另一个领域的业务规则。
 
 适合独立检查的字段使用明确命名的纯函数，例如：
 
@@ -341,7 +318,7 @@ New<UseCase>Validator 构造函数
 validate<UseCase>Request(request) 私有校验函数
 ```
 
-Validator 对象只保存调用所需依赖，不保存本次 DTO、校验结果或其他请求状态。入口方法依次创建 DTO、绑定、校验、调用 Controller；默认值引用所属位置的校验相关常量，在绑定前显式设置，具体应用约定见第 2.6 节。
+Validator 对象只保存调用所需依赖，不保存本次 DTO、校验结果或其他请求状态。入口方法依次创建 DTO、绑定、校验、调用 Controller；默认值引用所属位置的校验相关常量，在绑定前显式设置，具体应用约定见第 2.5 节。
 
 私有校验函数需要来源策略等依赖时，由入口方法通过参数明确传入，例如 `validateUpdateUserProfileRequest(request, avatarPolicy)`。没有相应依赖的接口不接收无关参数，文件的四段组织方式保持一致。
 
@@ -359,7 +336,7 @@ Validator 对象只保存调用所需依赖，不保存本次 DTO、校验结果
 
 私有函数不查询数据库，不调用 Service 执行业务操作，也不调用其他接口的 `validateXxxRequest` 来间接复用规则。共享逻辑向公共包或 models 提取，各接口独立组合。
 
-允许引用 Service 输入契约中导出的数量上下限、默认值、固定格式等校验相关常量，并在输入准备或校验步骤中使用；这是读取输入契约，不是执行业务操作。常量引用遵守第 2.5 节的方式和第 3.3 节的单向包依赖。
+允许引用 Service 输入契约中导出的数量上下限、默认值、固定格式等校验相关常量，并在输入准备或校验步骤中使用；这是读取输入契约，不是执行业务操作。常量引用遵守第 2.4 节的方式和第 3.3 节的单向包依赖。
 
 ### 6.3 集合与跨字段检查
 
