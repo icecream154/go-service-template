@@ -66,7 +66,7 @@ POST /api/v1/user/userProfile/createUser
 Content-Type: application/json
 ```
 
-本接口先进入 `UserProfileValidator.CreateUser`，由通用 `Bind` 调用 Gin 的 `ShouldBindJSON` 填充 `CreateUserRequest`，再通过同文件内的私有函数 `validateCreateUserRequest` 校验字段，全部通过后才将 DTO 交给 Controller。绑定错误返回 HTTP 400 和 `INVALID_ARGUMENT`；字段校验失败时按 `account_source`、`external_account_id`、`user_name`、`avatar_url` 的顺序汇总到 `details`，每个字段最多一条原因，不附带业务错误码。现有 Service 保留入参防御校验，并继续判断账户唯一性等业务规则。
+本接口先进入 `CreateUserValidator.CreateUser`，由通用 `Bind` 调用 Gin 的 `ShouldBindJSON` 填充 `CreateUserRequest`，再通过同文件内的私有函数 `validateCreateUserRequest` 校验字段，全部通过后才将 DTO 交给 Controller。绑定错误返回 HTTP 400 和 `INVALID_ARGUMENT`；字段校验失败时按 `account_source`、`external_account_id`、`user_name`、`avatar_url` 的顺序汇总到 `details`，每个字段最多一条原因，不附带业务错误码。现有 Service 保留入参防御校验，并继续判断账户唯一性等业务规则。
 
 本次仍采用 Gin 默认 JSON 解码：未知字段会被忽略，字段名允许大小写匹配，只读取第一个 JSON 值，非法 UTF-8 使用解码器的替换行为；绑定器不额外施加 1 MiB 限制或检查尾部内容。字段校验针对绑定后的 DTO，不改变原始解码行为。缺失或显式 `null` 的必填文本字段会保持零值，由请求 Validator 按不能为空白处理。
 
@@ -120,9 +120,9 @@ Content-Type: application/json
 | `user_id` | string | 是 | 目标内部用户 ID |
 | `expected_version` | number | 是 | 调用方读取到的资料版本，整数，范围为 `0`～`9223372036854775806` |
 | `user_name` | string | 是 | 新昵称，校验规则与创建一致 |
-| `avatar_url` | string 或 null | 是 | 新头像，校验规则与创建一致；必须显式提供该字段 |
+| `avatar_url` | string | 是 | 非空白的绝对 HTTP/HTTPS 地址，须包含主机名，合法 UTF-8，最多 512 个 Unicode 码点 |
 
-这是对昵称、头像的完整替换。头像传 `null` 表示清空为“尚未提供”，传空字符串则保存空字符串；遗漏字段不代表保留旧值。账户来源、外部账户标识和启用状态不在更新范围内。
+这是对昵称、头像的完整替换，每次都须提交昵称和有效头像地址，不支持清空头像。`avatar_url` 缺失、为 `null`、空字符串或全空白时，统一返回 HTTP 400、`INVALID_ARGUMENT` 及对应字段明细；遗漏字段也不表示保留旧值。Request DTO 使用标准绑定，不自定义 `UnmarshalJSON`，也不记录字段出现标记。账户来源、外部账户标识和启用状态不在更新范围内。
 
 请求示例：
 

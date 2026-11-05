@@ -25,23 +25,13 @@ func NewUserProfileController() *UserProfileController {
 	return &UserProfileController{}
 }
 
-// QueryUserProfileByUserID 解析用户 ID、查询领域模型并构造用户资料响应。
-// Query 参数 user_id 必填，按十进制解析为正 int64，缺失、格式错误、越界或非正数返回 400。
+// QueryUserProfileByUserID 接收 Validator 已绑定和校验的请求，查询并构造用户资料响应。
+// user_id 的格式及范围已校验，本方法将其十进制文本转换为 Service 使用的内部标识。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
-func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
-	// Query 参数是字符串，显式解析后填入请求 DTO；解析错误时不会继续查询。
-	var request userv1dto.QueryUserProfileByUserIDRequest
-	userID, err := strconv.ParseInt(ctx.Query("user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		response.Fail(ctx, response.InvalidArgument("", response.FieldError{
-			Field: "user_id", Reason: "must be a positive 64-bit integer",
-		}))
-		return
-	}
-	request.UserID = userID
-
+func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userv1dto.QueryUserProfileByUserIDRequest) {
+	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
-	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(request.UserID)
+	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userID)
 	if err != nil {
 		failUserProfileOperation(ctx, "Query user profile", err)
 		return
@@ -67,25 +57,13 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
 	response.Success(ctx, result)
 }
 
-// UpdateUserProfile 完整替换昵称和头像，版本必须显式提交，头像必须显式给出值或 null。
-// 发起方与目标用户使用不同字段；具体业务限制由 Service 校验。
-func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context) {
-	var request userv1dto.UpdateUserProfileRequest
-	if !decodeUserProfileJSON(ctx, &request,
-		[]string{"operator_user_id", "user_id", "expected_version", "user_name", "avatar_url"}, "avatar_url") {
-		return
-	}
-	if !requirePositiveUserID(ctx, "operator_user_id", request.OperatorUserID) ||
-		!requirePositiveUserID(ctx, "user_id", request.UserID) {
-		return
-	}
-	if request.ExpectedVersion < 0 {
-		failRequestField(ctx, "expected_version", "must be a non-negative 64-bit integer")
-		return
-	}
+// UpdateUserProfile 使用 Validator 已校验的完整资料及版本调用 Service。
+// 更新头像必须是有效的非空地址，以非 nil 指针传入 Service，不表达清空操作。
+// 发起方权限、用户状态和实际版本冲突继续由 Service 判断。
+func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userv1dto.UpdateUserProfileRequest) {
 	profile, err := composition.Current().UserProfile.UpdateUserProfile(userservice.UpdateUserProfileParams{
-		OperatorUserID: request.OperatorUserID, UserID: request.UserID, ExpectedVersion: request.ExpectedVersion,
-		UserName: request.UserName, AvatarURL: request.AvatarURL,
+		OperatorUserID: request.OperatorUserID, UserID: request.UserID, ExpectedVersion: *request.ExpectedVersion,
+		UserName: request.UserName, AvatarURL: &request.AvatarURL,
 	})
 	if err != nil {
 		failUserProfileOperation(ctx, "Update user profile", err)
@@ -96,23 +74,12 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context) {
 }
 
 // BatchQueryUserProfiles 批量读取明确的一组用户资料，返回已找到的资料和缺失 ID。
-// 单次最多接收 100 项；Service 对重复 ID 去重，并保留首次出现的顺序。
-func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context) {
-	var request userv1dto.BatchQueryUserProfilesRequest
-	if !decodeUserProfileJSON(ctx, &request, []string{"user_id_list"}) {
-		return
-	}
-	if len(request.UserIDList) < 1 || len(request.UserIDList) > userservice.MaxUserProfileBatchSize {
-		failRequestField(ctx, "user_id_list", "must contain between 1 and 100 user IDs")
-		return
-	}
+// 数量和 ID 格式由 Validator 校验；Service 对重复 ID 去重并保留首次出现的顺序。
+func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userv1dto.BatchQueryUserProfilesRequest) {
 	userIDs := make([]int64, 0, len(request.UserIDList))
 	for _, value := range request.UserIDList {
-		userID, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || userID <= 0 {
-			failRequestField(ctx, "user_id_list", "each item must be a positive 64-bit integer string")
-			return
-		}
+		// Validator 已确认该文本可表示正 int64，这里只转换 Service 参数。
+		userID, _ := strconv.ParseInt(value, 10, 64)
 		userIDs = append(userIDs, userID)
 	}
 	profiles, missingIDs, err := composition.Current().UserProfile.BatchQueryUserProfiles(userIDs)
@@ -131,15 +98,16 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context) {
 }
 
 // QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
-// 默认第 1 页、每页 20 条，按用户 ID 降序；每页最多 100 条。
-func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context) {
-	request := userv1dto.QueryUserProfilePageRequest{PageNumber: 1, PageSize: 20}
-	if !parsePageQuery(ctx, &request) {
-		return
+// 默认值和输入校验由 Validator 完成，本方法只映射 Service 参数。
+func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userv1dto.QueryUserProfilePageRequest) {
+	var isEnabled *bool
+	if request.IsEnabled != nil {
+		value := *request.IsEnabled == "true"
+		isEnabled = &value
 	}
 	profiles, totalCount, err := composition.Current().UserProfile.QueryUserProfilePage(userservice.QueryUserProfilePageParams{
 		PageNumber: request.PageNumber, PageSize: request.PageSize,
-		UserName: request.UserName, IsEnabled: request.IsEnabled,
+		UserName: request.UserName, IsEnabled: isEnabled,
 	})
 	if err != nil {
 		failUserProfileOperation(ctx, "Query user profile page", err)

@@ -15,20 +15,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// UserProfileValidator 持有用户资料控制器，不保存单次请求的 DTO 或绑定结果。
-type UserProfileValidator struct {
+// CreateUserValidator 持有用户资料控制器，不保存单次请求的 DTO 或绑定结果。
+type CreateUserValidator struct {
 	// controller 复用路由创建的控制器，绑定和参数校验通过后接收本次请求的 DTO。
 	controller *userv1controller.UserProfileController
 }
 
-// NewUserProfileValidator 复用路由已创建的控制器，不执行请求绑定或业务操作。
-func NewUserProfileValidator(controller *userv1controller.UserProfileController) *UserProfileValidator {
-	return &UserProfileValidator{controller: controller}
+// NewCreateUserValidator 复用路由已创建的控制器，不执行请求绑定或业务操作。
+func NewCreateUserValidator(controller *userv1controller.UserProfileController) *CreateUserValidator {
+	return &CreateUserValidator{controller: controller}
 }
 
 // CreateUser 为本次请求创建 DTO，绑定和字段校验通过后才调用 Controller。
 // 账户唯一性、ID 生成及创建操作继续由现有 Service 处理。
-func (v *UserProfileValidator) CreateUser(ctx *gin.Context) {
+func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
 	var request userv1dto.CreateUserRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
 		response.Fail(ctx, response.InvalidArgument(""))

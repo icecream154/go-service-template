@@ -5,13 +5,13 @@ import "go-service-template/app/domains/user/dto/v1/shared"
 // QueryUserProfilePageRequest 表示使用页码分页读取用户资料的 Query 参数。
 type QueryUserProfilePageRequest struct {
 	// PageNumber 从 1 开始，省略时为 1。
-	PageNumber int `json:"page_number"`
+	PageNumber int `form:"page_number" json:"page_number"`
 	// PageSize 是每页数量，范围为 1～100，省略时为 20。
-	PageSize int `json:"page_size"`
+	PageSize int `form:"page_size" json:"page_size"`
 	// UserName 可选，非空时按展示昵称精确匹配，不作为关键词检索。
-	UserName string `json:"user_name"`
-	// IsEnabled 可选，nil 表示包含所有启用状态，Query 值只接受 true、false。
-	IsEnabled *bool `json:"is_enabled"`
+	UserName string `form:"user_name" json:"user_name"`
+	// IsEnabled 保留可选 Query 文本，nil 表示不过滤；Validator 只允许 true、false。
+	IsEnabled *string `form:"is_enabled" json:"is_enabled"`
 }
 
 // QueryUserProfilePageResponse 表示按用户 ID 降序排列的一页资料及分页信息。

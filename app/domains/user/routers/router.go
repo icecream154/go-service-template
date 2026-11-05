@@ -12,27 +12,39 @@ import (
 type UserRouter struct {
 	// userProfiles 处理 V1 用户资料请求，不保存单次请求的数据。
 	userProfiles *userv1controller.UserProfileController
-	// userProfileValidator 绑定创建用户请求，再交给同一个用户资料控制器处理。
-	userProfileValidator *userv1validator.UserProfileValidator
+	// createUserValidator 绑定创建用户请求，再交给同一个用户资料控制器处理。
+	createUserValidator *userv1validator.CreateUserValidator
+	// queryUserProfileByUserIDValidator 绑定并校验按 ID 查询请求。
+	queryUserProfileByUserIDValidator *userv1validator.QueryUserProfileByUserIDValidator
+	// queryUserProfilePageValidator 绑定并校验分页查询请求。
+	queryUserProfilePageValidator *userv1validator.QueryUserProfilePageValidator
+	// updateUserProfileValidator 绑定并校验完整替换资料的请求。
+	updateUserProfileValidator *userv1validator.UpdateUserProfileValidator
+	// batchQueryUserProfilesValidator 绑定并校验批量查询请求。
+	batchQueryUserProfilesValidator *userv1validator.BatchQueryUserProfilesValidator
 }
 
-// NewRouter 创建并保存用户资料控制器及创建请求的 Validator，不执行数据库查询。
+// NewRouter 创建用户资料控制器及各用例的 Validator，不执行数据库查询。
 func NewRouter() *UserRouter {
 	controller := userv1controller.NewUserProfileController()
 	return &UserRouter{
-		userProfiles:         controller,
-		userProfileValidator: userv1validator.NewUserProfileValidator(controller),
+		userProfiles:                      controller,
+		createUserValidator:               userv1validator.NewCreateUserValidator(controller),
+		queryUserProfileByUserIDValidator: userv1validator.NewQueryUserProfileByUserIDValidator(controller),
+		queryUserProfilePageValidator:     userv1validator.NewQueryUserProfilePageValidator(controller),
+		updateUserProfileValidator:        userv1validator.NewUpdateUserProfileValidator(controller),
+		batchQueryUserProfilesValidator:   userv1validator.NewBatchQueryUserProfilesValidator(controller),
 	}
 }
 
 // RegisterV1Routes 在传入的 V1 分组下按领域、Controller 和业务用例注册路由。
-// 简单查询使用 Query 参数，创建、更新和批量查询使用 JSON 请求体。
+// 各请求先由对应 Validator 绑定和校验，再传给同一用户资料控制器。
 func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	user := v1.Group("/user")
 	userProfile := user.Group("/userProfile")
-	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
-	userProfile.GET("/queryUserProfilePage", r.userProfiles.QueryUserProfilePage)
-	userProfile.POST("/createUser", r.userProfileValidator.CreateUser)
-	userProfile.POST("/updateUserProfile", r.userProfiles.UpdateUserProfile)
-	userProfile.POST("/batchQueryUserProfiles", r.userProfiles.BatchQueryUserProfiles)
+	userProfile.GET("/queryUserProfileByUserId", r.queryUserProfileByUserIDValidator.QueryUserProfileByUserID)
+	userProfile.GET("/queryUserProfilePage", r.queryUserProfilePageValidator.QueryUserProfilePage)
+	userProfile.POST("/createUser", r.createUserValidator.CreateUser)
+	userProfile.POST("/updateUserProfile", r.updateUserProfileValidator.UpdateUserProfile)
+	userProfile.POST("/batchQueryUserProfiles", r.batchQueryUserProfilesValidator.BatchQueryUserProfiles)
 }

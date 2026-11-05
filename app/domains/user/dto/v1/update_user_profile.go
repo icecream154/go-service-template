@@ -8,12 +8,13 @@ type UpdateUserProfileRequest struct {
 	OperatorUserID int64 `json:"operator_user_id,string"`
 	// UserID 是待修改用户的内部 ID，必填且为正数，JSON 使用十进制字符串。
 	UserID int64 `json:"user_id,string"`
-	// ExpectedVersion 是调用方读取的资料版本，必填且非负，0 是有效初始版本。
-	ExpectedVersion int64 `json:"expected_version"`
+	// ExpectedVersion 是调用方读取的资料版本，必填且非负；指针区分未提供与有效的版本 0。
+	ExpectedVersion *int64 `json:"expected_version"`
 	// UserName 是完整替换后的展示昵称，必填，允许重名。
 	UserName string `json:"user_name"`
-	// AvatarURL 必须出现；null 表示清空，空字符串与 null 保持不同语义。
-	AvatarURL *string `json:"avatar_url"`
+	// AvatarURL 必填且为非空的 HTTP/HTTPS 地址，更新资料不支持清空头像。
+	// 缺失、null 和空字符串统一绑定为零值，由 Validator 拒绝。
+	AvatarURL string `json:"avatar_url"`
 }
 
 // UpdateUserProfileResponse 表示更新成功后的资料及递增后的版本。

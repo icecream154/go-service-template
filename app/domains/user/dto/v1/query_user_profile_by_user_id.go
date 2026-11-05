@@ -5,8 +5,8 @@ import "go-service-template/app/domains/user/dto/v1/shared"
 
 // QueryUserProfileByUserIDRequest 表示按内部用户 ID 查询用户资料的请求参数。
 type QueryUserProfileByUserIDRequest struct {
-	// UserID 是待查询的内部用户 ID，必须大于 0；JSON 使用十进制字符串。
-	UserID int64 `json:"user_id,string"`
+	// UserID 保留请求中的十进制文本，由 Validator 校验为正 int64 后交给 Controller 转换。
+	UserID string `form:"user_id" json:"user_id"`
 }
 
 // QueryUserProfileByUserIDResponse 表示查询成功后返回的用户基本资料。
