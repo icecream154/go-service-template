@@ -218,15 +218,23 @@ composition → Service → composition
 
 ### 4.1 目录与职责
 
-公共纯数据检查统一放在 `internal/check`，按数据类型或能力组织文件：
+公共纯数据检查统一放在 `internal/check`，先按能力组组织子包，再按数据类型组织文件：
 
 ```text
 internal/
-  check/            # 按数值、文本、URL 等能力组织纯检查方法
+  check/            # 根包只定义共享错误契约
+    scalar/         # 整数、浮点、十进制、布尔
+    text/           # 文本、长度、Unicode、模式
+    collection/     # 集合、唯一性、枚举
+    relation/       # 存在性与组合关系
+    datetime/       # 时间与时长
+    format/         # 标准格式与编码
   validator/        # HTTP 参数到 Request DTO 的通用绑定入口
 ```
 
 `internal/validator` 是 HTTP 参数绑定入口，依赖 Gin；`internal/check` 只处理普通 Go 值，不依赖 HTTP。二者分别承担数据映射和纯数据检查，不将业务字段规则放入通用绑定器。
+
+Go 的普通目录构成独立的包，能力目录通过子包组织；不将同一个包的源码分散到多个普通目录。子包依赖根包的错误契约，根包不反向导入子包。不同能力的详细方法和边界见[公共数据检查说明](../../internal/check/README.md)。
 
 ### 4.2 公共方法的约束
 

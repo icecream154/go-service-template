@@ -6,9 +6,12 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/gin-gonic/gin v1.10.1
 	github.com/go-sql-driver/mysql v1.10.1
+	github.com/rivo/uniseg v0.4.7
 	github.com/spf13/viper v1.20.1
 	go.uber.org/multierr v1.10.0
 	go.uber.org/zap v1.27.0
+	golang.org/x/net v0.33.0
+	golang.org/x/text v0.21.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2
@@ -47,8 +50,6 @@ require (
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/net v0.33.0 // indirect
 	golang.org/x/sys v0.29.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
 	google.golang.org/protobuf v1.36.1 // indirect
 )
