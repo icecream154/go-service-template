@@ -14,7 +14,7 @@
 | POST | `batchQueryUserProfiles` | `BatchQueryUserProfilesRequest` | `BatchQueryUserProfilesResponse` |
 | GET | `queryUserProfilePage` | `QueryUserProfilePageRequest` | `QueryUserProfilePageResponse` |
 
-GET 参数放在 Query，POST 使用 `application/json` 请求体，大小最多 1 MiB。JSON 请求体必须是单个对象，不接受未知字段或多个连续的 JSON 值。所有成功响应使用 HTTP 200。
+GET 参数放在 Query，POST 使用 `application/json` 请求体，所有成功响应使用 HTTP 200。`createUser` 使用第 3 节所述的 Gin 默认绑定；更新和批量查询仍使用严格 JSON 解析，请求体最多 1 MiB，必须是单个对象，不接受未知字段或多个连续的 JSON 值。
 
 接口中的用户 ID 为正 int64，范围为 `1`～`9223372036854775807`。JSON 中使用十进制字符串，批量 ID 数组的每个元素也使用字符串；Query 中使用对应十进制文本。版本号、页码、每页数量和总数使用 JSON 数字。
 
@@ -66,6 +66,10 @@ POST /api/v1/user/userProfile/createUser
 Content-Type: application/json
 ```
 
+本接口先进入 `UserProfileValidator.CreateUser`，由通用 `Bind` 调用 Gin 的 `ShouldBindJSON` 填充 `CreateUserRequest`，再通过同文件内的私有函数 `validateCreateUserRequest` 校验字段，全部通过后才将 DTO 交给 Controller。绑定错误返回 HTTP 400 和 `INVALID_ARGUMENT`；字段校验失败时按 `account_source`、`external_account_id`、`user_name`、`avatar_url` 的顺序汇总到 `details`，每个字段最多一条原因，不附带业务错误码。现有 Service 保留入参防御校验，并继续判断账户唯一性等业务规则。
+
+本次仍采用 Gin 默认 JSON 解码：未知字段会被忽略，字段名允许大小写匹配，只读取第一个 JSON 值，非法 UTF-8 使用解码器的替换行为；绑定器不额外施加 1 MiB 限制或检查尾部内容。字段校验针对绑定后的 DTO，不改变原始解码行为。缺失或显式 `null` 的必填文本字段会保持零值，由请求 Validator 按不能为空白处理。
+
 | 请求字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `account_source` | string | 是 | 外部账户来源命名空间，合法 UTF-8、非空白，最多 32 个 Unicode 码点 |
@@ -73,7 +77,7 @@ Content-Type: application/json
 | `user_name` | string | 是 | 展示昵称，合法 UTF-8、非空白，最多 64 个 Unicode 码点 |
 | `avatar_url` | string 或 null | 否 | 最多 512 个 Unicode 码点；非空字符串必须是绝对 HTTP/HTTPS URL |
 
-账户身份按原文处理，不去空格、不转换大小写，也不把外部标识转换为数字。缺失头像或显式传 `null` 均表示尚未提供头像；传空字符串则保留空字符串。
+Service 对绑定后的账户身份不去空格、不转换大小写，也不把外部标识转换为数字。缺失头像或显式传 `null` 均表示尚未提供头像；传空字符串则保留空字符串。
 
 请求示例：
 

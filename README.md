@@ -92,7 +92,9 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 | 路由不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","message":"route not found"}}` |
 | 查询、未处理异常或其他内部错误 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
-调用链为 Controller → Service → Repository。Controller 解析请求并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造用例专属响应 DTO，通过 `response.Success` 放入 `data`，资料字段包含用户 ID、昵称、头像、启用状态和版本。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的领域错误；Controller 复用 `user/apierror` 的映射，通过 `response.Fail` 返回通用码和可选业务码。参数格式错误只返回通用 `INVALID_ARGUMENT`，未知查询异常和未处理异常统一返回不带业务码的 `INTERNAL_ERROR`；原始内部错误只记录服务端日志。
+当前仅 `createUser` 接入 Router → `UserProfileValidator.CreateUser` → Controller 链路。领域 Validator 为每次请求创建 `CreateUserRequest`，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数 `validateCreateUserRequest` 校验必填文本、长度和头像地址，全部通过后才将 DTO 传给 Controller。绑定或字段校验失败返回 HTTP 400 和 `INVALID_ARGUMENT`，字段校验失败时通过 `details` 汇总参数问题。通用 `Bind` 使用 Gin 原生绑定：GET 读取 Query，POST 读取 JSON，不增加字段校验规则。创建接口使用 Gin 默认 JSON 解码行为，具体边界见[用户资料接口](specifications/application/user-profile-api.md#3-首次创建用户)。
+
+业务调用链为 Controller → Service → Repository。Controller 取得请求 DTO 并调用 Service；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造用例专属响应 DTO，通过 `response.Success` 放入 `data`，资料字段包含用户 ID、昵称、头像、启用状态和版本。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的领域错误；Controller 复用 `user/apierror` 的映射，通过 `response.Fail` 返回通用码和可选业务码。参数格式错误只返回通用 `INVALID_ARGUMENT`，未知查询异常和未处理异常统一返回不带业务码的 `INTERNAL_ERROR`；原始内部错误只记录服务端日志。
 
 `user/errors` 声明 Service 使用的内部领域错误，`user/apierror` 声明对外业务码并维护错误映射；Service 不依赖 Gin 或通用响应组件。内部错误与对外业务码不要求一一对应，多个内部错误可以对应同一个业务码；同一个业务码的通用错误类别保持固定。通用响应组件集中提供 `INVALID_ARGUMENT`、`UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`CONFLICT`、`RATE_LIMITED`、`INTERNAL_ERROR`、`SERVICE_UNAVAILABLE` 八个类别及对应构造器，具体约定见[接口返回规范](specifications/application/api-response.md)。
 

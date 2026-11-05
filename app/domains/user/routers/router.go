@@ -3,6 +3,7 @@ package routers
 
 import (
 	userv1controller "go-service-template/app/domains/user/controller/v1"
+	userv1validator "go-service-template/app/domains/user/validator/v1"
 
 	"github.com/gin-gonic/gin"
 )
@@ -11,11 +12,17 @@ import (
 type UserRouter struct {
 	// userProfiles 处理 V1 用户资料请求，不保存单次请求的数据。
 	userProfiles *userv1controller.UserProfileController
+	// userProfileValidator 绑定创建用户请求，再交给同一个用户资料控制器处理。
+	userProfileValidator *userv1validator.UserProfileValidator
 }
 
-// NewRouter 创建并保存用户资料控制器，不执行数据库查询。
+// NewRouter 创建并保存用户资料控制器及创建请求的 Validator，不执行数据库查询。
 func NewRouter() *UserRouter {
-	return &UserRouter{userProfiles: userv1controller.NewUserProfileController()}
+	controller := userv1controller.NewUserProfileController()
+	return &UserRouter{
+		userProfiles:         controller,
+		userProfileValidator: userv1validator.NewUserProfileValidator(controller),
+	}
 }
 
 // RegisterV1Routes 在传入的 V1 分组下按领域、Controller 和业务用例注册路由。
@@ -25,7 +32,7 @@ func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	userProfile := user.Group("/userProfile")
 	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
 	userProfile.GET("/queryUserProfilePage", r.userProfiles.QueryUserProfilePage)
-	userProfile.POST("/createUser", r.userProfiles.CreateUser)
+	userProfile.POST("/createUser", r.userProfileValidator.CreateUser)
 	userProfile.POST("/updateUserProfile", r.userProfiles.UpdateUserProfile)
 	userProfile.POST("/batchQueryUserProfiles", r.userProfiles.BatchQueryUserProfiles)
 }

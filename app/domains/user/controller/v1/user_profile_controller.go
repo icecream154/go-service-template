@@ -52,12 +52,9 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context) {
 }
 
 // CreateUser 使用首次自注册的外部身份创建用户，内部 ID、初始状态和版本由 Service 决定。
+// Request DTO 由领域 Validator 绑定后传入，本方法不再读取或解析 HTTP 请求体。
 // 当前接口不接入外部身份认证，不要求已有 operator_user_id。
-func (c *UserProfileController) CreateUser(ctx *gin.Context) {
-	var request userv1dto.CreateUserRequest
-	if !decodeUserProfileJSON(ctx, &request, []string{"account_source", "external_account_id", "user_name"}, "avatar_url") {
-		return
-	}
+func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.CreateUserRequest) {
 	profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
 		AccountSource: request.AccountSource, ExternalAccountID: request.ExternalAccountID,
 		UserName: request.UserName, AvatarURL: request.AvatarURL,
