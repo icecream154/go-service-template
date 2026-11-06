@@ -1,6 +1,6 @@
 // web 是 HTTP 服务的进程入口，负责参数解析、退出信号和应用资源生命周期。
 // 环境与数据库的创建交给 bootstrap；本入口负责在初始化成功后启动服务，
-// 并保证退出路径先结束 HTTP 访问，再释放数据库连接池。运行时日志统一使用英文。
+// 正常退出先结束 HTTP 访问及内部业务，再释放数据库连接池。运行时日志统一使用英文。
 package main
 
 import (
@@ -22,7 +22,7 @@ import (
 	"go-service-template/routers"
 )
 
-// main 将系统信号转换为取消通知，并在 run 完成全部清理后决定进程退出码。
+// main 将系统信号转换为停止通知，依据 run 的收尾结果决定进程退出码。
 // 不在持有资源的函数中调用 log.Fatal 或 os.Exit，因为它们会直接终止进程，跳过 defer。
 func main() {
 	// Ctrl+C 对应 os.Interrupt，服务管理器通常通过 SIGTERM 请求正常停止。
@@ -31,7 +31,8 @@ func main() {
 	err := run(ctx, os.Args[1:])
 	// 释放信号通知资源并恢复信号处理；显式调用，确保后面的 os.Exit 不会跳过它。
 	stop()
-	// 到达这里时，run 的 defer 已执行，主错误和资源关闭错误也已合并。
+	// 正常收尾已关闭资源；收尾超时则保留仍被内部业务使用的连接池，直接失败退出。
+	// 进程退出释放连接，不代表所有业务已完成，也不代表所有事务已回滚。
 	// 正常收到退出信号且清理成功时 err 为 nil，进程自然返回成功退出码。
 	if err != nil {
 		log.Printf("Application failed: %v", err)
@@ -39,7 +40,7 @@ func main() {
 	}
 }
 
-// run 持有资源生命周期：全部依赖初始化成功后监听，HTTP 收尾后关闭数据库。
+// run 持有资源生命周期：全部依赖初始化成功后监听，HTTP 和内部业务均结束后关闭数据库。
 //
 // ctx 是进程级停止通知，args 仅包含命令行参数，不包含可执行文件名。
 // 返回错误交给 main 记录并转换为非零退出码；本函数自身不终止进程。
@@ -55,8 +56,8 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	address := options.String("addr", ":8080", "HTTP listen address")
 	// 启动预算默认 30 秒，数据库连接和会话检查共享同一个预算，不是每个连接各获 30 秒。
 	startupTimeout := options.Duration("startup-timeout", 30*time.Second, "Maximum application initialization time")
-	// HTTP 收尾预算默认 10 秒，只控制优雅关闭等待，不代表每个业务请求的执行时限。
-	shutdownTimeout := options.Duration("shutdown-timeout", 10*time.Second, "Maximum HTTP graceful shutdown time")
+	// HTTP 与内部业务收尾共用默认 10 秒预算，不代表每个业务请求的执行时限。
+	shutdownTimeout := options.Duration("shutdown-timeout", 10*time.Second, "Maximum HTTP and internal work shutdown time")
 	if err := options.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -91,9 +92,14 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		}
 		return fmt.Errorf("initialize application: %w", err)
 	}
-	// Runtime 成功返回后，所有后续退出路径都必须释放数据库资源，包括监听失败。
-	// errors.Join 同时保留主故障与关闭故障的错误链，避免后发生的错误覆盖最初原因。
+	// 启动或监听失败时正常释放资源；服务运行后，必须确认 HTTP 和内部业务都结束。
+	// 收尾预算耗尽时不主动关闭仍可能被使用的连接池，由 main 的失败退出释放进程资源。
+	closeRuntime := true
 	defer func() {
+		if !closeRuntime {
+			log.Printf("Skip database pool cleanup: HTTP or internal work was not fully drained; process will exit")
+			return
+		}
 		if err := runtime.Close(); err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("close database connections: %w", err))
 		}
@@ -103,8 +109,11 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 默认服务已初始化，路由入口创建各领域控制器并挂载版本化接口。
-	router := routers.New()
+	// 创建完整路由，并按方法和路径选择默认或覆盖的响应等待时间。
+	handler, err := routers.NewHTTPHandler()
+	if err != nil {
+		return fmt.Errorf("initialize HTTP handler: %w", err)
+	}
 
 	// 只有环境、配置文件以及全部启用的数据库连接都初始化成功后，才打印成功日志。
 	// 此日志描述应用依赖已就绪；HTTP 是否成功监听由后面的独立日志说明。
@@ -118,18 +127,14 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return fmt.Errorf("listen for HTTP requests: %w", err)
 	}
 	log.Printf("HTTP server listening: address=%s", listener.Addr())
-	return serve(ctx, listener, router, *shutdownTimeout)
+	closeRuntime, resultErr = serve(ctx, listener, handler, *shutdownTimeout)
+	return resultErr
 }
 
-// serve 在收到退出信号后等待现有请求结束。超时则强制关闭 HTTP 连接，
-// 返回到 run 后才释放数据库连接池；收尾使用独立 context，不复用已取消的运行 context。
-//
-// listener 已由 run 成功创建，本函数负责关闭它和 HTTP 连接；handler 只处理业务请求。
-// 正常路径使用 Shutdown：停止接收新连接并等待在途请求完成，之后才允许 run 关闭数据库。
-// 超时路径使用 Close：直接断开仍存活的 HTTP 连接，随后返回错误并进入数据库清理。
-// 强制断开不等于所有业务处理器已经执行完毕；业务和 SQL 操作仍需响应请求 context，
-// 并自行处理事务提交结果，不能把网络连接关闭当作业务操作必然已回滚的证明。
-func serve(ctx context.Context, listener net.Listener, handler http.Handler, shutdownTimeout time.Duration) error {
+// serve 在停止信号或监听故障后，使用同一独立预算等待 HTTP 和全部内部业务。
+// drained 仅在两部分都确认结束时为 true，供 run 决定能否正常关闭数据库。
+// 收尾超时会关闭 HTTP 连接并返回错误，不取消内部业务，也不宣称事务已回滚。
+func serve(ctx context.Context, listener net.Listener, handler *routers.HTTPHandler, shutdownTimeout time.Duration) (drained bool, resultErr error) {
 	server := &http.Server{
 		Handler: handler,
 		// 只限制读取 HTTP 请求头的时间，避免慢请求头长期占用连接；不限制完整业务执行时长。
@@ -144,30 +149,38 @@ func serve(ctx context.Context, listener net.Listener, handler http.Handler, shu
 		serverErr <- server.Serve(listener)
 	}()
 
+	var serveErr error
+	serveReturned := false
 	select {
-	case err := <-serverErr:
-		// 监听或服务循环主动失败时及时向上传递；ErrServerClosed 是主动关闭的正常结果。
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve HTTP requests: %w", err)
-		}
-		return nil
+	case serveErr = <-serverErr:
+		serveReturned = true
 	case <-ctx.Done():
-		log.Printf("Shutting down HTTP server")
-		// 运行 ctx 此刻已经取消，若以它为父 context，Shutdown 会立即失败而无法等待请求。
-		// 改用 Background 派生独立的关闭预算，仍可用 shutdownTimeout 限制等待时间。
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancelShutdown()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			// 超时或其他收尾故障后强制断开连接，保留 Shutdown 和 Close 两个阶段的错误。
-			// 返回后 run 才执行数据库关闭，main 最后记录合并错误并以非零状态退出。
-			return errors.Join(fmt.Errorf("shut down HTTP server: %w", err), server.Close())
-		}
-		// Shutdown 成功已经等到普通在途请求结束；再接收 Serve 的终止结果，
-		// 使监听协程也完成退出，并检查是否存在独立的服务循环错误。
-		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve HTTP requests: %w", err)
-		}
-		log.Printf("HTTP server shutdown completed")
-		return nil
 	}
+
+	// 监听异常也可能留下正在执行的业务，因此所有退出触发都经过同一收尾流程。
+	log.Printf("Shutting down HTTP server and internal work")
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
+	httpErr := server.Shutdown(shutdownCtx)
+	if httpErr != nil {
+		resultErr = errors.Join(resultErr, fmt.Errorf("shut down HTTP server: %w", httpErr), server.Close())
+	}
+	// 即使 HTTP 等待失败，也不能跳过内部收尾；各超时组件共用剩余的同一预算。
+	workErr := handler.Shutdown(shutdownCtx)
+	if workErr != nil {
+		resultErr = errors.Join(resultErr, fmt.Errorf("drain internal HTTP work: %w", workErr))
+	}
+	if !serveReturned {
+		serveErr = <-serverErr
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		resultErr = errors.Join(resultErr, fmt.Errorf("serve HTTP requests: %w", serveErr))
+	}
+	drained = httpErr == nil && workErr == nil
+	if drained {
+		log.Printf("HTTP server and internal work shutdown completed")
+	} else {
+		log.Printf("HTTP shutdown incomplete: http_error=%v internal_work_error=%v", httpErr, workErr)
+	}
+	return drained, resultErr
 }

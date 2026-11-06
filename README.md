@@ -12,7 +12,7 @@ go run ./cmd/web
 
 `APP_ENV` 支持 `dev/test/prod`，未设置或为空时默认 `dev`；`APP_REGION` 目前支持 `cn`，未设置或为空时默认 `cn`。环境名和区域值严格匹配，非法值停止启动。
 
-按环境选择唯一的 `config/database/mysql/<environment>.yml`，文件缺失不回退其他环境。默认监听 `:8080`，初始化总时限为 30 秒，HTTP 收尾时限为 10 秒。可指定配置根目录、地址和时限：
+按环境选择唯一的 `config/database/mysql/<environment>.yml`，文件缺失不回退其他环境。默认监听 `:8080`，初始化总时限为 30 秒，停机收尾总时限为 10 秒。可指定配置根目录、地址和时限：
 
 ```sh
 go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeout 30s -shutdown-timeout 10s
@@ -26,7 +26,9 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。SIGINT/SIGTERM 触发 HTTP 收尾，请求结束后再关闭数据库；HTTP 收尾超时会强制关闭连接并返回错误。
+启动顺序为：部署环境初始化 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。
+
+SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才正常关闭数据库。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享连接池，并以失败状态退出，由进程退出释放连接；这不代表业务完成或事务已回滚。
 
 当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
 
@@ -57,6 +59,18 @@ machine_id: 1
 | POST | `updateUserProfile` | 检查版本并完整替换昵称、有效头像地址，不支持清空头像 |
 | POST | `batchQueryUserProfiles` | 按 ID 批量查询，返回已存在资料和缺失 ID |
 | GET | `queryUserProfilePage` | 按昵称、启用状态筛选并分页查询 |
+
+所有接口已启用响应等待超时，配置集中在 [routers/http_handler.go](routers/http_handler.go)：
+
+| 适用请求 | 等待时间 |
+| --- | --- |
+| 未单独覆盖的请求 | 3 秒 |
+| `GET /api/v1/user/userProfile/queryUserProfilePage` | 5 秒 |
+| `POST /api/v1/user/userProfile/createUser` | 10 秒 |
+
+覆盖配置按 HTTP 方法与 `URL.Path` 精确匹配，Query 参数不参与选择；每个请求只经过一个等待包装器。修改默认时间或增减覆盖项后重新启动服务即可生效，无需修改 Controller、Validator 或 Service。
+
+超过等待时间时返回 HTTP 503、`SERVICE_UNAVAILABLE`，消息为 `response wait timeout; operation outcome is unknown`。已经开始的内部业务继续执行，最终响应被丢弃；客户端应稍后确认结果，不能把超时当作业务失败或回滚证明。响应等待时间与 `-startup-timeout`、`-shutdown-timeout` 分别控制不同阶段。
 
 请求与响应字段见[用户资料 DTO](app/domains/user/dto/v1/user_profile/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。创建为首次自注册，不要求已有发起方用户 ID；更新显式提供 `operator_user_id` 和目标 `user_id`，当前限定本人修改。认证尚未接入，来源、外部账户及发起方 ID 都由请求声明，不代表已验证身份。
 
@@ -99,7 +113,7 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 
 Service 自己声明的错误集中在对应 Service 文件顶部，用包级 `var` 和 `errors.New` 表达本层独立判断的失败或明确的业务语义映射；Service 和 models 不声明新的 error 类型。每个用例在同一区域依次组织 Params、可选 Result、输入常量、输入校验和处理方法，Result 紧接 Params，跨用例私有方法位于尾部 `shared`。用例专属 Result 留在 Service，领域模型直接复用，具体见[Service 输出契约](specifications/application/api-service-validator.md#74-service-的输出契约)。Controller 文件维护自己的业务码和映射；models 直接复用公共检查错误，只为自身独立判断的领域失败声明错误。内部错误与对外业务码不要求一一对应；同一个业务码的通用错误类别保持固定。公共响应组件维护八个通用类别及 HTTP 状态映射，合法错误的 `Message`、`Details` 原样输出，具体约定见[接口错误规范](specifications/application/api-error.md)及[接口返回规范](specifications/application/api-response.md)。
 
-顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
+顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。`cmd/web` 通过 `routers.NewHTTPHandler` 在完整 Gin Engine 外装配响应等待中间件，并保存收尾入口；`routers.New` 本身仍只创建 Gin Engine。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
 Controller 保留在对应领域的 `controller/v1` 中；Validator 与 DTO 先按版本、再按 Controller 分组，用户资料分别位于 `validator/v1/user_profile` 和 `dto/v1/user_profile`。每个用例独立组织文件，两个分组包均命名为 `userprofile`，导入时分别使用 `userprofilevalidator`、`userprofiledto` 别名。同一 Controller 内复用的 `UserProfile` 放在该 DTO 分组的 `user_profile.go` 中；只有跨 Controller 复用且语义一致的结构，才按需建立 `dto/v1/shared` 包。统一响应外层由 `internal/response` 提供。
 
@@ -192,6 +206,8 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `internal/response` | 定义统一响应外层、通用错误枚举及固定 HTTP 状态映射、Gin 输出函数 |
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
+| `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
+| `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
 | `app/domains/*/controller/v1` | V1 请求处理；Controller 内维护业务码和错误映射 |
 | `app/domains/*/validator/v1/<controller>` | 按 Controller 分组的 V1 请求绑定与校验，每个用例一个 Validator 文件 |

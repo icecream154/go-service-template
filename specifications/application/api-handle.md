@@ -2,7 +2,7 @@
 
 本文面向第一次阅读本项目的开发者，说明一个 HTTP 请求如何进入系统、经过各层处理、访问数据库，再转换成最终响应。以 `createUser` 为主线，最后补充查询、分页、批量和更新接口的差异。
 
-本文描述各层的调用关系，以及可选响应等待超时启用后的处理约定。可选中间件只有显式接入 HTTP 入口后才生效，声明或构造组件不会自动改变接口行为。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
+本文描述各层的调用关系，以及 HTTP 入口统一启用响应等待超时后的处理约定。所有接口默认等待 3 秒，分页查询和创建用户分别覆盖为 5 秒、10 秒；超时只结束响应等待，不取消内部业务。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
 
 ## 1. 先看整体链路
 
@@ -11,7 +11,8 @@
 ```text
 客户端
   → net/http.Server 接收请求
-  → 可选的响应等待超时中间件：控制客户端等待，不取消内部业务
+  → HTTPHandler 按方法和路径选择响应等待配置
+  → 响应等待超时中间件：控制客户端等待，不取消内部业务
   → Gin 匹配路由，执行公共中间件
   → 对应用例的 Validator
       → Bind：HTTP 参数映射为 Request DTO
@@ -29,7 +30,7 @@ Repository 返回表结构或 error
   → Service 返回领域模型或用例 Result；明确业务失败返回业务错误，输入错误、技术故障和未知 error 原样返回
   → Controller 转换为 Response DTO 或接口错误
   → response.Success / response.Fail 编码并写入 JSON
-  → 未启用等待超时时直接输出；启用时由外层决定发送正常响应或超时响应
+  → 外层决定发送正常响应或超时响应；超时后丢弃晚到结果
   → 内部处理结束，释放本次执行资源
 ```
 
@@ -52,14 +53,16 @@ main → run
       → 加载 MySQL 配置
       → runtime.Init：创建数据库连接和 Repository
       → composition.Init：创建默认 Service
-  → routers.New：创建 Controller、Validator 并注册路由
+  → routers.NewHTTPHandler
+      → routers.New：创建 Controller、Validator 并注册路由
+      → 为同一个 Gin Engine 装配默认及接口覆盖的响应等待包装器
   → net.Listen
   → http.Server.Serve：开始接收 HTTP 请求
 ```
 
 环境、配置和数据库连接初始化成功后，程序才开始监听端口。默认地址为 `:8080`；启动方式和配置准备见 [README](../../README.md)。数据库及表结构需要提前准备，启动流程不自动建表，也不创建示例用户。
 
-`routers.New` 返回的 `*gin.Engine` 可以直接作为 `http.Server.Handler`。启用响应等待超时时，在完整 Gin Handler 外层使用中间件包装，HTTP 服务持有包装后的 Handler；普通路由和业务处理链不变。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求最终进入 Gin 的 `ServeHTTP`。中间件的配置和执行边界见第 5.4 节。
+`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine 和各个等待包装器，请求到来时只选择一个包装器执行，不重新创建路由或中间件。`routers.New` 仍只返回 Gin Engine，直接使用它不会启用这层等待控制。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
 
 ### 2.2 共享对象分别由谁持有
 
@@ -68,6 +71,7 @@ main → run
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
+| [routers/http_handler.go](../../routers/http_handler.go) | 同一个 Gin Engine、默认与覆盖配置的等待包装器及收尾组件 | 按请求方法和路径选择一个包装器；停机时统一等待内部处理 |
 | [用户领域 Router](../../app/domains/user/routers/router.go) | Controller 和各用例的 Validator | Gin 保存其处理方法，收到请求后调用 |
 
 MySQL 组件为每个启用的命名连接创建独立连接池，完成连通性及会话检查后交给 GORM。用户资料 Repository 复用用户数据库入口；Repository 的构造函数不会另建连接池。
@@ -137,7 +141,7 @@ userProfile.POST("/createUser", r.createUserValidator.CreateUser)
 
 一次请求到来后，Gin 按 HTTP 方法和路径选择已注册的处理链。公共中间件围绕后续处理执行：
 
-- `gin.Logger` 记录方法、路径以及内部处理链的状态码和耗时；启用响应等待超时后，外层另行记录选定的 HTTP 状态和等待耗时，不能把晚到的内部成功日志当作客户端收到了成功响应，也不能仅凭 503 判断发生了超时。
+- `gin.Logger` 记录方法、路径以及内部处理链的状态码和耗时；外层另行记录选定的 HTTP 状态和等待耗时，不能把晚到的内部成功日志当作客户端收到了成功响应，也不能仅凭 503 判断发生了超时。
 - `gin.CustomRecovery` 捕获当前请求处理链中的未处理 `panic`，框架错误的返回方式见第 5 节。
 
 Gin 为本次请求准备 `*gin.Context`，其中的 `Request` 提供原始 HTTP 请求，`Writer` 用于写出响应。Validator、Controller 和响应方法接收的是同一个 `ctx`；它属于单次请求，不保存在共享对象中。这里的 Gin Context 与启动入口用于停止进程的 `context.Context` 是不同对象。
@@ -281,7 +285,7 @@ Controller 随后调用 `userProfileDTO`，只选择对外公开的字段，构�
 response.Success(ctx, result)
 ```
 
-公共响应组件先将包含 `data/error` 的完整对象编码成 JSON 字节，再设置状态码、响应头并写入正文。未启用响应等待超时时，写入直接交给 HTTP Writer；启用后，先进入外层中间件的响应缓冲区，由外层决定是否发送。Controller 的调用方式不变；编码失败和写入失败的职责见第 5.3 节，超时后丢弃结果的规则见第 5.4 节。
+公共响应组件先将包含 `data/error` 的完整对象编码成 JSON 字节，再设置状态码、响应头并写入正文。写入先进入外层中间件的响应缓冲区，由外层决定是否发送。Controller 的调用方式不变；编码失败和写入失败的职责见第 5.3 节，超时后丢弃结果的规则见第 5.4 节。
 
 示例响应如下，用户 ID 仅用于说明结构，实际值由雪花生成器产生：
 
@@ -352,8 +356,9 @@ HTTP JSON
 | Repository 查询 | 目标资料未找到 | 404、`NOT_FOUND`、`USER_PROFILE_NOT_FOUND` | Service 解释为资料不存在，Controller 分类并输出 |
 | Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出收到的错误文案 |
 | response 编码 | DTO 无法编码为 JSON | 尚未写出时尝试返回默认 500 | response 记录原因并终止后续处理 |
-| response 写入 | 连接错误或正文未完整写入 | 不再追加错误响应 | response 记录原因并终止后续处理 |
-| 响应等待中间件（启用时） | 等待期限内未取得完整响应 | 503、`SERVICE_UNAVAILABLE`、结果尚未确认 | 不主动取消已开始的业务；后到响应丢弃 |
+| response 写入 | 当前 Writer 返回写入错误或短写 | 不再追加错误响应 | response 记录原因并终止后续处理 |
+| 外层网络写入 | 连接错误或正文未完整写入 | 不再追加错误响应 | 响应等待中间件记录实际发送失败 |
+| 响应等待中间件 | 等待期限内未取得完整响应 | 503、`SERVICE_UNAVAILABLE`、结果尚未确认 | 不主动取消已开始的业务；后到响应丢弃 |
 | 请求处理链 | 未处理的 `panic` | 交给公共异常恢复中间件 | 结束当前请求处理链 |
 
 ### 5.1 内部错误如何变成接口错误
@@ -391,19 +396,27 @@ HTTP JSON
 
 1. **编码失败时，由 response 在写出前准备兜底响应。** 例如 DTO 包含 JSON 无法表达的值，完整响应编码会返回错误。response 记录原始原因并中止后续处理链；尚未写出时，尝试返回 HTTP 500 和默认的 `INTERNAL_ERROR`、`internal server error`，不把编码错误作为业务错误交回 Controller，也不递归生成兜底响应。
 
-2. **写入失败时，由 response 记录并停止发送。** 例如用户已经创建成功，但客户端随后关闭连接，正文写入可能失败。组件记录写入错误或短写，不重试、不再追加一份错误 JSON；进入输出入口时如果响应已经写出，同样只记录并终止。服务端写入状态不能证明客户端已完整收到响应。
+2. **写入当前 Writer 失败时，由 response 记录并停止输出。** 组件检查 Writer 返回的写入错误或短写，不重试、不再追加一份错误 JSON；进入输出入口时如果响应已经写出，同样只记录并终止。这一步写入的是缓冲区，缓冲成功不保证最终网络发送成功，更不证明客户端已完整收到响应。
 
 3. **输出失败不改变已经完成的业务结果。** 编码或写入发生在 Service 返回之后，响应组件不会重新创建用户，也不能据此撤销已经提交的数据库操作。该阶段日志由 response 负责，Controller 无须重复记录；错误处理的完整约定见[接口返回规范第 7 节](api-response.md#7-响应编码与写出失败)。
 
-4. **启用响应等待超时后，缓冲写入与实际网络写入分开负责。** response 仍负责 JSON 编码及写入当前 Writer；外层中间件负责把获选的完整响应发送到真实 HTTP Writer，并记录该阶段的写入错误或短写。已经超时而被丢弃的结果不再尝试网络发送；任何阶段都不能因输出失败追加第二份响应。
+4. **缓冲写入与实际网络写入分开负责。** response 仍负责 JSON 编码及写入当前 Writer；外层中间件负责把获选的完整响应发送到真实 HTTP Writer，并记录该阶段的写入错误或短写。例如用户创建成功后客户端关闭连接，网络发送失败由外层记录。已经超时而被丢弃的结果不再尝试网络发送；任何阶段都不能因输出失败追加第二份响应。
 
 ### 5.4 响应等待超时不取消内部业务
 
 **响应等待超时只结束客户端对本次 HTTP 响应的等待，不决定业务成功、失败或回滚。** 这项能力适用于完整返回的普通 JSON 接口，不用于流式响应、SSE、WebSocket 或需要边处理边发送的接口。
 
-1. **等待时间在 HTTP 装配层配置，从标准库包装器开始处理本次请求时计时。** [响应等待中间件](../../app/http/middleware/response_timeout.go) 通过 `NewResponseTimeout(timeout)` 接收正的 `time.Duration`，不隐式采用默认值，零值和负值属于装配错误。`Wrap(next)` 返回包装完整 HTTP Handler 的入口；只有把这个入口接入 HTTP 服务才启用。不同入口可以配置不同等待时间，Controller、Validator、Service 和 Repository 不各自设置同一个 HTTP 等待期限。
+1. **等待时间集中在 HTTP 装配层配置，每次请求只选择一个等待期限。** [routers/http_handler.go](../../routers/http_handler.go) 的 `defaultResponseTimeout` 声明统一默认值，`NewHTTPHandler` 中的 `overrides` 声明接口覆盖项；构造时调用 `NewResponseTimeout(timeout)`、`Wrap(next)`，为同一个 Gin Engine 预先创建包装器。每个时长必须是正的 `time.Duration`，零值和负值属于装配错误。
 
-   **等待期限覆盖经过包装器的内部处理过程，不等于数据库执行时限。** 例如配置为 3 秒，绑定、校验、业务执行和响应准备共用这 3 秒；它不包含进入包装器之前读取请求头的时间。启动超时、HTTP 网络读写超时、数据库网络超时和进程收尾超时分别控制各自阶段，不能相互代替。
+   | 适用请求 | 响应等待时间 |
+   | --- | --- |
+   | 未单独覆盖的请求 | 3 秒 |
+   | `GET /api/v1/user/userProfile/queryUserProfilePage` | 5 秒 |
+   | `POST /api/v1/user/userProfile/createUser` | 10 秒 |
+
+   **覆盖项按 HTTP 方法和 `URL.Path` 精确匹配，Query 参数不参与匹配。** 例如分页查询无论使用哪一页或哪些筛选条件，都采用 5 秒；同一路径的其他方法不命中此覆盖项。未配置的接口采用默认 3 秒，未知路径也进入默认包装器，再由 Gin 返回路由不存在。覆盖包装器与默认包装器是并列选择，不能先套 3 秒再套 10 秒，否则创建接口仍会在 3 秒结束等待。新增接口通常只注册领域路由；只有需要不同等待时间时，才在中央配置增加覆盖项，修改后重启生效。
+
+   **等待时间从标准库包装器开始处理本次请求时计算，不等于数据库执行时限。** 例如配置为 3 秒，绑定、校验、业务执行和响应准备共用这 3 秒；它不包含进入包装器之前读取请求头的时间。Controller、Validator、Service 和 Repository 不各自设置同一个 HTTP 等待期限。启动超时、HTTP 网络读写超时、数据库网络超时和进程收尾超时分别控制各自阶段，不能相互代替。
 
 2. **计时、内部协程、响应缓冲和最终响应选择复用 `http.TimeoutHandler`。** 内部 Handler 的响应先进入标准库缓冲，外层只发送正常结果或超时结果中的一个；完成和超时同时就绪时也只选择一次，不承诺固定优先级。项目不再实现另一套定时器或缓冲 Writer，只适配统一 JSON、取消隔离、内部工作收尾和必要的输出日志。
 
@@ -458,19 +471,19 @@ HTTP JSON
 
 ### 7.1 HTTP 响应结束与内部处理结束
 
-1. **正常路径在内部处理完成后输出响应，并释放本次执行资源。** Controller 和 Validator 依次返回，Gin 记录内部处理状态与耗时；启用响应等待中间件时，由外层发送获选响应。Writer 返回成功不保证客户端已完整收到结果，输出失败仍按第 5.3 节处理。
+1. **正常路径在内部处理完成后输出响应，并释放本次执行资源。** Controller 和 Validator 依次返回，Gin 记录内部处理状态与耗时，由外层发送获选响应。Writer 返回成功不保证客户端已完整收到结果，输出失败仍按第 5.3 节处理。
 
 2. **超时路径先结束 HTTP 等待，内部处理结束后才完成本次业务收尾。** 超时后的处理仍可能持有事务、数据库连接及本次请求的内存；中间件要等内部 Handler 退出后，才从待收尾记录中移除。共享 Service、Repository 和连接池继续供运行中的请求使用，不能在发送超时响应时关闭。
 
 ### 7.2 停止接收、等待收尾与关闭资源
 
-1. **进程退出先停止接收新工作，再等待已经开始的工作。** HTTP 服务停止接收新请求；已启用的响应等待组件调用 `Shutdown(ctx)`，停止接纳新的内部执行，并等待已经登记的 Handler 退出。普通在途 HTTP 请求由 `http.Server.Shutdown` 等待，已经返回超时但仍在运行的处理由中间件等待；两部分都完成后，才允许关闭数据库等共享依赖。
+1. **进程退出先停止接收新请求，再依次等待 HTTP 请求和内部处理。** [进程入口](../../cmd/web/main.go) 先调用 `http.Server.Shutdown(ctx)`，关闭监听并等待普通在途 HTTP 请求；随后调用 `HTTPHandler.Shutdown(ctx)`，遍历默认配置与接口覆盖使用的所有响应等待组件，停止接纳内部执行，并等待已经登记的 Handler 退出。即使 HTTP 收尾失败，也必须继续调用内部收尾入口；某个组件等待失败时，也不能漏掉其他组件。已经返回超时但仍在运行的业务由这一步继续跟踪。
 
-2. **收尾使用独立预算，不复用已取消的进程通知或 HTTP 等待 Context。** 应用装配层为停机创建独立的标准 Context，在同一个收尾总预算内等待 HTTP 服务和各中间件。响应等待时间只影响单次响应，不能决定数据库连接池什么时候关闭；内部处理晚于 HTTP 响应结束，也不能因此被漏掉。
+2. **两次收尾共用一个独立总预算，不复用已取消的进程通知或 HTTP 等待 Context。** `-shutdown-timeout` 指定总预算，默认 10 秒；入口创建独立的标准 Context，依次传给 HTTP 服务和装配对象的 `Shutdown`，不会给每个组件重新分配完整预算。响应等待时间只影响单次响应，不能决定数据库连接池什么时候关闭；HTTP 层排空也不能代替内部处理排空。
 
-3. **收尾超时表示仍有工作未确认结束，不能按正常完成继续描述。** `Shutdown(ctx)` 返回截止时间错误时，应记录仍有未完成工作，按照部署约定执行异常停机；不能报告“全部业务已完成”或“全部事务已回滚”。强制断开 HTTP 连接或进程退出，都不证明提交结果已经确定。连接池不能仅因 HTTP 层已排空就按正常顺序提前关闭；有限停机预算不能提供进程终止后继续执行业务的保证。
+3. **共享资源只在 HTTP 和内部处理均确认结束后正常关闭。** 两部分收尾均成功时，入口才执行应用资源清理，关闭数据库等共享依赖。启动装配或监听失败、尚未开始处理请求时，也应正常释放已创建的资源。HTTP 收尾失败可以强制关闭 HTTP 连接，但这不能取消内部跟踪，更不能据此提前关闭仍被业务使用的连接池。
 
-4. **应用装配必须同时接入等待中间件和对应收尾责任。** [进程入口](../../cmd/web/main.go) 持有 HTTP 服务、应用资源及停机顺序；启用包装器时，保存中间件实例以便调用其 `Shutdown`。只创建或包装 Handler 不会自动修改进程退出流程，也不能仅依靠 `http.Server.Shutdown` 等待已脱离 HTTP 等待的业务。未启用响应等待中间件时，仍按普通 HTTP 处理完成后关闭共享资源的顺序运行。
+4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭共享数据库连接池，并以失败状态退出；进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
 
 ## 8. 第一次看代码时的阅读顺序
 
@@ -481,7 +494,7 @@ HTTP JSON
 | 1 | [cmd/web/main.go](../../cmd/web/main.go) | `run`、`serve`：依赖初始化与 HTTP 服务启动、关闭 |
 | 2 | [bootstrap/init.go](../../bootstrap/init.go) | `Init`：启动顺序 |
 | 3 | [internal/runtime/runtime.go](../../internal/runtime/runtime.go)、[internal/composition/services.go](../../internal/composition/services.go) | DB、Repository、Service 分别在哪里创建与保存 |
-| 4 | [routers/web.go](../../routers/web.go) | Gin、中间件、API 前缀和版本 |
+| 4 | [routers/http_handler.go](../../routers/http_handler.go)、[routers/web.go](../../routers/web.go) | 默认和接口覆盖的等待时间、外层 Handler、Gin、中间件、API 前缀和版本 |
 | 5 | [用户领域 Router](../../app/domains/user/routers/router.go) | 完整路径如何拼接、实际注册哪个 Validator 方法 |
 | 6 | [create_user_validator.go](../../app/domains/user/validator/v1/user_profile/create_user_validator.go)、[bind.go](../../internal/validator/bind.go) | 请求绑定、字段校验、失败时提前返回 |
 | 7 | [create_user.go](../../app/domains/user/dto/v1/user_profile/create_user.go)、[user_profile.go](../../app/domains/user/dto/v1/user_profile/user_profile.go) | 请求字段类型及标签、专属响应类型及同组共享字段 |
