@@ -2,7 +2,7 @@
 
 ## 1. 适用范围与文件职责
 
-1. **`internal/authn` 声明公共认证契约，JWT 子包提供具体实现，`app/identity` 声明项目命名空间。** `authn` 表示 authentication，即身份认证。公共契约回答“如何签发和验证凭证、认证成功得到什么身份、失败如何返回”，不绑定某个业务用户模型；项目层集中定义身份体系的名称及含义，具体声明与引用方式见第 2.4 节。
+1. **公共契约、凭证实现、HTTP 适配和项目身份名称各自归属对应层。** `authn` 表示 authentication，即身份认证。`internal/authn` 回答“如何签发和验证凭证、认证成功得到什么身份、失败如何返回”，JWT 子包提供具体实现；`app/http/middleware` 负责从 HTTP 请求读取凭证、保存认证结果及输出认证失败；`app/identity` 集中定义项目身份体系的名称及含义，具体约定见第 2.4 节。
 
    | 文件 | 声明内容 | 职责 |
    | --- | --- | --- |
@@ -13,6 +13,8 @@
    | [jwt/config.go](../../internal/authn/jwt/config.go) | JWT 配置与加载方法 | 加载指定环境配置，校验字段并读取签名密钥 |
    | [jwt/provider.go](../../internal/authn/jwt/provider.go) | `Provider` | 使用 HS256 签发和验证 JWT |
    | [jwt/runtime.go](../../internal/authn/jwt/runtime.go) | `Init`、`Current` | 初始化并访问进程共享的 JWT 实例 |
+   | [authentication.go](../../app/http/middleware/authentication.go) | `RequireAuthentication` 及私有凭证读取、错误处理方法 | 将 HTTP Authorization 头转换为公共凭证，调用认证器并控制后续处理 |
+   | [HTTP principal.go](../../app/http/middleware/principal.go) | `PrincipalFromContext` 及私有保存方法 | 在当前 Gin Context 中按值保存、读取可信身份 |
    | [user_namespace.go](../../app/identity/user_namespace.go) | 项目用户命名空间常量 | 维护用户身份体系的名称、语义与扩展约定 |
    | [service_namespace.go](../../app/identity/service_namespace.go) | 项目服务命名空间常量 | 维护管理服务等服务身份体系的名称、语义与扩展约定 |
 
@@ -268,3 +270,60 @@ type Issuer interface {
    ```
 
 2. **凭证有效不代表主体的实时业务状态或操作权限已通过。** 本组件不检查用户是否停用、服务是否被移出管理名单或某个对象是否属于调用方；这些判断不能由验签结果代替。它也不提供凭证刷新、丢失恢复或单个凭证撤销机制，不能将重复注册或自行提交一个主体 ID 当作重新签发凭证的依据。
+
+## 7. HTTP 认证适配层
+
+### 7.1 文件职责与公开方法
+
+1. **HTTP 认证放在 `app/http/middleware`，公共认证包不依赖 Gin。** [authentication.go](../../app/http/middleware/authentication.go) 负责 HTTP 凭证提取、调用认证器、处理失败和放行；[principal.go](../../app/http/middleware/principal.go) 负责保存和读取本次请求的身份。该适配层依赖 `authn` 接口及统一 `response`，不导入具体 JWT 包或项目 `identity`，也不判断某个业务接口允许哪种身份。
+
+2. **中间件构造器只接收已经装配好的认证器。** 公开方法如下；构造时传入 `authn.Authenticator`，每次请求使用同一个可并发调用的实例。未提供认证器或接口值中包含 nil 指针等空依赖时，构造器直接 panic，作为装配错误处理。更换认证实现时，不需要修改 HTTP 凭证读取和身份保存方式。
+
+   ```go
+   func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc
+
+   func PrincipalFromContext(ctx *gin.Context) (authn.Principal, bool)
+   ```
+
+3. **组件存在不代表路由已经启用认证。** 本次只提供中间件和身份读取能力，没有在全局、路由分组或单个接口挂载 `RequireAuthentication`，也没有修改 Controller。以后需要保护某个入口时，由路由装配明确将中间件放在其 Validator 之前；身份类别、命名空间和对象访问范围继续由对应业务规则决定。
+
+### 7.2 Authorization 头如何映射为凭证
+
+1. **唯一凭证来源是一个 `Authorization` 请求头。** 不读取 Query、请求体或 Cookie，也不在其他来源中回退寻找 Token。头部缺失或仅含 HTTP 外层允许的空格、制表符，表示未提供凭证；重复的 Authorization 头直接拒绝，不选第一条或最后一条，逗号拼接的多份凭证也不能当作一份输入。头名称忽略大小写，大小写不同的重复头也一并计数。
+
+2. **方案与 Token 之间使用 ASCII 空格，Token 正文保持原样。** HTTP 字段值外层允许的空格、制表符可以剥离；方案和正文之间至少需要一个 ASCII 空格，方案名按 HTTP `token` 字符集检查，`Bearer` 忽略大小写。正文按 HTTP `b64token` 字符集检查：至少包含一个英文字母、数字或 `-._~+/` 字符，只允许在末尾附加 `=`。内部空白、逗号、非 ASCII 字符及位于正文中间的 `=` 均拒绝；不执行 URL 解码，不修复或重新拼接 Token，也不把 `Bearer` 前缀送入 `Credential.Value`。
+
+3. **HTTP 格式错误与凭证验证失败分别处理。** 缺少分隔、空 Token、错误分隔符、重复头或逗号多凭证属于请求格式错误，在调用认证器前返回 400。结构完整但方案不是 Bearer 时返回方案不支持的 401；结构合法的 Bearer 凭证才交给认证器判断签名、有效期及身份。仅凭格式正确不能认定凭证有效。
+
+### 7.3 一次请求的执行顺序
+
+1. **先清除旧身份并检查 HTTP 凭证格式，再调用认证器。** 中间件先清空本存储键中的已有值，避免沿用同一请求前序处理器留下的身份；随后从 Authorization 头构造 `authn.Credential`，执行 `authenticator.Authenticate(ctx.Request.Context(), credential)`。使用的是当前 Request 的标准 Context，不把 Gin Context 传入公共认证层，也不在这里创建新的等待超时。
+
+2. **认证成功后检查结果完整性，再保存身份并继续处理。** 中间件确认 `Principal.Kind` 为 `user` 或 `service`，且命名空间、主体标识非空白；结果不满足公共契约时按认证器实现错误返回 500，不保存身份或继续处理。结果完整时，通过私有 `setPrincipal` 按值保存，再调用 `ctx.Next()`。这项检查不重复验签或判断业务命名空间；Token 原文不存入 Principal，不供后续 Controller 重新解析身份。
+
+3. **认证失败立即输出并终止，不进入 Validator 或 Controller。** 中间件按照第 7.4 节选择响应和挑战头，通过 `response.Fail` 输出后立即 `return`。`Fail` 中的 `Abort` 阻止后续 Gin 处理器运行，当前方法仍必须返回；不能输出失败后继续保存身份或调用后续处理。
+
+### 7.4 错误响应与认证挑战
+
+1. **HTTP 格式、身份认证和技术故障使用不同响应类别。** 所有失败均使用统一 `data/error` 结构，不附 `business_code` 或 `details`；消息使用对应错误的 `Error()`，适配层不将 Authorization 头、Token 或签名密钥拼入消息。具体映射如下：
+
+   | 情况 | HTTP 状态与通用码 | `WWW-Authenticate` |
+   | --- | --- | --- |
+   | 未提供凭证，或认证器返回 `ErrMissingCredential` | 401、`UNAUTHENTICATED` | `Bearer realm="api"` |
+   | 完整凭证的方案不支持，或认证器返回 `ErrUnsupportedScheme` | 401、`UNAUTHENTICATED` | `Bearer realm="api"` |
+   | Authorization 结构不合法 | 400、`INVALID_ARGUMENT` | `Bearer realm="api", error="invalid_request"` |
+   | 认证器返回 `ErrInvalidCredential` 或 `ErrExpiredCredential` | 401、`UNAUTHENTICATED` | `Bearer realm="api", error="invalid_token"` |
+   | 认证器成功返回了不完整身份，或返回 `ErrInvalidPrincipal` | 500、`INTERNAL_ERROR` | 不设置认证挑战 |
+   | 未知技术错误或 Context 取消、截止时间错误 | 500、`INTERNAL_ERROR` | 不设置认证挑战 |
+
+2. **技术故障由中间件记录并原样说明，不能伪装成无效凭证。** 500 错误记录英文日志，响应保留原始 `err.Error()`；日志不额外记录凭证或完整请求头，错误产生处也不能把凭证写入错误消息。成功却返回不完整身份时使用固定消息 `authenticator returned an invalid principal`。已确认的缺失、不支持、无效或过期等认证失败，使用公共认证错误识别，不根据英文消息猜测类别；Context 错误优先按 500 处理。
+
+3. **认证挑战只说明凭证要求，不承诺业务权限。** `WWW-Authenticate` 的 Bearer 表示该入口接受的凭证方案；`invalid_request` 表示请求格式问题，`invalid_token` 表示凭证无效或过期。即使认证通过，也仍需执行接口自己的授权与业务约束。
+
+### 7.5 Principal 的保存、读取与缺失处理
+
+1. **保存入口保持私有，认证结果只属于当前请求。** `setPrincipal` 由认证中间件在成功后调用，内部存储键不作为业务接口开放；不提供从 Request DTO、Query 或请求自报 ID 设置可信身份的方法。不同请求各自使用自己的 Gin Context，不把 Principal 写入共享 Controller、Service 或全局变量。
+
+2. **读取方法返回值和存在标记，不产生响应副作用。** `PrincipalFromContext(ctx)` 返回 `authn.Principal` 的值及 `bool`，调用方先检查标记，再使用身份；取得副本后修改字段不会改变 Context 中保存的身份。身份未保存、已被中间件清空或存储类型不正确时，返回零值和 `false`；读取方法不写 HTTP 响应、不调用 `Abort`，也不临时解析 Token 补建身份。
+
+3. **缺少 Principal 由使用方根据入口契约处理。** 受保护入口应当已先经过认证中间件，Controller 此时仍取不到身份，说明路由装配或调用链有问题，应按内部错误处理，不能改用请求中的用户 ID 继续执行。公开入口本来可以没有身份，不能仅因读取返回 `false` 就返回认证失败；本次未修改任何 Controller 的读取或错误处理。

@@ -206,7 +206,10 @@ func (provider *Provider) acceptsPrincipal(principal authn.Principal) bool {
 // 不能只用 errors.Is(err, ErrTokenExpired)：它在过期与其他失败同时出现时也会返回 true。
 // 未识别的叶子错误一律拒绝，避免库增加验证规则后被误分类为单纯过期。
 func onlyExpirationCauses(err error) bool {
-	if errors.Is(err, jwtlib.ErrTokenExpired) || errors.Is(err, jwtlib.ErrTokenInvalidClaims) {
+	// 此处必须比较当前错误节点本身，不能用会递归搜索整个错误树的 errors.Is。
+	// 例如「声明错误 → [已过期、接收方不匹配]」：找到过期只说明有这个原因，
+	// 不能省略对另一个分支的检查。以下递归会检查所有分支并拒绝接收方错误。
+	if err == jwtlib.ErrTokenExpired || err == jwtlib.ErrTokenInvalidClaims {
 		return true
 	}
 	switch wrapped := err.(type) {
