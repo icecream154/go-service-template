@@ -25,7 +25,7 @@
 
 ```text
 Repository 返回表结构或 error
-  → Service 返回领域模型；已识别的业务失败转为领域错误，其他 error 继续上抛
+  → Service 返回领域模型或用例 Result；明确业务失败返回业务错误，输入错误、技术故障和未知 error 原样返回
   → Controller 转换为 Response DTO 或接口错误
   → response.Success / response.Fail 写入 HTTP JSON
   → 请求处理结束
@@ -230,9 +230,11 @@ Controller 将请求字段组织为 [CreateUserParams](../../app/domains/user/se
 
 这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责输入映射和后续响应转换。
 
+Controller 的业务入参只有 Request DTO，`ctx` 是独立的 HTTP 上下文。Validator 不构造 Service Params；需要将 ID 文本转换为整数等操作时，由 Controller 在构造 Params 时完成。Validator 已按相同解析语义验证成功、且 DTO 值未被修改的纯类型转换，允许忽略错误返回值。例如，按 ID 查询接口在 Controller 中使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。
+
 ### 3.6 Service 决定如何创建用户
 
-[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、参数校验和处理方法；跨用例复用的实现放在文件尾部的 `shared` 区域。
+[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、可选 Result、输入常量、参数校验和处理方法；Result 紧接 Params，跨用例复用的实现放在文件尾部的 `shared` 区域。创建结果就是 `models.UserProfile`，因此这个用例直接返回模型，不声明 `CreateUserResult`。
 
 Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值声明在 [Service 文件](../../app/domains/user/service/user_profile_service.go) 各用例的 Params 旁，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
 
@@ -321,10 +323,13 @@ HTTP JSON
 | Service Params | 业务用例接受的输入 | Controller 手工映射 |
 | `tables.UserProfile` | 数据库列、GORM 标签、SQL 可空值 | Service 构造，Repository 写入或读取 |
 | `models.UserProfile` | 业务层返回的用户资料 | Service 的 `profileModel` 转换 |
-| 用例 Response DTO | 当前接口允许对外返回的字段 | Controller 的 `userProfileDTO` 转换 |
+| Service `<UseCase>Result` | 某个用例组合的业务结果，例如资料列表和总数、缺失 ID | Service 组织；类型紧接同文件对应 Params 声明 |
+| 用例 Response DTO | 当前接口允许对外返回的字段 | Controller 从模型或 Result 映射，资料字段由 `userProfileDTO` 转换 |
 | `response.Response[T]` | 统一的 `data/error` 外层 | `response.Success` 或 `response.Fail` 构造 |
 
 当前 Repository 直接使用 `tables`，不接收或返回 `models`。当前 `models.UserProfile` 是业务字段结构，其校验和业务流程由现有 Validator、Service 实现。
+
+单条查询、创建和更新的 Service 结果就是 `models.UserProfile`，直接返回该模型。批量查询的 `BatchQueryUserProfilesResult` 将 `UserProfiles` 和 `MissingUserIDs` 放在一起；分页查询的 `QueryUserProfilePageResult` 包含 `UserProfiles` 和 `TotalCount`。这两个结构都声明在 Service 对应用例的 Params 下方，Controller 再将它们映射成各自的 Response DTO，HTTP 字段及外层结构保持一致。返回类型和空结果约定见[Service 的输出契约](api-service-validator.md#74-service-的输出契约)。
 
 这些转换只有 HTTP 到 Request DTO 的部分交给 Gin 自动完成。其余映射在 Controller 和 Service 中明确编写，阅读时可以直接跟随字段赋值查看数据去向。
 
@@ -337,39 +342,35 @@ HTTP JSON
 | Gin 路由匹配 | 方法或路径未匹配 | 404、`NOT_FOUND`、无业务码 | 不进入用例 Validator |
 | 通用绑定 | JSON 格式错误、字段类型不匹配 | 400、`INVALID_ARGUMENT` | 不进入 Controller |
 | 请求字段校验 | 昵称为空、字段超长 | 400、`INVALID_ARGUMENT`、字段明细 | 不进入 Controller |
-| Service 业务处理 | 账户身份已存在 | 409、`CONFLICT`、`USER_ACCOUNT_ALREADY_EXISTS` | Controller 输出错误 |
-| Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出 Service 准备的错误文案 |
+| Service 业务处理 | 更新时实际版本与提交版本不同 | 409、`CONFLICT`、`USER_PROFILE_VERSION_CONFLICT` | Controller 输出错误 |
+| Repository 查询 | 目标资料未找到 | 404、`NOT_FOUND`、`USER_PROFILE_NOT_FOUND` | Service 解释为资料不存在，Controller 分类并输出 |
+| Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出收到的错误文案 |
 | 请求处理链 | 未处理的 `panic` | 交给公共异常恢复中间件 | 结束当前请求处理链 |
 
 ### 5.1 内部错误如何变成接口错误
 
-Service 返回 Go 的 `error`，自身的业务错误及内部执行故障类型定义在 [Service 文件顶部](../../app/domains/user/service/user_profile_service.go)。[Controller](../../app/domains/user/controller/v1/user_profile_controller.go) 在文件顶部声明业务码，`mapUserProfileErrorCodes` 只选择通用码和业务码，`failUserProfileOperation` 直接使用收到的 `err.Error()` 构造 `ErrorInfo`，不重新组织文案或补造字段明细。
+1. **Service 解释业务失败，models 检查领域规则，两层都不声明新的 error 类型。** 需要命名错误时使用 `errors.New`，Service 的声明放在[文件顶部](../../app/domains/user/service/user_profile_service.go)。发号器成功返回非正 ID、用户状态不允许修改、提交版本与实际版本不一致，由 Service 自己判断；目标资料明确未命中，则由 Service 解释为资料不存在。公共检查和 models 已表达清楚的输入错误、数据库连接或执行故障、发号失败等原样返回，不增加包装或替换成统一失败错误。
 
-例如，创建时发生唯一键冲突，Service 会先区分冲突原因：
+2. **Controller 识别 Service 返回的错误，只选择通用码和业务码。** [Controller](../../app/domains/user/controller/v1/user_profile_controller.go) 在文件顶部声明业务码，由 `mapUserProfileErrorCodes` 集中分类。以资料查询未命中为例，Repository 返回 `gorm.ErrRecordNotFound`，Service 返回 `ErrUserProfileNotFound`；Controller 识别这个业务错误，选择 `NOT_FOUND` 和 `USER_PROFILE_NOT_FOUND`。`failUserProfileOperation` 使用收到的 `err.Error()`，不重新组织文案或补造字段明细。
 
-1. 识别 GORM 重复键错误或 MySQL 1062。
-2. 按账户来源和外部标识复查。
-3. 确认该账户已存在，才转换为 `ErrAccountAlreadyExists`。
-4. Controller 的 `mapUserProfileErrorCodes` 将其映射为 `CONFLICT` 和 `USER_ACCOUNT_ALREADY_EXISTS`。
+   查询未命中的响应示例：
 
-主键冲突等内部异常不能一概归类为“账户已存在”。内部领域错误与对外业务错误码分别维护，也不要求一一对应。
+   ```json
+   {
+     "data": null,
+     "error": {
+       "code": "NOT_FOUND",
+       "business_code": "USER_PROFILE_NOT_FOUND",
+       "message": "user profile not found"
+     }
+   }
+   ```
 
-重复账户的响应示例：
+   HTTP 状态码为 404。`code` 表达通用类别，`business_code` 表达具体业务原因；通用类别与 HTTP 状态码的映射由 [internal/response/error.go](../../internal/response/error.go) 统一维护。
 
-```json
-{
-  "data": null,
-  "error": {
-    "code": "CONFLICT",
-    "business_code": "USER_ACCOUNT_ALREADY_EXISTS",
-    "message": "user account already exists"
-  }
-}
-```
+3. **重复键只有确认业务条件后，才能返回账户已存在。** Service 通过 [mysql.IsDuplicateKey](../../internal/database/mysql/error.go) 识别重复键；MySQL 编号和 GORM 错误兼容逻辑集中在数据库组件，Service 不自行比较魔法数字。该方法不判断具体约束或业务含义，也不修改原始错误。确认属于重复键后，Service 按账户来源及外部标识复查；成功找到该账户后，返回 `ErrAccountAlreadyExists`，由 Controller 输出 HTTP 409、`CONFLICT`、`USER_ACCOUNT_ALREADY_EXISTS` 和 `user account already exists`。这个判断确认账户已经存在，不声称识别了实际冲突索引。复查明确未命中时，原样返回最初的写入错误；复查发生技术故障时，原样返回复查错误，并在日志中记录两次失败原因，不用 `errors.Join` 合并错误。不能仅凭重复键类别将任意冲突归为账户已存在。
 
-HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体业务原因；通用类别与 HTTP 状态码的映射由 [internal/response/error.go](../../internal/response/error.go) 统一维护。
-
-数据库、发号等执行故障由 Service 在故障出口记录原始错误，再返回文件顶部声明的命名错误。例如创建失败返回 `ErrUserCreateFailed`，其文案为 `failed to create user`。Controller 将这类失败映射为 HTTP 500、`INTERNAL_ERROR`，响应消息直接采用该错误的 `Error()`，不解包原因或重复记录日志。框架异常恢复仍使用默认的 `internal server error`。完整约定见[错误声明、传递与响应规范](api-error.md)。
+4. **执行故障和第三方文案沿同一条原样返回链路处理。** Service 可以在故障出口记录操作上下文，随后仍返回原错误。Controller 对无法识别的失败选择 `INTERNAL_ERROR`，响应消息直接采用收到的 `err.Error()`，包括第三方数据库错误的原始文案。项目自行声明的错误提供可公开的非空白英文说明；第三方文案不翻译、不脱敏、不替换。框架异常恢复仍使用默认的 `internal server error`。完整约定见[错误声明、传递与响应规范](api-error.md)。
 
 ### 5.2 Fail、return 和异常恢复各负责什么
 
@@ -383,16 +384,16 @@ HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体
 
 | 接口 | Validator 入口 | 相比创建接口的主要差异 |
 | --- | --- | --- |
-| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/user_profile/query_user_profile_by_user_id_validator.go) | GET Query 绑定 ID 文本，校验为正 int64；Controller 转为整数，Service 查询，未命中返回领域错误 |
-| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/user_profile/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；校验分页范围、昵称和状态文本；仓储执行总数及本页查询 |
-| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/user_profile/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组，Controller 转为整数数组；Service 按首次出现顺序去重，返回资料与缺失 ID |
+| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/user_profile/query_user_profile_by_user_id_validator.go) | GET Query 绑定 ID 文本，校验为正 int64；Controller 转为整数，Service 将明确未命中解释为资料不存在，技术故障原样返回 |
+| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/user_profile/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；仓储执行总数及本页查询，Service 通过 `QueryUserProfilePageResult` 返回资料和总数 |
+| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/user_profile/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组，Controller 转为整数数组；Service 去重后通过 `BatchQueryUserProfilesResult` 返回资料与缺失 ID |
 | `updateUserProfile` | [UpdateUserProfile](../../app/domains/user/validator/v1/user_profile/update_user_profile_validator.go) | 校验目标、发起方、版本和完整资料；Service 使用显式事务、行锁及版本条件完成更新 |
 
 补充阅读时容易混淆的细节：
 
 - 分页默认值仅在未提供参数时保留，显式零值会被校验拒绝。状态筛选先绑定成可选字符串，只允许 `true`、`false`，Controller 再映射为 Service 的可选布尔值。
 - 分页总数与本页数据分别读取，固定按用户 ID 降序，不承诺并发写入期间来自同一个数据库快照。
-- 批量查询的数量限制按去重前计算。部分或全部用户不存在仍是成功查询，缺失 ID 放在结果字段中。
+- 批量查询的数量限制按去重前计算。部分或全部用户不存在仍是成功查询，缺失 ID 放在 Result 字段中；成功时资料列表和缺失 ID 列表均为非 nil 切片。分页无匹配记录时仍返回 Result，列表为空并保留实际总数。Service 执行失败返回 `nil, err`，不提供可继续使用的部分结果。
 - 更新版本使用 `*int64`，缺失或 `null` 不合法，版本 `0` 合法。更新头像是必填的有效 URL 字符串，这个 HTTP 接口不允许清空；创建及查询结果中的可空头像仍保留原有语义。
 - 更新 Service 先判断本人操作，再在事务中锁读用户，检查启用状态及实际版本，执行带版本条件的更新，读取更新结果，提交成功后才返回。事务内的 Repository 使用本次 `tx`，不会切回普通连接。
 

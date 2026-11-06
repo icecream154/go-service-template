@@ -81,7 +81,7 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 }
 ```
 
-顶层 `data`、`error` 始终存在：成功时 `data` 是该用例的 Response DTO，`error` 为 `null`；失败时 `data` 为 `null`，`error` 是统一错误对象。调用方从 `data` 读取业务结果，从必填的 `error.code` 判断通用错误类别，按需使用可选的 `error.business_code` 识别具体业务原因；`error.message` 为英文说明，`error.details` 为可选字段明细。HTTP 状态码由通用码的固定映射决定，Controller 不独立设置状态码。
+顶层 `data`、`error` 始终存在：成功时 `data` 是该用例的 Response DTO，`error` 为 `null`；失败时 `data` 为 `null`，`error` 是统一错误对象。调用方从 `data` 读取业务结果，从必填的 `error.code` 判断通用错误类别，按需使用可选的 `error.business_code` 识别具体业务原因；`error.message` 直接使用收到的错误说明，项目自行声明的错误使用英文，第三方故障保留原始文案；`error.details` 为可选字段明细。HTTP 状态码由通用码的固定映射决定，Controller 不独立设置状态码。
 
 `data.user_id` 使用十进制字符串，避免雪花 ID 精度丢失。`data.avatar_url` 始终保留：未提供头像时为 `null`，数据库中明确保存空字符串时为 `""`。`data.is_enabled` 表示当前启用状态，`data.version` 用于下一次更新时提交 `expected_version`。
 
@@ -90,14 +90,14 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 | ID 缺失、格式错误、非正数或超出 int64 范围 | 400 | `{"data":null,"error":{"code":"INVALID_ARGUMENT","message":"user_id: must be a positive 64-bit integer","details":[{"field":"user_id","reason":"must be a positive 64-bit integer"}]}}` |
 | 用户资料不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","business_code":"USER_PROFILE_NOT_FOUND","message":"user profile not found"}}` |
 | 路由不存在 | 404 | `{"data":null,"error":{"code":"NOT_FOUND","message":"route not found"}}` |
-| 用户资料查询执行失败 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"failed to query user profile"}}` |
+| 用户资料查询执行失败，例如下层返回 `driver: bad connection` | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"driver: bad connection"}}` |
 | 未处理异常 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
 五个接口均使用 Router → 对应用例 Validator → Controller 链路。领域 Validator 为每次请求创建 Request DTO，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数校验。已知字段问题汇总为 `details`，消息使用第一条字段错误的 `Error()`；规则错误和未知失败单独返回 500。校验全部通过后才将 DTO 传给 Controller。通用 `Bind` 使用 Gin 原生绑定：GET 读取 Query，POST 读取 JSON；绑定失败使用其错误文案并终止，不继续检查部分 DTO。完整链路见[接口处理流程](specifications/application/api-handle.md)。
 
-业务调用链为 Controller → Service → Repository。Controller 将请求 DTO 映射为 Service Params；Service 从仓储取得表结构，再映射为 `models.UserProfile` 领域实体；Controller 根据实体构造用例专属响应 DTO，通过 `response.Success` 放入 `data`。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的业务错误；Controller 在自己的文件中选择通用码和可选业务码，直接使用 `err.Error()` 输出。数据库、发号等故障由 Service 记录原始原因，再返回自己声明的命名错误，Controller 只分类并输出。
+业务调用链为 Controller → Service → Repository。Controller 的业务入参只有 Request DTO，由其内部构造 Service Params；Validator 已保证成功的纯类型转换可以忽略错误返回值。Service 从仓储取得表结构，再映射为领域实体；单条资料用例直接返回 `models.UserProfile`，批量和分页用例分别返回 `BatchQueryUserProfilesResult`、`QueryUserProfilePageResult`。Controller 根据模型或 Result 构造用例专属响应 DTO，通过 `response.Success` 放入 `data`。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的业务错误；Controller 在自己的文件中选择通用码和可选业务码，直接使用收到的 `err.Error()` 输出。数据库连接、SQL 执行、发号等技术故障由 Service 记录上下文后原样返回，不包装或替换为统一失败错误。
 
-Service 错误集中在对应 Service 文件顶部；每个用例在同一区域依次组织 Params、输入校验和处理方法，跨用例私有方法位于尾部 `shared`。Controller 文件维护自己的业务码和映射；models 直接复用公共检查错误，不额外包一层字段错误。内部错误与对外业务码不要求一一对应；同一个业务码的通用错误类别保持固定。公共响应组件维护八个通用类别及 HTTP 状态映射，合法错误的 `Message`、`Details` 原样输出，具体约定见[接口错误规范](specifications/application/api-error.md)及[接口返回规范](specifications/application/api-response.md)。
+Service 自己声明的错误集中在对应 Service 文件顶部，用包级 `var` 和 `errors.New` 表达本层独立判断的失败或明确的业务语义映射；Service 和 models 不声明新的 error 类型。每个用例在同一区域依次组织 Params、可选 Result、输入常量、输入校验和处理方法，Result 紧接 Params，跨用例私有方法位于尾部 `shared`。用例专属 Result 留在 Service，领域模型直接复用，具体见[Service 输出契约](specifications/application/api-service-validator.md#74-service-的输出契约)。Controller 文件维护自己的业务码和映射；models 直接复用公共检查错误，只为自身独立判断的领域失败声明错误。内部错误与对外业务码不要求一一对应；同一个业务码的通用错误类别保持固定。公共响应组件维护八个通用类别及 HTTP 状态映射，合法错误的 `Message`、`Details` 原样输出，具体约定见[接口错误规范](specifications/application/api-error.md)及[接口返回规范](specifications/application/api-response.md)。
 
 顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
@@ -163,7 +163,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 
 `UpdateProfile(id, expectedVersion, tables.UserProfile{...})` 只取传入结构的 `UserName` 和 `AvatarURL`，完整替换昵称和头像，并递增版本。更新只作用于启用且旧版本匹配的记录；传入结构里的 ID、账户身份、启用状态、Version 和时间不参与修改。`AvatarURL` 使用 `sql.NullString`：`Valid=false` 写 SQL `NULL`，`Valid=true` 则保存 `String`，包括空字符串。它不是 PATCH，未提交字段由调用方提前处理。
 
-仓储不维护自定义错误层，直接返回 GORM 或驱动提供的原始错误。查询未命中可检查 `gorm.ErrRecordNotFound`，重复键按当前数据库配置检查驱动错误或 GORM 翻译结果；仓储不额外分类、包装或记录业务日志。
+仓储不维护自定义错误层，直接返回 GORM 或驱动提供的原始错误。查询未命中可检查 `gorm.ErrRecordNotFound`；重复键由 [mysql.IsDuplicateKey](internal/database/mysql/error.go) 统一识别，兼容驱动原始错误和 GORM 通用错误，Service 不直接比较错误编号。该判断不解释账户等业务含义，也不修改原错误；仓储不额外分类、包装或记录业务日志。
 
 `UpdateProfile` 返回 `(rowsAffected int64, err error)`。调用方先处理 `err`，再判断影响行数；`0, nil` 表示 SQL 执行正常但条件未匹配，可能是用户不存在、停用或版本过期，由外层决定业务含义。版本和启用条件仍在 SQL 中原子判断，不能仅依赖写入前的内存检查。
 
@@ -190,7 +190,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `internal/response` | 定义统一响应外层、通用错误枚举及固定 HTTP 状态映射、Gin 输出函数 |
-| `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、校验和处理，尾部保存共享实现 |
+| `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
 | `app/domains/*/controller/v1` | V1 请求处理；Controller 内维护业务码和错误映射 |

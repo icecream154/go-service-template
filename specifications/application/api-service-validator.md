@@ -46,7 +46,7 @@
 | 接口专属 | `app/domains/<domain>/validator/v<version>/<controller>/<use_case>_validator.go`，与该用例 Validator 放在一起 | 仅供本包使用时采用包含完整用例名的包内常量，例如 `maxQueryOrderPageConditionCount`；同一 HTTP 适配层确有合法跨包使用需求时可以按需导出 | 私有校验函数引用约束和格式常量，入口方法在绑定前引用默认值；Service 不反向引用这些接口专属常量 |
 | 业务用例输入契约 | `app/domains/<domain>/service/<object>_service.go` 的对应用例区域，与该用例的 Params 放在一起 | 需要 Validator 等其他包直接引用时导出，例如 `MinUserProfilePageNumber`、`MaxUserProfileBatchSize`；只在 Service 包内部使用时保持包内可见 | 跨包调用方通过 Service 包名引用导出常量；Service 在同包内引用所属声明，不重复定义 |
 
-1. **用例输入契约描述 Service 接受的参数及其共同约束。** 它由 Service 的 Params 及其配套校验相关常量组成。相关声明放在 Service 文件的对应用例区域，随后组织私有 Params 校验函数和用例处理方法，不再拆成独立的 Params 文件或校验文件。
+1. **用例输入契约描述 Service 接受的参数及其共同约束。** 它由 Service 的 Params 及其配套校验相关常量组成。相关声明放在 Service 文件的对应用例区域；需要用例专属 Result 时，紧接 Params 声明，再组织输入常量、私有 Params 校验函数和用例处理方法。不再拆成独立的 Params、Result 或校验文件。
 
 2. **校验相关常量覆盖上下限、默认值和固定格式等固定值。** 上下限和固定格式用于判断输入是否符合要求，默认值用于准备未提供的输入，本身不执行有效性判断。具体使用步骤见第 2.5 节。
 
@@ -155,6 +155,14 @@ Router 匹配接口
 ```
 
 绑定或请求字段校验失败时，Validator 输出参数错误并立即返回，不调用 Controller；规则错误或未知校验失败走内部错误出口。Service 失败时返回 `error`，由 Controller 在本文件维护的映射中选择通用码和业务码，消息直接取 `err.Error()`，已有字段明细原样传递。
+
+Controller 的输入映射遵守以下约定：
+
+1. **Controller 的业务入参只使用对应用例的 Request DTO。** HTTP 上下文可以作为独立参数传入；Validator 完成绑定和校验后传入 DTO，不提前构造 Service Params，也不把业务字段拆成多个参数。
+
+2. **Service Params 由 Controller 在方法内部构造。** Controller 根据 Service 的输入类型完成字段赋值和必要的类型转换；Service 接收自己的 Params，不直接接收 Request DTO。
+
+3. **已经由 Validator 保证成功的纯类型转换，Controller 可以忽略其错误返回值。** 例如，Validator 已确认某个未修改的 ID 文本能够按十进制解析为正 int64，Controller 构造 Params 时可以再次按相同语义解析并使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。该约定只覆盖已被前置校验保证成功的转换，不适用于未经校验的转换、不同解析规则或数据库等执行操作。
 
 ### 3.2 规则的复用关系
 
@@ -430,7 +438,7 @@ func RuneCountAtMost(value string, maximum int) error
 
 **Service 根据自己的业务输入契约检查参数，不依赖调用方已经完成 HTTP 校验。** 输入保障复用公共和领域规则，HTTP 文本的解析工作留在对应适配层。
 
-1. **Service 接收业务 Params，不接收 HTTP 对象。** Controller 将 Request DTO 映射为 Params，其他入口也按同一契约构造输入。在 Service 文件中，每个用例依次组织 Params 及输入常量、`validate<UseCase>Params` 和用例处理方法；本 Service 的错误声明放在文件顶部，多用例共用的私有逻辑放在文件尾部 `shared` 区域。需要取消或截止时间时，可以另行接收标准 `context.Context`，不将 Gin Context、HTTP 请求体或 Request DTO 传入业务逻辑。
+1. **Service 接收业务 Params，不接收 HTTP 对象。** Controller 将 Request DTO 映射为 Params，其他入口也按同一契约构造输入。在 Service 文件中，每个用例依次组织 Params、需要时紧接声明的 Result、输入常量、`validate<UseCase>Params` 和用例处理方法；本 Service 的错误声明放在文件顶部，多用例共用的私有逻辑放在文件尾部 `shared` 区域。需要取消或截止时间时，可以另行接收标准 `context.Context`，不将 Gin Context、HTTP 请求体或 Request DTO 传入业务逻辑。
 
 2. **业务入口继续保证参数取值满足用例约束。** 例如，已经是整数的内部标识仍需符合正数要求，批量数量和版本值仍需位于允许范围。布尔文本已经映射为 `bool` 时，不重新判断原文本是否为 `true`；整数也不转回字符串再检查格式。
 
@@ -456,9 +464,9 @@ func RuneCountAtMost(value string, maximum int) error
 
 **Service 必须根据受并发保护的写入结果判断业务是否成功。** 预检查可以提前发现问题，数据库约束和事务保障需要的写入一致性；预检查通过不能作为写入成功的依据。
 
-1. **并发创建依靠数据库唯一约束防止重复，数据库返回的错误由 Service 原样传递。** 预查询成功返回存在性结果时，Service 可以根据该结果提前发现已有数据；但这不能保证从查询结束到写入期间，没有其他请求创建相同数据。预查询本身返回非 `nil` 错误时，也必须直接返回该错误。
+1. **并发创建依靠数据库唯一约束防止重复，Service 负责解释明确的业务结果。** 预查询可以提前发现已有数据；但这不能保证从查询结束到写入期间，没有其他请求创建相同数据。查询明确未命中时，Service 按当前用例解释为“可继续创建”或“目标不存在”；查询发生连接或执行故障时，原样返回错误。
 
-   **两个请求都查到“不存在”，仍可能尝试创建同一个账户。** 这里的“不存在”指下层成功返回 `exists = false` 或数量为 0，没有返回错误。若下层用未命中错误表达不存在，Service 必须直接返回该错误。以成功取得存在性结果为例，请求 A、B 同时创建账户 `alice`：
+   **两个请求都查到“不存在”，仍可能尝试创建同一个账户。** Repository 可以用 `exists = false`、数量为 0，或明确的未命中错误表达不存在。Service 根据查询契约确认这一业务结果；不能把连接失败等技术故障当作不存在。请求 A、B 同时创建账户 `alice`：
 
    | 时序 | 请求 A | 请求 B |
    | --- | --- | --- |
@@ -469,7 +477,7 @@ func RuneCountAtMost(value string, maximum int) error
 
    账户字段有唯一约束时，数据库会拒绝 B 的重复写入；没有对应约束时，就可能产生两条同名账户记录。是否增加预查询由用例决定，实际写入仍须由数据库唯一约束保证唯一性。
 
-   **重复键错误的业务含义，取决于实际违反的唯一约束。** 同一张用户表可能同时存在以下约束，接口层选择错误码时，应依据原始错误中能够明确识别的约束信息判断：
+   **重复键错误的业务含义，取决于实际违反的唯一约束。** 同一张用户表可能同时存在以下约束，Service 应根据能够明确识别的约束或经过确认的业务结果解释含义，再由 Controller 根据收到的错误选择接口码：
 
    | 违反的约束 | 应如何解释 |
    | --- | --- |
@@ -477,15 +485,45 @@ func RuneCountAtMost(value string, maximum int) error
    | 手机号唯一约束 | 手机号已被使用 |
    | 系统生成的用户 ID 主键约束 | 可能是 ID 生成或数据写入异常，不能据此判断账户已存在 |
 
-   **Service 不把数据库冲突替换成本层错误。** 即使能够识别为账户或手机号唯一约束冲突，只要 Repository 已返回错误，Service 就直接返回同一个错误，不改成 `ErrAccountAlreadyExists` 等错误值。只有下层调用成功、本层根据返回数据独立判断账户已存在时，才可返回本层声明的错误。Controller 对原始冲突选择适合的响应错误码；错误缺少足够的约束信息时，不能只看到“重复键”就认定“用户已存在”。
+   **Service 只把已确认的业务冲突映射为本层命名错误。** 确认账户或手机号已被占用时，可以返回预先声明的 `ErrAccountAlreadyExists` 等错误，由 Controller 选择接口错误码。错误缺少足够的约束或业务信息时，不能只看到“重复键”就认定“用户已存在”；无法解释的原始错误继续返回。确认过程中若发生连接或查询执行故障，同样保留技术故障，不替换成业务冲突。
 
-2. **版本和状态条件需要在写入中受到保障。** 根据用例采用带条件更新、锁或其他明确的并发控制方式，避免检查与写入之间的竞态。写入返回错误时直接返回该错误；只有写入成功返回影响行数时，Service 才根据操作语义判断是否违反本层条件。零影响行数可能对应缺失、状态变化或版本冲突，不能一概映射为某个固定业务错误。
+   **数据库错误类别由数据库组件统一识别。** MySQL 重复键通过 `internal/database/mysql.IsDuplicateKey(err)` 判断，组件兼容 GORM 通用错误和 MySQL 驱动错误，并集中维护有说明的错误编号常量。Service 不自行比较驱动编号；该方法只识别重复键，不判断具体业务对象、不查询数据，也不包装或替换原始错误。
+
+2. **版本和状态条件需要在写入中受到保障。** 根据用例采用带条件更新、锁或其他明确的并发控制方式，避免检查与写入之间的竞态。写入发生技术故障时原样返回错误；取得影响行数等明确结果后，Service 根据操作语义判断业务是否成功。零影响行数可能对应缺失、状态变化或版本冲突，不能一概映射为某个固定业务错误。
 
 3. **需要共同提交的多步骤写入，由事务保证结果完整。** 提交前任一步失败应回滚，只有确认提交成功才返回业务成功。实体内存修改已经完成、单条 SQL 已执行或局部结果已经构造，都不等于事务已经提交；事务边界和提交结果由业务流程负责。
 
-4. **Repository 返回错误时，Service 不再生成另一个错误。** 查询未命中、唯一约束冲突、数据库连接失败等，只要下层通过非 `nil` 错误表达，Service 都直接 `return err`。记录日志可以补充操作上下文，但不能改变返回的错误值。仅在下层调用成功后，Service 才根据取得的数据或影响行数判断本层业务条件，并在条件不满足时返回本层声明的错误。
+4. **Service 区分业务结果与技术故障，不按 `err != nil` 一概处理。** 目标资料明确未命中时，返回本层声明的对象不存在错误；唯一约束冲突只有确认业务含义后才能映射。数据库连接、SQL 执行、发号等技术故障以及无法解释的错误，原样 `return err`。日志可以补充操作上下文，但不通过 `fmt.Errorf`、`errors.Join` 或统一失败错误包装、合并或替换技术故障。
 
 5. **数据库约束提供持久化保障，不替代前面的输入校验。** 字段长度、非空和唯一约束保护实际存储，但调用方仍需要清晰的输入问题说明。应用先执行适用的输入和领域规则，写入阶段继续处理数据库约束结果，不把原始数据库错误直接作为对外字段文案。
+
+### 7.4 Service 的输出契约
+
+**Service 按业务结果的含义选择返回类型。** 领域模型表达领域对象，用例专属 Result 表达该用例组织出的结果；HTTP Response DTO 由 Controller 另行构造。
+
+1. **结果就是一个领域模型时，直接返回该模型。** 例如查询、创建或修改一份资料后返回 `*models.Record`，不为统一后缀再包一层 `QueryRecordResult`。仅返回同一种领域模型的列表且没有其他结果字段时，也可以直接返回模型切片。
+
+2. **与用例紧密绑定的复合结果，在 Service 中声明 `<UseCase>Result`。** 例如分页结果包含记录列表和总数，批量查询结果包含已找到记录和缺失标识，均由对应用例的 Result 命名这些字段。Result 使用完整用例名，紧接同一 Service 文件内对应的 Params 声明；不放入 models、HTTP DTO 或额外的 Result 文件、目录。
+
+   ```go
+   type QueryRecordPageParams struct {
+       PageNumber int
+       PageSize   int
+   }
+
+   type QueryRecordPageResult struct {
+       Records    []*models.Record
+       TotalCount int64
+   }
+   ```
+
+   配套输入常量、`validateQueryRecordPageParams` 和用例处理方法依次放在上述声明之后。用例返回 `(*QueryRecordPageResult, error)`，不把属于同一结果的多个字段继续拆成平级返回值。
+
+3. **Result 可以组合领域模型，仍保持业务层表达。** 例如概览结果可以包含资料、会员及统计信息；字段选用领域模型或明确的业务数据类型，不依赖 Request DTO、Response DTO、Gin 或 `response`。Controller 从模型或 Result 中选择对外字段、转换传输格式，再构造用例专属 Response DTO；两者不因字段暂时相同而合并。
+
+4. **错误返回与成功结果分开表达。** 返回模型指针或 Result 指针的方法，成功时提供非 nil 结果并返回 `nil` 错误；失败时返回 `nil, err`，调用方先检查错误，不把失败路径中的局部数据当作可用结果。单个目标不存在时，按用例语义返回对象不存在错误，不用 `nil, nil` 表达。
+
+5. **空集合和缺失项按用例结果契约表达。** 查询成功但没有匹配记录时，返回非 nil 的空切片；分页 Result 仍存在，并保留实际总数。批量查询允许部分目标不存在时，已找到记录和缺失标识一起放在 Result 中，错误为 `nil`；数据库执行失败则返回错误，不把已取得的局部数据伪装成允许的部分结果。
 
 ## 8. 必填、可空与值合法性
 
@@ -519,14 +557,14 @@ func RuneCountAtMost(value string, maximum int) error
 | 公共检查 | `Violation`、`RuleError`、`IndexError`、`KeyError`，或解析后的值与错误 | 不生成 HTTP 字段明细或业务码 |
 | models | 原样返回的下层错误，或 `errors.New` 声明的本层独立错误值 | 不声明新 error 类型，不包装或替换下层错误，不决定对外业务码 |
 | Validator 私有函数 | `([]response.FieldError, error)`，分别表示输入问题与内部失败 | 不解释数据库状态或执行业务操作 |
-| Service | 原样返回的下层错误，或 `errors.New` 声明的本层独立错误值 | 不声明新 error 类型，不包装或替换下层错误，不构造 HTTP 错误结构 |
+| Service | `errors.New` 声明的本层独立错误或明确业务语义映射的错误，以及原样返回的输入错误、下层技术故障及未知错误 | 不声明新 error 类型，不包装或替换下层技术故障，不构造 HTTP 错误结构 |
 | Controller | 选择通用码、可选业务码，直接采用 `err.Error()` 和已有明细 | 不重新实现底层校验算法，不重新组织消息或字段明细 |
 
 校验错误通过 `errors.Is` 识别已有错误值或分类，通过 `errors.As` 读取下层已有错误类型，不比较 `Error()` 文本。Service 和 models 不为此新增 error 类型，也不包装已有错误。无需为每条字段规则新增对外业务错误码。
 
 错误声明与映射位置遵守[错误处理规范](api-error.md)：公共错误类型放在 `check`，models 的本层错误值与对应规则放在一起，Service 的本层错误值位于所属 Service 文件顶部；每个 Controller 在自身文件声明业务码并维护错误码映射，不另设领域 `errors` 或 `apierror` 包。
 
-**Service 和 models 的“错误常量”使用包级 `var` 配合 `errors.New` 声明。** Go 不支持以 `const` 声明 error；例如 `var ErrRecordNotEditable = errors.New("record is not editable")`，声明后不再重新赋值。该错误只表示本层独立条件失败，不能用来替换下层已经返回的错误。下层错误原样返回时，不使用 `fmt.Errorf` 的 `%w` 或 `%v`、`errors.Join`、`errors.New(err.Error())` 等方式再造错误。
+**Service 和 models 的“错误常量”使用包级 `var` 配合 `errors.New` 声明。** Go 不支持以 `const` 声明 error；例如 `var ErrRecordNotEditable = errors.New("record is not editable")`，声明后不再重新赋值。models 的错误只表示本层独立领域规则失败；Service 还可声明对象不存在等错误，表达对明确下层结果的业务解释。两层都不使用 `fmt.Errorf` 的 `%w` 或 `%v`、`errors.Join`、`errors.New(err.Error())` 再造错误，技术故障必须原样返回。
 
 Validator 知道正在检查哪个请求字段，直接把已知输入问题组织成实际参数名和可公开的英文原因，不要求先给错误增加字段包装。公共包不硬编码 `user_name`、`avatar_url` 等请求字段。
 
@@ -550,6 +588,6 @@ Validator 知道正在检查哪个请求字段，直接把已知输入问题组�
 
 3. **Service 返回已知错误时，Controller 按具体语义选择两个错误码。** 每个 Controller 在自己的文件内维护业务码声明和错误映射，消息直接使用收到的 `err.Error()`，已有明细原样传递；Service 仅返回 `error` 时不补造字段明细。HTTP 状态由通用错误码的固定映射决定；例如，资源不存在使用 `NOT_FOUND` 和 HTTP 404，状态冲突使用 `CONFLICT` 和 HTTP 409，不能把所有业务失败都当作参数错误。
 
-4. **Service 遇到下层执行失败时原样返回，由 Controller 选择错误类别。** Service 可以记录操作上下文，但必须直接返回收到的数据库或外部依赖错误，不包装或替换为自己的错误值。Controller 对未预期失败选择 `INTERNAL_ERROR`，由响应组件映射为 HTTP 500，不附业务码、不补造字段明细，消息仍为收到的 `err.Error()`；Controller 和公共响应组件不因 HTTP 500 再次强制替换消息。输出后立即返回。
+4. **Service 遇到下层技术故障时原样返回，由 Controller 选择错误类别。** Service 可以记录操作上下文，但数据库连接失败、SQL 执行故障、发号失败等必须直接返回收到的原错误，不包装或替换为自己的统一失败错误。Controller 对未预期失败选择 `INTERNAL_ERROR`，由响应组件映射为 HTTP 500，不附业务码、不补造字段明细，消息仍为收到的 `err.Error()`，包括第三方原始文案；Controller 和公共响应组件不因 HTTP 500 再次强制替换消息。输出后立即返回。
 
 5. **未处理的 `panic` 由统一异常恢复中间件兜底。** 中间件记录异常；尚未写出响应时，返回标准内部错误；响应已经写出时，中止后续处理，不再追加第二份错误 JSON。正常的绑定失败、字段校验失败和业务失败通过返回值处理，不使用 `panic` 传递。

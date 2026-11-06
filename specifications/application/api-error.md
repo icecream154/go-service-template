@@ -14,7 +14,7 @@
    | `Violation`、`RuleError`、`IndexError`、`KeyError` | `internal/check/error.go` | 各公共检查方法返回，调用方识别其含义 |
    | models 本层的命名错误值 | 所属 `models/<entity>_validation.go`，与规则放在一起 | 只用 `errors.New` 声明本层独立判断产生的错误；下层错误原样返回 |
    | 接口专属校验问题 | 对应的 `validator/v<version>/<controller>/<use_case>_validator.go` | Validator 直接构造 `FieldError`，无须额外声明一套 Validator 错误类型 |
-   | Service 本层的命名错误值 | 对应的 `service/<object>_service.go` 顶部 | 只用 `errors.New` 声明本层独立判断产生的错误；下层错误原样返回 |
+   | Service 本层的命名错误值 | 对应的 `service/<object>_service.go` 顶部 | 只用 `errors.New` 声明本层独立失败及明确业务语义映射的错误；下层技术故障原样返回 |
    | 接收到的错误与两个错误码的对应关系 | 对应的 Controller 文件内部 | Controller 的私有映射函数集中处理，包括 Service 返回的错误 |
 
 3. **正常失败通过返回值传递，不使用 `panic`。** 文中的“返回错误”指返回 Go `error` 或已经构造好的字段明细。成功返回 `nil`；`panic` 只由框架异常恢复流程兜底，不作为参数错误和业务失败的传递方式。
@@ -30,9 +30,9 @@
    var ErrRecordNotEditable = errors.New("record is not editable")
    ```
 
-3. **本层错误只表达本层独立判断出的失败，不依赖下层错误。** 例如，下层成功返回资料且没有错误，Service 根据资料状态判断当前不允许编辑，可以返回 `ErrRecordNotEditable`。models 自己检查实体字段关系或状态时，也可以返回本层声明的错误。不能根据下层 `err` 的类型、内容或分类，换成另一个本层错误。
+3. **本层命名错误表达独立判断的失败或 Service 对明确业务结果的解释。** models 只为自己判断出的领域规则失败声明错误。Service 除了根据输入、数据或状态判断失败，也负责解释下层结果的业务含义；例如，查询目标资料得到明确的未命中错误时，返回预先声明的 `ErrRecordNotFound`。下层没有返回错误但给出异常值时，例如发号成功却得到非正 ID，Service 也可以为自己的检查声明错误。错误声明本身使用独立的 `errors.New(...)`，不保存下层错误、拼接下层文案或定义包装类型。
 
-4. **下层只要返回非 `nil` 错误，Service 和 models 就原样返回该错误值。** 该约束覆盖公共检查、models、Repository、数据库驱动、发号器等下层调用，不因错误属于参数问题、业务失败或执行故障而例外。
+4. **已有输入错误和技术故障原样返回，Service 只解释能够确定含义的业务结果。** 公共检查或 models 已清楚表达的输入问题，直接返回原错误。数据库连接失败、SQL 执行故障、发号失败等技术错误，也直接返回同一个 `err`。Repository 的明确未命中等结果，由 Service 结合当前操作解释业务含义；无法确定含义的错误仍原样返回。models 不承担 Repository 结果解释或持久化错误分类。
 
    ```go
    if err := models.ValidateRecordName(params.Name); err != nil {
@@ -40,12 +40,15 @@
    }
 
    record, err := repository.GetRecord(params.RecordID)
+   if errors.Is(err, gorm.ErrRecordNotFound) {
+       return nil, ErrRecordNotFound
+   }
    if err != nil {
        return nil, err
    }
    ```
 
-5. **原样返回不允许增加包装、复制消息或替换错误。** 禁止使用 `fmt.Errorf` 的 `%w` 或 `%v` 包装下层错误，禁止 `errors.Join`、`errors.New(err.Error())`，也禁止将下层错误替换成本层已声明的错误。需要记录操作上下文时可以写入日志，随后仍返回原来的 `err`；不能以补充字段名、转换业务含义或准备响应文案为由改变错误。
+5. **技术故障不增加包装、复制消息或替换错误。** Service 和 models 不使用 `fmt.Errorf` 的 `%w` 或 `%v`、`errors.Join`、`errors.New(err.Error())` 再造错误，也不将数据库或发号故障换成 `ErrRecordQueryFailed` 等统一失败错误。需要记录操作上下文时写入日志，随后返回原来的 `err`。Service 将明确未命中解释为对象不存在，属于业务语义映射；这不允许把技术故障伪装成业务条件失败。
 
 6. **公共检查和下层组件已有的错误类型保持原有归属。** `check` 的四种错误类型由公共包维护，Service 和 models 接收后直接传递；本节不要求修改这些公共类型。Controller、Validator 识别接收到的错误，再完成各自负责的响应处理。
 
@@ -113,11 +116,13 @@ func (err FieldError) Error() string {
 
 ### 2.3 错误文案的责任
 
-1. **本层自行声明的错误在声明处确定文案。** Service 和 models 使用 `errors.New` 提供非空白英文说明，错误类别由错误值或已有类型决定，不能依赖文案比较。因为接口层直接使用 `Error()`，文案变更也会影响实际接口输出。
+1. **项目自行声明的错误在声明处提供可公开的非空白英文文案。** Service 和 models 使用 `errors.New` 声明符合第 1.1 节职责的本层错误值，错误类别由错误值或已有类型决定，不能依赖文案比较。因为接口层直接使用 `Error()`，文案变更也会影响实际接口输出。
 
-2. **下层错误的文案随原错误传递，Service 和 models 不重新准备。** 例如，数据库查询返回 `err` 时，Service 可以记录操作上下文，但仍返回同一个 `err`，不能改成 `ErrRecordQueryFailed` 或其他固定说明。Controller 接收这个错误，选择错误码并直接使用其 `Error()`；不在中间层设置“记录后替换”的例外。
+2. **Service 完成业务语义判断后，Controller 直接使用收到的错误文案。** 明确查询未命中时，Service 可以返回 `ErrRecordNotFound`，Controller 使用该业务错误的 `Error()`。数据库连接或查询执行发生技术故障时，Service 可以记录操作上下文，但仍返回原来的 `err`，不能改成 `ErrRecordQueryFailed`。Controller 选择错误码后直接使用收到的 `Error()`，不再组织另一套说明。
 
-3. **Validator 可以在构造字段明细时准备接口需要的说明。** `Reason` 可以直接使用底层 `err.Error()`，也可以在该 Validator 中组织更明确的字段说明。一旦构造成 `FieldError` 并返回，后续输出环节不再加工其内容。
+3. **原样传递的第三方错误保留原始文案，不因输出需要再加工。** 数据库驱动、ORM 等组件的技术故障随原错误值向上传递，Controller 直接使用收到的 `err.Error()`。项目明确接受这些错误的原始文案，不翻译、不脱敏、不替换为统一说明。“可公开的英文文案”要求适用于项目自己声明的错误，不要求各层改写第三方故障文案；第 1.1 节规定的业务语义映射仍由 Service 完成。
+
+4. **Validator 可以在构造字段明细时准备接口需要的说明。** `Reason` 可以直接使用底层 `err.Error()`，也可以在该 Validator 中组织更明确的字段说明。一旦构造成 `FieldError` 并返回，后续输出环节不再加工其内容。
 
 ## 3. 公共检查的错误
 
@@ -228,21 +233,21 @@ func (err FieldError) Error() string {
    var ErrRecordVersionConflict = errors.New("record version conflict")
    ```
 
-   上述错误均来自本层对成功取得的数据所做的判断：资料已停用、已有资料数量达到业务限制、提交版本与实际版本不一致。下层若已返回错误，就直接返回下层错误，不改成这些错误值。
+   上述错误来自本层对成功取得的数据所做的判断：资料已停用、已有资料数量达到业务限制、提交版本与实际版本不一致。Service 也可以声明用于解释明确查询结果的错误，例如目标资料不存在；技术故障不能转换成这些业务错误。
 
 2. **所有自有错误都使用 `errors.New` 声明，不定义错误类型。** 名称使用 `Err<对象><原因>`。Controller 需要识别的声明使用导出名称；名称包含所属业务对象，避免同一个 Service 包中不同文件重名。声明方式及禁止事项遵守第 1.1 节。
 
-3. **顶部只收纳本 Service 独立产生的错误值。** 不重新声明 `check` 的四种类型，不复制 models 或其他下层已有的错误，也不为下层故障增加一个同义的 Service 错误。下层返回的错误一律原样返回。
+3. **顶部只收纳本 Service 独立判断的错误和明确业务语义映射的错误值。** 包括状态不允许操作、下层无错误却返回异常值，以及结合用例解释出的对象不存在。不重新声明 `check` 的四种类型，不复制 models 已表达清楚的输入错误，也不为下层技术故障增加一个同义的 Service 错误。
 
-4. **错误声明说明产生条件和文案含义。** 各用例方法的注释说明可能返回的 Service 错误，以及调用链可能返回的下层错误；下层错误必须原样传递。Controller 引用相应声明进行映射，不比较 `Error()` 字符串。
+4. **错误声明说明产生条件和文案含义。** 各用例方法的注释说明哪些下层结果会解释成 Service 业务错误，以及哪些输入错误和技术故障会原样传递。Controller 引用相应声明进行映射，不比较 `Error()` 字符串。
 
 ### 5.2 按用例组织文件
 
-1. **每个用例在同一个区域依次声明 Params、参数校验方法和处理方法。** 用例输入相关常量与 Params 放在一起；参数校验方法使用 `validate<UseCase>Params` 命名，保持包内可见。用例处理方法先调用该校验方法，通过后再执行依赖业务状态的操作。
+1. **每个用例在同一个区域依次声明 Params、可选的 Result、输入常量、参数校验方法和处理方法。** 结果就是领域模型时直接返回该模型；与用例绑定的复合结果使用 `<UseCase>Result`，紧接对应 Params 声明，不另建文件或目录。结果类型及空结果约定见[Service 的输出契约](api-service-validator.md#74-service-的输出契约)。参数校验方法使用 `validate<UseCase>Params` 命名，保持包内可见；用例处理方法先调用该校验方法，再执行依赖业务状态的操作。
 
 2. **仅供一个用例使用的辅助逻辑留在该用例区域。** 多个用例复用的实现统一放在文件尾部的 `shared` 区域，原则上使用私有方法。文件顶部共享错误和文件尾部共享实现分别组织，不把两者混在一起。
 
-3. **Service 文件采用以下顺序。** 该顺序使阅读者先看到错误契约，再按用例读完输入、检查和执行流程，最后查看公共实现。
+3. **Service 文件采用以下顺序。** 该顺序使阅读者先看到错误契约，再按用例读完输入、输出、检查和执行流程，最后查看公共实现。
 
    ```text
    package、imports
@@ -259,13 +264,17 @@ func (err FieldError) Error() string {
    Service 类型与构造函数
 
    use case: CreateRecord
-     CreateRecordParams 及配套输入常量
+     CreateRecordParams
+     CreateRecordResult（需要用例专属结果时声明）
+     配套输入常量
      validateCreateRecordParams
      (*RecordService).CreateRecord
      本用例专属的私有辅助方法
 
    use case: UpdateRecord
-     UpdateRecordParams 及配套输入常量
+     UpdateRecordParams
+     UpdateRecordResult（需要用例专属结果时声明）
+     配套输入常量
      validateUpdateRecordParams
      (*RecordService).UpdateRecord
      本用例专属的私有辅助方法
@@ -278,7 +287,7 @@ func (err FieldError) Error() string {
 
 1. **Service 独立保障自己的输入和业务条件。** Params 校验可以复用 `check` 和 models；依赖数据库状态、操作权限或并发条件的判断由用例组织。Validator 已校验过 HTTP 输入，不代表其他入口也已校验。
 
-2. **Service 区分下层返回错误和本层业务判断失败。** 下层查询返回未命中错误、唯一约束错误或连接错误时，均直接返回原始 `err`；不转换成 `ErrRecordNotFound`、`ErrRecordAlreadyExists` 或执行失败错误。在没有下层错误的前提下，本层独立检查输入、数据或状态发现不满足要求时，才返回本层声明的命名错误。
+2. **Service 区分明确业务结果和技术故障。** 查询目标资料明确未命中时，返回本层的 `ErrRecordNotFound`；确认账户等业务对象已经存在时，可以返回对应的已存在错误。数据库连接失败、SQL 执行故障、发号失败或无法确定含义的下层错误，原样返回。唯一约束冲突必须确认对应的业务条件，不能只凭重复键类别就认定某个业务对象已存在。
 
 3. **Service 不决定接口错误码，也不构造 HTTP 字段明细。** Service 不依赖 `response`、Controller、Validator 或 Request DTO。HTTP `Code`、`BusinessCode` 由 Controller 选择；没有既有响应明细时 `Details` 为空，Controller 不在收到 Service 错误后重新执行字段校验来补齐它。
 
@@ -300,7 +309,7 @@ func (err FieldError) Error() string {
 
 2. **同一 Controller 的全部错误分类集中在本文件的私有映射函数中。** 映射覆盖该 Controller 接收的 Service 错误、需要识别的领域错误及公共检查错误。Controller 的各个处理方法复用该函数，不分别编写同义映射，也不另建领域 `apierror` 包保存本 Controller 的业务码和映射。
 
-3. **下层错误由 Controller 直接识别，不要求 Service 预先转换。** 例如，Controller 可以识别仓储或驱动提供的明确未命中错误，选择 `NOT_FOUND`；具体业务码取决于当前用例能否确定其业务含义。唯一约束错误必须确认具体约束，不能把所有重复键都映射为同一个对象已存在。无法确定含义时按内部错误处理，不比较错误消息来猜测原因。
+3. **业务含义由 Service 解释，Controller 将收到的错误映射为接口码。** 例如，Service 将目标资料未命中解释为 `ErrRecordNotFound`，Controller 映射为 `NOT_FOUND` 和对应业务码。公共输入错误、models 规则错误和技术故障按原有错误值或类型识别；无法确定含义时按内部错误处理，不比较错误消息猜测原因，也不把所有重复键映射为同一个对象已存在。
 
 ### 6.2 映射与响应装配
 
@@ -355,7 +364,7 @@ func (err FieldError) Error() string {
      → response 输出 HTTP 400
    ```
 
-2. **业务用例失败时，由 Controller 选择错误码并输出。** Service 对所有下层错误均原样返回；本层独立判断失败时返回自己声明的命名错误。Controller 识别原因，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
+2. **业务用例失败时，由 Controller 选择错误码并输出。** Service 对本层独立判断的失败及明确的业务语义映射返回自己的命名错误，原样传递已有输入错误、下层技术故障及无法确定含义的错误。Controller 识别收到的错误，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
 
    ```text
    Service 校验 Params 或执行用例

@@ -45,8 +45,9 @@ type ErrorInfo struct {
 	// 同一业务码固定归属一个 Code，不要求与内部领域 error 一一对应。
 	BusinessCode BusinessErrorCode `json:"business_code,omitempty"`
 
-	// Message 必填，使用非空白英文说明失败原因，供人阅读，不作为程序判断错误的依据。
-	// 接口层直接采用接收到的 err.Error()，包括内部错误；错误产生处负责提供可公开文案。
+	// Message 必填，直接采用接收到的 err.Error()，供人阅读，不作为程序判断错误的依据。
+	// 项目自行声明的错误使用非空白、可公开的英文说明；第三方错误保留原始文案。
+	// 包括内部错误在内，接口层不翻译、包装或替换已经收到的错误消息。
 	Message string `json:"message"`
 
 	// Details 可选，提供请求参数校验的字段明细，包括参数名和违反的约束。

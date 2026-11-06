@@ -3,7 +3,6 @@ package service
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"math"
 
@@ -13,11 +12,11 @@ import (
 	"go-service-template/internal/check/collection"
 	"go-service-template/internal/check/relation"
 	"go-service-template/internal/check/scalar"
+	dbmysql "go-service-template/internal/database/mysql"
 	"go-service-template/internal/database/sqlvalue"
 	appruntime "go-service-template/internal/runtime"
 	"go-service-template/internal/snowflake"
 
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -26,19 +25,12 @@ import (
 // ErrUserProfileNotFound 表示查询或更新的目标用户资料不存在。
 var ErrUserProfileNotFound = errors.New("user profile not found")
 
-// errors: QueryUserProfileByUserID
-
-// ErrUserProfileQueryFailed 表示资料查询执行失败，原始原因在 Service 中记录。
-var ErrUserProfileQueryFailed = errors.New("failed to query user profile")
-
 // errors: CreateUser
 
 var (
 	// ErrAccountAlreadyExists 表示同一来源的外部账户已经关联了用户。
 	ErrAccountAlreadyExists = errors.New("user account already exists")
-	// ErrUserCreateFailed 表示发号或创建资料失败，原始原因在 Service 中记录。
-	ErrUserCreateFailed = errors.New("failed to create user")
-	// errInvalidGeneratedUserID 表示发号器产生了不合法的内部 ID，仅用于内部故障原因。
+	// errInvalidGeneratedUserID 表示发号器未返回错误，但产生了不合法的内部 ID。
 	errInvalidGeneratedUserID = errors.New("generated user ID must be positive")
 )
 
@@ -51,21 +43,9 @@ var (
 	ErrUserProfileVersionConflict = errors.New("user profile version conflict")
 	// ErrUserProfilePermissionDenied 表示发起方不允许修改目标用户的资料。
 	ErrUserProfilePermissionDenied = errors.New("user profile operation is not permitted")
-	// ErrUserProfileUpdateFailed 表示更新事务执行失败，原始原因在 Service 中记录。
-	ErrUserProfileUpdateFailed = errors.New("failed to update user profile")
 )
 
-// errors: BatchQueryUserProfiles
-
-// ErrUserProfileBatchQueryFailed 表示批量查询执行失败，原始原因在 Service 中记录。
-var ErrUserProfileBatchQueryFailed = errors.New("failed to query user profiles")
-
-// errors: QueryUserProfilePage
-
-// ErrUserProfilePageQueryFailed 表示分页查询执行失败，原始原因在 Service 中记录。
-var ErrUserProfilePageQueryFailed = errors.New("failed to query user profile page")
-
-// UserProfileService 提供用户资料操作，使用领域模型表达查询结果。
+// UserProfileService 提供用户资料操作，返回领域模型或用例专属 Result。
 // 结构体不保存仓储或本次查询的状态。
 type UserProfileService struct{}
 
@@ -85,14 +65,14 @@ type QueryUserProfileByUserIDParams struct {
 // validateQueryUserProfileByUserIDParams 检查用户 ID，保留公共检查错误的分类。
 func validateQueryUserProfileByUserIDParams(params QueryUserProfileByUserIDParams) error {
 	if err := scalar.PositiveInt64(params.UserID); err != nil {
-		return fmt.Errorf("user ID: %w", err)
+		return err
 	}
 	return nil
 }
 
 // QueryUserProfileByUserID 按内部用户 ID 查询完整资料，不默认过滤停用用户。
 // 输入非法时返回公共检查错误；未命中返回 ErrUserProfileNotFound；
-// 其他查询故障记录原始原因并返回 ErrUserProfileQueryFailed。
+// 其他查询故障记录操作上下文后原样返回，不替换为通用查询失败错误。
 func (s *UserProfileService) QueryUserProfileByUserID(params QueryUserProfileByUserIDParams) (*models.UserProfile, error) {
 	if err := validateQueryUserProfileByUserIDParams(params); err != nil {
 		return nil, err
@@ -105,7 +85,7 @@ func (s *UserProfileService) QueryUserProfileByUserID(params QueryUserProfileByU
 			return nil, ErrUserProfileNotFound
 		}
 		log.Printf("Query user profile failed: error=%v", err)
-		return nil, ErrUserProfileQueryFailed
+		return nil, err
 	}
 	return profileModel(profile), nil
 }
@@ -129,17 +109,17 @@ type CreateUserParams struct {
 // 未提供头像和显式空字符串均允许，保留原始值，不补默认值或修改 Params。
 func validateCreateUserParams(params CreateUserParams) error {
 	if err := models.ValidateAccountSource(params.AccountSource); err != nil {
-		return fmt.Errorf("account source: %w", err)
+		return err
 	}
 	if err := models.ValidateExternalAccountID(params.ExternalAccountID); err != nil {
-		return fmt.Errorf("external account ID: %w", err)
+		return err
 	}
 	if err := models.ValidateUserName(params.UserName); err != nil {
-		return fmt.Errorf("user name: %w", err)
+		return err
 	}
 	if params.AvatarURL != nil && *params.AvatarURL != "" {
 		if err := models.ValidateAvatarURL(*params.AvatarURL); err != nil {
-			return fmt.Errorf("avatar URL: %w", err)
+			return err
 		}
 	}
 	return nil
@@ -147,7 +127,7 @@ func validateCreateUserParams(params CreateUserParams) error {
 
 // CreateUser 按首次注册语义创建用户，初始启用、版本为 0。
 // 输入非法时返回领域字段规则错误；重复账户返回 ErrAccountAlreadyExists；
-// 发号或持久化故障记录原始原因并返回 ErrUserCreateFailed。本用例不核验外部身份凭证。
+// 发号或持久化故障记录操作上下文后原样返回。本用例不核验外部身份凭证。
 func (s *UserProfileService) CreateUser(params CreateUserParams) (*models.UserProfile, error) {
 	if err := validateCreateUserParams(params); err != nil {
 		return nil, err
@@ -158,17 +138,17 @@ func (s *UserProfileService) CreateUser(params CreateUserParams) (*models.UserPr
 			return nil, err
 		}
 		log.Printf("Create user failed: error=%v", err)
-		return nil, ErrUserCreateFailed
+		return nil, err
 	}
 	return profile, nil
 }
 
 // createUser 按次接收仓储和发号函数，不将依赖或单次注册状态保存在 Service 上。
-// 本方法的技术错误交给公开用例入口转换为可公开的执行故障。
+// 确认账户已存在时返回本层业务错误；技术故障保持原始错误值。
 func createUser(params CreateUserParams, profiles *repository.UserProfileRepository, nextID func() (int64, error)) (*models.UserProfile, error) {
 	id, err := nextID()
 	if err != nil {
-		return nil, fmt.Errorf("generate user ID: %w", err)
+		return nil, err
 	}
 	if id <= 0 {
 		return nil, errInvalidGeneratedUserID
@@ -178,13 +158,14 @@ func createUser(params CreateUserParams, profiles *repository.UserProfileReposit
 		UserName: params.UserName, AvatarURL: sqlvalue.ToNullString(params.AvatarURL), IsEnabled: true, Version: 0,
 	}
 	if err := profiles.CreateProfile(profile); err != nil {
-		var driverError *mysqldriver.MySQLError
-		if errors.Is(err, gorm.ErrDuplicatedKey) || (errors.As(err, &driverError) && driverError.Number == 1062) {
-			// 唯一键冲突也可能来自主键；按注册账户复查，避免把发号冲突误报为账号已存在。
+		if dbmysql.IsDuplicateKey(err) {
+			// 重复键本身不能确定业务原因；复查只确认请求账户是否已存在，不声称识别了冲突索引。
 			if _, accountErr := profiles.GetProfileByAccount(params.AccountSource, params.ExternalAccountID); accountErr == nil {
 				return nil, ErrAccountAlreadyExists
 			} else if !errors.Is(accountErr, gorm.ErrRecordNotFound) {
-				return nil, errors.Join(err, fmt.Errorf("check account after duplicate key: %w", accountErr))
+				// 复查执行失败时保留该技术错误，两次操作的原因只在日志中关联。
+				log.Printf("Check account after duplicate key failed: create_error=%v account_error=%v", err, accountErr)
+				return nil, accountErr
 			}
 		}
 		return nil, err
@@ -219,29 +200,29 @@ const (
 // 本用例完整替换昵称与头像，头像必须提供且不能清空。
 func validateUpdateUserProfileParams(params UpdateUserProfileParams) error {
 	if err := scalar.PositiveInt64(params.OperatorUserID); err != nil {
-		return fmt.Errorf("operator user ID: %w", err)
+		return err
 	}
 	if err := scalar.PositiveInt64(params.UserID); err != nil {
-		return fmt.Errorf("user ID: %w", err)
+		return err
 	}
 	if err := scalar.Int64InRange(params.ExpectedVersion, MinUserProfileExpectedVersion, MaxUserProfileExpectedVersion); err != nil {
-		return fmt.Errorf("expected version: %w", err)
+		return err
 	}
 	if err := models.ValidateUserName(params.UserName); err != nil {
-		return fmt.Errorf("user name: %w", err)
+		return err
 	}
 	if err := relation.NotNil(params.AvatarURL); err != nil {
-		return fmt.Errorf("avatar URL: %w", err)
+		return err
 	}
 	if err := models.ValidateAvatarURL(*params.AvatarURL); err != nil {
-		return fmt.Errorf("avatar URL: %w", err)
+		return err
 	}
 	return nil
 }
 
 // UpdateUserProfile 完整替换本人的昵称、头像，成功后递增版本。
 // 输入非法时返回公共检查或领域字段规则错误；权限、缺失、停用、版本冲突分别返回对应业务错误。
-// 事务执行故障记录原始原因并返回 ErrUserProfileUpdateFailed；事务内使用行锁保障状态检查和更新。
+// 事务执行故障记录操作上下文后原样返回；事务内使用行锁保障状态检查和更新。
 func (s *UserProfileService) UpdateUserProfile(params UpdateUserProfileParams) (*models.UserProfile, error) {
 	if err := validateUpdateUserProfileParams(params); err != nil {
 		return nil, err
@@ -256,7 +237,7 @@ func (s *UserProfileService) UpdateUserProfile(params UpdateUserProfileParams) (
 			return nil, err
 		}
 		log.Printf("Update user profile failed: error=%v", err)
-		return nil, ErrUserProfileUpdateFailed
+		return nil, err
 	}
 	return profile, nil
 }
@@ -309,6 +290,15 @@ type BatchQueryUserProfilesParams struct {
 	UserIDs []int64
 }
 
+// BatchQueryUserProfilesResult 组合本次批量查询找到的资料和未找到的用户 ID。
+// 部分或全部 ID 未找到仍是成功结果；执行失败时不返回此结构。
+type BatchQueryUserProfilesResult struct {
+	// UserProfiles 按输入中首次出现的顺序保存已找到的资料，无匹配时为空切片。
+	UserProfiles []*models.UserProfile
+	// MissingUserIDs 按输入中首次出现的顺序保存未找到的 ID，无缺失时为空切片。
+	MissingUserIDs []int64
+}
+
 const (
 	// MinUserProfileBatchSize 表示单次批量查询提交的 ID 数量下限，包含重复项，允许等于该值。
 	MinUserProfileBatchSize = 1
@@ -320,31 +310,31 @@ const (
 // 集合检查不重排、不去重，也不把整数转换回 HTTP 文本重新解析。
 func validateBatchQueryUserProfilesParams(params BatchQueryUserProfilesParams) error {
 	if err := collection.SliceLengthInRange(params.UserIDs, MinUserProfileBatchSize, MaxUserProfileBatchSize); err != nil {
-		return fmt.Errorf("user IDs: %w", err)
+		return err
 	}
 	if err := collection.Each(params.UserIDs, scalar.PositiveInt64); err != nil {
-		return fmt.Errorf("user IDs: %w", err)
+		return err
 	}
 	return nil
 }
 
 // BatchQueryUserProfiles 按输入顺序返回资料与未找到的 ID，重复 ID 只处理首次出现。
-// 输入非法时返回公共检查错误，查询故障记录原始原因并返回 ErrUserProfileBatchQueryFailed。
+// 输入非法时原样返回公共检查错误，查询故障记录操作上下文后原样返回。
 // 部分或全部缺失仍属于正常查询结果，空集合始终返回非 nil 切片。
-func (s *UserProfileService) BatchQueryUserProfiles(params BatchQueryUserProfilesParams) ([]*models.UserProfile, []int64, error) {
+func (s *UserProfileService) BatchQueryUserProfiles(params BatchQueryUserProfilesParams) (*BatchQueryUserProfilesResult, error) {
 	if err := validateBatchQueryUserProfilesParams(params); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	profiles, missing, err := batchQueryUserProfiles(params.UserIDs, appruntime.Current().Repositories.UserProfile)
+	result, err := batchQueryUserProfiles(params.UserIDs, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
 		log.Printf("Batch query user profiles failed: error=%v", err)
-		return nil, nil, ErrUserProfileBatchQueryFailed
+		return nil, err
 	}
-	return profiles, missing, nil
+	return result, nil
 }
 
 // batchQueryUserProfiles 在查询前去重，并按首次出现的顺序组织找到和缺失的 ID。
-func batchQueryUserProfiles(userIDs []int64, profiles *repository.UserProfileRepository) ([]*models.UserProfile, []int64, error) {
+func batchQueryUserProfiles(userIDs []int64, profiles *repository.UserProfileRepository) (*BatchQueryUserProfilesResult, error) {
 	ids := make([]int64, 0, len(userIDs))
 	seen := make(map[int64]struct{}, len(userIDs))
 	for _, id := range userIDs {
@@ -355,22 +345,24 @@ func batchQueryUserProfiles(userIDs []int64, profiles *repository.UserProfileRep
 	}
 	rows, err := profiles.GetProfilesByIDs(ids)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	byID := make(map[int64]*models.UserProfile, len(rows))
 	for i := range rows {
 		byID[rows[i].ID] = profileModel(&rows[i])
 	}
-	result := make([]*models.UserProfile, 0, len(rows))
-	missing := make([]int64, 0)
+	result := &BatchQueryUserProfilesResult{
+		UserProfiles:   make([]*models.UserProfile, 0, len(rows)),
+		MissingUserIDs: make([]int64, 0),
+	}
 	for _, id := range ids {
 		if profile, exists := byID[id]; exists {
-			result = append(result, profile)
+			result.UserProfiles = append(result.UserProfiles, profile)
 		} else {
-			missing = append(missing, id)
+			result.MissingUserIDs = append(result.MissingUserIDs, id)
 		}
 	}
-	return result, missing, nil
+	return result, nil
 }
 
 // use case: QueryUserProfilePage
@@ -385,6 +377,15 @@ type QueryUserProfilePageParams struct {
 	UserName string
 	// IsEnabled 为 nil 时同时查询启用、停用用户。
 	IsEnabled *bool
+}
+
+// QueryUserProfilePageResult 组合当前页的资料和全部匹配记录的数量。
+// 当前页无记录时仍返回成功结果；总数与当前页不承诺来自同一个数据库快照。
+type QueryUserProfilePageResult struct {
+	// UserProfiles 保存按用户 ID 降序排列的当前页资料，无匹配时为空切片。
+	UserProfiles []*models.UserProfile
+	// TotalCount 是符合筛选条件的总记录数，不是当前页的记录数。
+	TotalCount int64
 }
 
 const (
@@ -404,48 +405,51 @@ const (
 // 默认值由调用入口准备，显式零值不在 Service 内自动改写。
 func validateQueryUserProfilePageParams(params QueryUserProfilePageParams) error {
 	if err := scalar.IntInRange(params.PageSize, MinUserProfilePageSize, MaxUserProfilePageSize); err != nil {
-		return fmt.Errorf("page size: %w", err)
+		return err
 	}
 	if err := scalar.IntAtLeast(params.PageNumber, MinUserProfilePageNumber); err != nil {
-		return fmt.Errorf("page number: %w", err)
+		return err
 	}
 	if err := scalar.IntAtMost(params.PageNumber-1, math.MaxInt/params.PageSize); err != nil {
-		return fmt.Errorf("page offset: %w", err)
+		return err
 	}
 	if params.UserName != "" {
 		if err := models.ValidateUserName(params.UserName); err != nil {
-			return fmt.Errorf("user name: %w", err)
+			return err
 		}
 	}
 	return nil
 }
 
 // QueryUserProfilePage 查询精确昵称、启用状态筛选下的资料页和总数。
-// 输入非法时返回公共检查或领域字段规则错误，查询故障记录原始原因并返回 ErrUserProfilePageQueryFailed。
+// 输入非法时原样返回公共检查或领域字段规则错误，查询故障记录操作上下文后原样返回。
 // 资料固定按 ID 降序排列，页码超出结果范围时返回空页及实际总数。
-func (s *UserProfileService) QueryUserProfilePage(params QueryUserProfilePageParams) ([]*models.UserProfile, int64, error) {
+func (s *UserProfileService) QueryUserProfilePage(params QueryUserProfilePageParams) (*QueryUserProfilePageResult, error) {
 	if err := validateQueryUserProfilePageParams(params); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	profiles, total, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
+	result, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
 		log.Printf("Query user profile page failed: error=%v", err)
-		return nil, 0, ErrUserProfilePageQueryFailed
+		return nil, err
 	}
-	return profiles, total, nil
+	return result, nil
 }
 
 // queryUserProfilePage 读取总数及当前页，保留仓储的排序和查询语义。
-func queryUserProfilePage(params QueryUserProfilePageParams, profiles *repository.UserProfileRepository) ([]*models.UserProfile, int64, error) {
+func queryUserProfilePage(params QueryUserProfilePageParams, profiles *repository.UserProfileRepository) (*QueryUserProfilePageResult, error) {
 	rows, total, err := profiles.QueryProfilePage(params.UserName, params.IsEnabled, params.PageNumber, params.PageSize)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	result := make([]*models.UserProfile, 0, len(rows))
+	result := &QueryUserProfilePageResult{
+		UserProfiles: make([]*models.UserProfile, 0, len(rows)),
+		TotalCount:   total,
+	}
 	for i := range rows {
-		result = append(result, profileModel(&rows[i]))
+		result.UserProfiles = append(result.UserProfiles, profileModel(&rows[i]))
 	}
-	return result, total, nil
+	return result, nil
 }
 
 // shared

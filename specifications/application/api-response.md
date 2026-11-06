@@ -70,7 +70,7 @@ func (err FieldError) Error() string {
 
 ## 3. 失败响应与错误码
 
-失败时 `data` 固定为 `null`，`error` 包含通用错误类别、可选业务错误码及英文消息。HTTP 状态码与错误语义保持一致，不以 HTTP 200 承载业务失败。
+失败时 `data` 固定为 `null`，`error` 包含通用错误类别、可选业务错误码及错误消息。项目自行声明的错误使用英文消息，第三方错误保留其原始文案。HTTP 状态码与错误语义保持一致，不以 HTTP 200 承载业务失败。
 
 ### 3.1 通用错误码与 HTTP 状态码
 
@@ -146,11 +146,11 @@ func (err FieldError) Error() string {
 }
 ```
 
-Service 和 models 自己声明的错误在 `errors.New` 中确定文案；对下层已有的错误，直接返回原来的 `err`，不能为了响应文案进行包装、重建或替换。日志可以补充上下文，但不能改变返回值。框架需要默认内部错误时使用 `InternalError()`，其消息为 `internal server error`。
+Service 和 models 自己声明的错误在 `errors.New` 中确定文案。Service 可以将明确未命中等结果解释为对象不存在等业务错误；公共检查、models 已表达清楚的输入错误，以及数据库连接、SQL 执行、发号等技术故障均原样返回，不能为了响应文案进行包装、重建或替换。日志可以补充上下文。框架需要默认内部错误时使用 `InternalError()`，其消息为 `internal server error`。
 
 ## 4. 内部错误与对外错误的职责
 
-Service 返回的 Go `error` 用于传递执行失败原因。下层已有错误时原样返回；没有下层错误且本层独立判断失败时，返回本层用 `errors.New` 声明的错误值。Service 和 models 不声明新的 error 类型。对外 `business_code` 是接口调用方依赖的稳定字符串，二者不要求一一对应：多个错误可以映射为同一个业务码；未预期的执行错误映射为 `INTERNAL_ERROR`，不附带业务码。
+Service 返回的 Go `error` 用于传递失败原因：本层独立判断的失败及明确的业务语义映射使用本层以 `errors.New` 声明的错误值，例如状态不允许操作、发号成功却得到非正 ID、结合当前查询解释出的对象不存在；已有输入错误、下层技术故障及无法确定含义的错误原样返回。models 只声明自身独立判断的领域错误，原样返回其调用的公共检查错误。Service 和 models 都不声明新的 error 类型。对外 `business_code` 是接口调用方依赖的稳定字符串，二者不要求一一对应：多个错误可以映射为同一个业务码；未预期的执行错误映射为 `INTERNAL_ERROR`，不附带业务码。
 
 按以下位置组织错误定义和转换：
 
@@ -159,11 +159,11 @@ Service 返回的 Go `error` 用于传递执行失败原因。下层已有错误
 | `internal/response` | 通用错误枚举、固定 HTTP 状态映射、错误响应结构和输出函数 |
 | `internal/check/error.go` | 公共检查的错误类型与分类标识 |
 | 所属 models 规则文件 | 使用 `errors.New` 声明本层独立错误；下层错误原样返回，不新增 error 类型 |
-| 对应 Service 文件 | 顶部使用 `errors.New` 声明本层独立错误；下层错误原样返回，不新增 error 类型 |
+| 对应 Service 文件 | 顶部使用 `errors.New` 声明本层独立失败及明确业务语义映射的错误；原样返回已有输入错误和下层技术故障，不新增 error 类型 |
 | 对应 Validator 文件 | 绑定并校验请求，准备字段明细，发生错误时直接输出并终止 |
 | 对应 Controller 文件 | 声明自身业务码、集中映射接收到的错误，使用原错误消息和已有明细输出响应 |
 
-Service 不构造 `ErrorInfo` 或 HTTP 字段明细，也不需要知道错误最终对应的 `business_code`。Controller 使用 `errors.Is`、`errors.As` 识别收到的本层或下层错误并选择两个错误码，不比较错误字符串决定类别；`message` 直接取收到的 `err.Error()`，已有 `details` 原样传递。不要求 Service 先将仓储或驱动错误转换成自己的错误，具体约束见[错误处理规范第 1.1 节](api-error.md#11-service-与-models-的错误声明和返回约束)。
+Service 不构造 `ErrorInfo` 或 HTTP 字段明细，也不需要知道错误最终对应的 `business_code`。Service 解释业务含义后，Controller 使用 `errors.Is`、`errors.As` 识别收到的业务错误或原样传递的下层错误并选择两个错误码，不比较错误字符串决定类别；`message` 直接取收到的 `err.Error()`，已有 `details` 原样传递。具体约束见[错误处理规范第 1.1 节](api-error.md#11-service-与-models-的错误声明和返回约束)。
 
 ## 5. 错误构造与输出
 
@@ -183,7 +183,7 @@ Service 不构造 `ErrorInfo` 或 HTTP 字段明细，也不需要知道错误�
 | `Success(ctx, data)` | 将用例 Response DTO 包装为成功响应，返回 HTTP 200 |
 | `Fail(ctx, failure)` | 输出失败响应，并中止后续 Gin 处理链 |
 
-接收 `message` 的构造器在消息为空或全为空白时，使用第 3.1 节列出的默认英文消息。已有具体错误时直接传入其 `Error()`；消息是否可公开由错误产生处负责，不能依靠输出组件替换内容。
+接收 `message` 的构造器在消息为空或全为空白时，使用第 3.1 节列出的默认英文消息。已有具体错误时直接传入其 `Error()`。项目自行声明的错误在声明处准备可公开的非空白英文文案；原样传递的第三方故障明确接受原始文案，各层不为输出而翻译、脱敏、包装或替换。Service 对明确业务结果的解释不属于文案加工。具体责任范围见[错误文案的责任](api-error.md#23-错误文案的责任)。
 
 例如，Validator 已经收集到非空字段明细时，使用第一条明细的 `Error()` 作为消息，并原样传递全部明细：
 

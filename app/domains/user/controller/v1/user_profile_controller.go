@@ -41,6 +41,7 @@ func NewUserProfileController() *UserProfileController {
 // user_id 的格式及范围已校验，本方法将其十进制文本转换为 Service 使用的内部标识。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userprofiledto.QueryUserProfileByUserIDRequest) {
+	// Validator 已按相同十进制规则确认格式、int64 范围和正数要求，此处允许忽略转换错误。
 	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
 	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userservice.QueryUserProfileByUserIDParams{
@@ -92,23 +93,23 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userprofiledto.BatchQueryUserProfilesRequest) {
 	userIDs := make([]int64, 0, len(request.UserIDList))
 	for _, value := range request.UserIDList {
-		// Validator 已确认该文本可表示正 int64，这里只转换 Service 参数。
+		// Validator 已按相同规则确认正 int64 文本，这里构造 Service 参数，允许忽略转换错误。
 		userID, _ := strconv.ParseInt(value, 10, 64)
 		userIDs = append(userIDs, userID)
 	}
-	profiles, missingIDs, err := composition.Current().UserProfile.BatchQueryUserProfiles(userservice.BatchQueryUserProfilesParams{
+	serviceResult, err := composition.Current().UserProfile.BatchQueryUserProfiles(userservice.BatchQueryUserProfilesParams{
 		UserIDs: userIDs,
 	})
 	if err != nil {
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	missing := make([]string, 0, len(missingIDs))
-	for _, userID := range missingIDs {
+	missing := make([]string, 0, len(serviceResult.MissingUserIDs))
+	for _, userID := range serviceResult.MissingUserIDs {
 		missing = append(missing, strconv.FormatInt(userID, 10))
 	}
 	result := userprofiledto.BatchQueryUserProfilesResponse{
-		UserProfileList: userProfileDTOList(profiles), MissingUserIDList: missing,
+		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), MissingUserIDList: missing,
 	}
 	response.Success(ctx, result)
 }
@@ -121,7 +122,7 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 		value := *request.IsEnabled == "true"
 		isEnabled = &value
 	}
-	profiles, totalCount, err := composition.Current().UserProfile.QueryUserProfilePage(userservice.QueryUserProfilePageParams{
+	serviceResult, err := composition.Current().UserProfile.QueryUserProfilePage(userservice.QueryUserProfilePageParams{
 		PageNumber: request.PageNumber, PageSize: request.PageSize,
 		UserName: request.UserName, IsEnabled: isEnabled,
 	})
@@ -130,8 +131,8 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 		return
 	}
 	result := userprofiledto.QueryUserProfilePageResponse{
-		UserProfileList: userProfileDTOList(profiles), PageNumber: request.PageNumber,
-		PageSize: request.PageSize, TotalCount: totalCount,
+		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), PageNumber: request.PageNumber,
+		PageSize: request.PageSize, TotalCount: serviceResult.TotalCount,
 	}
 	response.Success(ctx, result)
 }
@@ -154,7 +155,7 @@ func userProfileDTOList(profiles []*models.UserProfile) []userprofiledto.UserPro
 }
 
 // mapUserProfileErrorCodes 集中选择本 Controller 的通用码和业务码，不修改错误文案。
-// Service 的执行故障已记录原始原因并转换为命名错误，由默认分支归为内部错误。
+// Service 解释可确定的业务失败；其原样返回的未知错误和技术故障由默认分支归为内部错误。
 func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessErrorCode) {
 	switch {
 	case errors.Is(err, check.ErrInvalidRule):
