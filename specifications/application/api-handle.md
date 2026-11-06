@@ -28,6 +28,7 @@
 ```text
 Repository 返回表结构或 error
   → Service 返回领域模型或用例 Result；明确业务失败返回业务错误，输入错误、技术故障和未知 error 原样返回
+  → Controller 处理结果；createUser 成功后签发新用户 JWT
   → Controller 转换为 Response DTO 或接口错误
   → response.Success / response.Fail 编码并写入 JSON
   → 外层决定发送正常响应或超时响应；超时后丢弃晚到结果
@@ -69,7 +70,7 @@ main → run
 
 | 位置 | 启动时准备的对象 | 请求中如何使用 |
 | --- | --- | --- |
-| [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 通过 `authnjwt.Current()` 获取；目前尚未接入 HTTP 中间件或业务接口 |
+| [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | `createUser` 的 Controller 在创建成功后取得组件并签发凭证；尚未接入 HTTP 认证中间件 |
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
@@ -123,9 +124,9 @@ Content-Type: application/json
 }
 ```
 
-客户端提交账户身份和初始资料。内部用户 ID、启用状态、版本及持久化时间由服务端生成。
+客户端提交账户身份声明和初始资料。内部用户 ID、启用状态、版本及持久化时间由服务端生成。
 
-当前未接入身份认证中间件，账户来源和外部账户标识是请求中的身份声明；这一步不会核验外部身份凭证。
+`createUser` 允许匿名调用，不要求已有内部用户 ID 或身份凭证。账户来源和外部账户标识仍只是请求中的声明，这一步不会核验外部身份；创建后签发的凭证只对应新建的本地用户。具体契约见 [user 领域接口权限规范](../domains/user/api-authorization.md#4-创建用户与首次凭证签发)。
 
 ### 3.2 Gin 根据方法和路径找到入口
 
@@ -217,26 +218,23 @@ v.controller.CreateUser(ctx, &request)
 
 ### 3.5 Controller 将 DTO 转成 Service 参数
 
-[UserProfileController.CreateUser](../../app/domains/user/controller/v1/user_profile_controller.go) 接收 `ctx` 和已校验的 DTO：
+[UserProfileController.CreateUser](../../app/domains/user/controller/v1/user_profile_controller.go) 接收 `ctx` 和已校验的 DTO，先调用 Service：
 
 ```go
-func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
-    profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
-        AccountSource:     request.AccountSource,
-        ExternalAccountID: request.ExternalAccountID,
-        UserName:          request.UserName,
-        AvatarURL:         request.AvatarURL,
-    })
-    if err != nil {
-        failUserProfileOperation(ctx, err)
-        return
-    }
-    result := userprofiledto.CreateUserResponse(userProfileDTO(profile))
-    response.Success(ctx, result)
+ctx.Header("Cache-Control", "no-store")
+profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
+    AccountSource:     request.AccountSource,
+    ExternalAccountID: request.ExternalAccountID,
+    UserName:          request.UserName,
+    AvatarURL:         request.AvatarURL,
+})
+if err != nil {
+    failUserProfileOperation(ctx, err)
+    return
 }
 ```
 
-Controller 将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_service.go)，然后调用启动时已经创建的 Service。成功时转换结果，失败时通过本文件的 `mapUserProfileErrorCodes` 选择通用码和业务码，由 `failUserProfileOperation` 使用错误的 `Error()` 输出响应。
+Controller 先设置 `Cache-Control: no-store`，避免后续含令牌的响应被缓存；设置 Header 本身还没有写出正文。随后将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_service.go)，调用启动时已经创建的 Service。创建失败时，通过本文件的 `mapUserProfileErrorCodes` 选择通用码和业务码，由 `failUserProfileOperation` 使用错误的 `Error()` 输出响应，立即返回，不签发凭证。创建成功后的签发及输出继续见第 3.8 节。
 
 这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责输入映射和后续响应转换。
 
@@ -275,42 +273,51 @@ Service 没有在这个创建流程中显式开启跨步骤事务。单次 GORM 
 
 Repository 返回原始 GORM 或驱动错误，不在这里决定 HTTP 状态码、业务错误码，也不输出 JSON。
 
-### 3.8 结果沿调用链返回并写成 JSON
+### 3.8 创建结果返回后签发凭证，再写成 JSON
 
-创建成功时，Service 使用 `profileModel` 将回填后的表对象转换为 [models.UserProfile](../../app/domains/user/models/user_profile.go)。创建结果来自成功写入的对象，这条成功路径不会再执行一次查询。
+1. **Service 返回已创建的资料，Controller 据此确定签发身份。** Service 使用 `profileModel` 将回填后的表对象转换为 [models.UserProfile](../../app/domains/user/models/user_profile.go)，成功路径不再查询一次数据库。Controller 使用固定的 `authn.PrincipalKindUser`、`identity.UserNamespaceMember` 和 `strconv.FormatInt(profile.ID, 10)` 构造 `Principal`，通过 `authnjwt.Current().Issue(ctx.Request.Context(), principal)` 签发 JWT。身份来源是本次创建结果，不能从请求中读取或覆盖；Service 和 Repository 不参与凭证签发。
 
-Controller 随后调用 `userProfileDTO`，只选择对外公开的字段，构造 `CreateUserResponse`。该响应类型是同一 DTO 包内 [UserProfile](../../app/domains/user/dto/v1/user_profile/user_profile.go) 的别名，既复用用户资料字段，又保留用例专属名称；Controller 通过 `userprofiledto.UserProfile` 引用这个共享结构。
+2. **签发成功后，Controller 将资料与凭证组合为用例响应。** [CreateUserResponse](../../app/domains/user/dto/v1/user_profile/create_user.go) 是独立结构体，其中 `UserProfile` 字段复用同组 [UserProfile](../../app/domains/user/dto/v1/user_profile/user_profile.go) DTO。资料字段由 `userProfileDTO(profile)` 转换；`AccessToken`、`TokenType` 和 `ExpiresAt` 分别直接采用签发结果的 `Credential.Value`、`Credential.Scheme` 和 `ExpiresAt`。到期时间不由 Controller 再次计算。
 
-最后由 [response.Success](../../internal/response/response.go) 完成统一外层包装并写入响应：
+3. **只有创建和签发都成功，才写出一次成功响应。** Controller 沿用入口处设置的 `Cache-Control: no-store`，由 [response.Success](../../internal/response/response.go) 完成外层包装：
 
-```go
-response.Success(ctx, result)
-```
+   ```go
+   result := userprofiledto.CreateUserResponse{
+       UserProfile: userProfileDTO(profile),
+       AccessToken: issued.Credential.Value,
+       TokenType:   issued.Credential.Scheme,
+       ExpiresAt:   issued.ExpiresAt,
+   }
+   response.Success(ctx, result)
+   ```
 
-公共响应组件先将包含 `data/error` 的完整对象编码成 JSON 字节，再设置状态码、响应头并写入正文。写入先进入外层中间件的响应缓冲区，由外层决定是否发送。Controller 的调用方式不变；编码失败和写入失败的职责见第 5.3 节，超时后丢弃结果的规则见第 5.4 节。
+   公共响应组件先将包含 `data/error` 的完整对象编码成 JSON 字节，再设置状态码、响应头并写入正文。写入先进入外层中间件的响应缓冲区，由外层决定是否发送；编码失败和写入失败的职责见第 5.3 节，超时后丢弃结果的规则见第 5.4 节。
 
-示例响应如下，用户 ID 仅用于说明结构，实际值由雪花生成器产生：
+   示例响应如下，用户 ID、令牌占位文本和到期时间仅用于说明结构，不是可用凭证：
 
-```json
-{
-  "data": {
-    "user_id": "1234567890123456789",
-    "user_name": "Example User",
-    "avatar_url": null,
-    "is_enabled": true,
-    "version": 0
-  },
-  "error": null
-}
-```
+   ```json
+   {
+     "data": {
+       "user_profile": {
+         "user_id": "1234567890123456789",
+         "user_name": "Example User",
+         "avatar_url": null,
+         "is_enabled": true,
+         "version": 0
+       },
+       "access_token": "<signed-jwt>",
+       "token_type": "Bearer",
+       "expires_at": "2026-11-06T10:00:00Z"
+     },
+     "error": null
+   }
+   ```
 
-这里有三项转换需要注意：
+4. **响应字段按各自契约序列化，凭证正文不混入资料 DTO。** HTTP 状态码为 200，成功结果位于 `data`，`error` 为 `null`。`data.user_profile.user_id` 的十进制字符串由共享 DTO 的 `json:"user_id,string"` 标签控制；`data.expires_at` 使用 UTC RFC3339 字符串。账户来源、外部账户标识和持久化时间保留在内部数据中，不因签发凭证而新增到资料响应。统一响应由 `Success` 或 `Fail` 显式写出，框架不会在任意返回值外自动再包装一层 JSON。
 
-- HTTP 状态码为 200，成功结果位于 `data`，`error` 为 `null`。
-- `user_id` 的十进制字符串格式由 Response DTO 的 `json:"user_id,string"` 标签控制，避免大整数精度丢失。
-- 账户来源、外部账户标识和持久化时间保留在内部数据中，普通资料响应不返回这些字段。
+5. **签发失败返回 500，但不撤销已创建的用户。** Controller 记录包含新建 `user_id` 和原始错误的英文日志，不记录令牌，然后返回 `INTERNAL_ERROR` 与原始 `err.Error()`，不附业务码，立即结束方法。不能先返回资料成功，再追加签发错误。重复账户在 Service 失败分支已终止，不会为已有用户补发凭证。
 
-统一响应由代码显式调用 `Success` 或 `Fail` 写出。框架不会在任意返回值外面自动再包装一层 JSON。
+6. **等待超时后，创建和签发可以继续完成，但凭证响应会被丢弃。** 本接口外层等待 10 秒，超过期限返回 503；传入 `Issue` 的 Request Context 已由等待中间件隔离取消，不会因响应等待结束而取消签发。已经创建的记录不回滚，晚到凭证不发送给客户端。丢失结果时不能通过重复匿名注册取回令牌，本次不提供凭证恢复机制；签发成功也不表示其余四个接口已经启用身份认证和授权。
 
 ## 4. 数据对象为什么会多次转换
 
@@ -324,6 +331,7 @@ HTTP JSON
   → Repository / MySQL
   → 回填后的 tables.UserProfile
   → models.UserProfile
+  → Controller 以新建 ID 构造 Principal，签发 IssuedCredential
   → CreateUserResponse
   → response.Response[T]
   → HTTP JSON
@@ -336,6 +344,7 @@ HTTP JSON
 | `tables.UserProfile` | 数据库列、GORM 标签、SQL 可空值 | Service 构造，Repository 写入或读取 |
 | `models.UserProfile` | 业务层返回的用户资料 | Service 的 `profileModel` 转换 |
 | Service `<UseCase>Result` | 某个用例组合的业务结果，例如资料列表和总数、缺失 ID | Service 组织；类型紧接同文件对应 Params 声明 |
+| `authn.IssuedCredential` | 签发凭证的原文、方案及有效时间 | Controller 根据新建资料构造身份，调用公共 JWT 签发器取得 |
 | 用例 Response DTO | 当前接口允许对外返回的字段 | Controller 从模型或 Result 映射，资料字段由 `userProfileDTO` 转换 |
 | `response.Response[T]` | 统一的 `data/error` 外层 | `response.Success` 或 `response.Fail` 构造 |
 
@@ -357,6 +366,7 @@ HTTP JSON
 | Service 业务处理 | 更新时实际版本与提交版本不同 | 409、`CONFLICT`、`USER_PROFILE_VERSION_CONFLICT` | Controller 输出错误 |
 | Repository 查询 | 目标资料未找到 | 404、`NOT_FOUND`、`USER_PROFILE_NOT_FOUND` | Service 解释为资料不存在，Controller 分类并输出 |
 | Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出收到的错误文案 |
+| Controller 签发凭证 | 用户已创建，但 JWT 签发返回错误 | 500、`INTERNAL_ERROR`、无业务码，使用原始错误文案 | Controller 记录错误并结束，不回滚已创建的用户 |
 | response 编码 | DTO 无法编码为 JSON | 尚未写出时尝试返回默认 500 | response 记录原因并终止后续处理 |
 | response 写入 | 当前 Writer 返回写入错误或短写 | 不再追加错误响应 | response 记录原因并终止后续处理 |
 | 外层网络写入 | 连接错误或正文未完整写入 | 不再追加错误响应 | 响应等待中间件记录实际发送失败 |
@@ -503,7 +513,8 @@ HTTP JSON
 | 8 | [user_profile_controller.go](../../app/domains/user/controller/v1/user_profile_controller.go) | `CreateUser`、`userProfileDTO`、`failUserProfileOperation` |
 | 9 | [user_profile_service.go](../../app/domains/user/service/user_profile_service.go) | 共享仓储查找、发号、创建流程及模型转换 |
 | 10 | [user_profile_repository.go](../../app/domains/user/repository/user_profile_repository.go)、[user_profile.go](../../app/domains/user/tables/user_profile.go) | SQL 的执行入口、表映射及回填 |
-| 11 | [Controller 错误映射](../../app/domains/user/controller/v1/user_profile_controller.go)、[response.go](../../internal/response/response.go) | `mapUserProfileErrorCodes` 如何分类，最终 JSON 如何写出 |
-| 12 | [response_timeout.go](../../app/http/middleware/response_timeout.go) | 标准库超时包装、统一响应适配、取消隔离与内部处理收尾 |
+| 11 | [JWT Provider](../../internal/authn/jwt/provider.go)、[共享实例](../../internal/authn/jwt/runtime.go) | Controller 如何取得签发器，新建身份如何形成凭证和有效期 |
+| 12 | [Controller 错误映射](../../app/domains/user/controller/v1/user_profile_controller.go)、[response.go](../../internal/response/response.go) | `mapUserProfileErrorCodes` 如何分类，最终 JSON 如何写出 |
+| 13 | [response_timeout.go](../../app/http/middleware/response_timeout.go) | 标准库超时包装、统一响应适配、取消隔离与内部处理收尾 |
 
 沿这个顺序阅读，可以把一个请求的入口、数据形态、业务执行、数据库访问和最终响应对应到具体方法，而无需先遍历整个项目。

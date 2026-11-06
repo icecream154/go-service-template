@@ -12,7 +12,7 @@ export JWT_SIGNING_KEY="$(openssl rand -base64 32)"
 go run ./cmd/web
 ```
 
-`JWT_SIGNING_KEY` 是标准 Base64 编码的随机签名密钥，解码后至少 32 字节；配置中的 `signing_key_env` 指定变量名。所有环境均须提供密钥，没有内置默认值，缺失或无效时停止启动。同一部署的多个实例应使用同一份密钥，不同环境使用不同密钥；更换密钥会使旧凭证失效。部署时通过受控环境变量注入，不将密钥写入仓库。JWT 固定使用 HS256，配置模板中的有效期为 1 小时；组件初始化不会自动启用 HTTP 认证或修改业务接口，详细约定见[公共身份认证契约](specifications/application/api-authentication.md)。
+`JWT_SIGNING_KEY` 是标准 Base64 编码的随机签名密钥，解码后至少 32 字节；配置中的 `signing_key_env` 指定变量名。所有环境均须提供密钥，没有内置默认值，缺失或无效时停止启动。同一部署的多个实例应使用同一份密钥，不同环境使用不同密钥；更换密钥会使旧凭证失效。部署时通过受控环境变量注入，不将密钥写入仓库。JWT 固定使用 HS256，配置模板中的有效期为 1 小时；组件初始化本身不启用 HTTP 认证，业务入口通过显式调用使用签发能力，详细约定见[公共身份认证与 JWT 实现](specifications/application/api-authentication.md)。
 
 `APP_ENV` 支持 `dev/test/prod`，未设置或为空时默认 `dev`；`APP_REGION` 目前支持 `cn`，未设置或为空时默认 `cn`。环境名和区域值严格匹配，非法值停止启动。
 
@@ -59,7 +59,7 @@ machine_id: 1
 | HTTP 方法 | 业务用例 | 用途 |
 | --- | --- | --- |
 | GET | `queryUserProfileByUserId` | 按内部用户 ID 查询资料 |
-| POST | `createUser` | 以外部账户身份首次注册，生成内部用户 ID |
+| POST | `createUser` | 匿名首次注册，生成内部用户 ID，成功后返回用户资料及该用户的 JWT |
 | POST | `updateUserProfile` | 检查版本并完整替换昵称、有效头像地址，不支持清空头像 |
 | POST | `batchQueryUserProfiles` | 按 ID 批量查询，返回已存在资料和缺失 ID |
 | GET | `queryUserProfilePage` | 按昵称、启用状态筛选并分页查询 |
@@ -76,7 +76,9 @@ machine_id: 1
 
 超过等待时间时返回 HTTP 503、`SERVICE_UNAVAILABLE`，消息为 `response wait timeout; operation outcome is unknown`。已经开始的内部业务继续执行，最终响应被丢弃；客户端应稍后确认结果，不能把超时当作业务失败或回滚证明。响应等待时间与 `-startup-timeout`、`-shutdown-timeout` 分别控制不同阶段。
 
-请求与响应字段见[用户资料 DTO](app/domains/user/dto/v1/user_profile/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。创建为首次自注册，不要求已有发起方用户 ID；更新显式提供 `operator_user_id` 和目标 `user_id`，当前限定本人修改。认证尚未接入，来源、外部账户及发起方 ID 都由请求声明，不代表已验证身份。
+请求与响应字段见[用户资料 DTO](app/domains/user/dto/v1/user_profile/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。`createUser` 不要求已有发起方用户 ID 或凭证；Controller 在创建成功后为新建 ID 签发 `user/member` JWT，HTTP 200 的 `data` 包含嵌套的 `user_profile`、`access_token`、`token_type` 和 `expires_at`。令牌类型为 `Bearer`，到期时间直接使用签发结果并输出 UTC RFC3339 字符串，成功响应设置 `Cache-Control: no-store`。
+
+创建失败或账户重复时不签发凭证；创建完成后签发失败返回 500，并保留已创建的用户。10 秒等待超时后内部继续，晚到凭证不再发送；不能通过重复匿名注册补发令牌，本次不提供凭证恢复。具体约定见 [user 领域接口权限规范](specifications/domains/user/api-authorization.md#4-创建用户与首次凭证签发)。其余四个接口尚未接入 HTTP 身份认证及授权；更新仍显式接收 `operator_user_id` 和目标 `user_id`，只检查二者的既有业务约束。来源、外部账户及请求自报的发起方 ID 都不代表已验证身份。
 
 `GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
 

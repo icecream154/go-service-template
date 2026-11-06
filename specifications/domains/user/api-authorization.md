@@ -4,9 +4,11 @@
 
 1. **本文规定 `UserProfileController` 五个接口的调用资格和数据访问范围。** 创建用户允许匿名调用；单个资料的查询、修改仅限用户本人；批量及分页查询仅限管理服务。本规范独立维护 user 领域规则，不将这些接口规则写入通用认证契约。
 
-2. **通用身份结构与项目命名空间沿用既有声明。** `Principal`、认证器及通用认证错误见[公共身份认证契约](../../application/api-authentication.md)；用户与服务命名空间分别声明在 [user_namespace.go](../../../app/identity/user_namespace.go) 和 [service_namespace.go](../../../app/identity/service_namespace.go)。本文约定认证结果如何用于这五个接口，不限定凭证格式、签名算法或有效期。
+2. **通用身份结构与项目命名空间沿用既有声明。** `Principal`、签发器、认证器及通用认证错误见[公共身份认证与 JWT 实现](../../application/api-authentication.md)；用户与服务命名空间分别声明在 [user_namespace.go](../../../app/identity/user_namespace.go) 和 [service_namespace.go](../../../app/identity/service_namespace.go)。本文规定接口使用哪一种身份以及创建后的凭证响应，签名算法和有效期配置沿用公共 JWT 组件。
 
 3. **身份认证与业务授权分别成立。** 有效凭证证明调用方身份；本规范决定该身份能够调用哪个接口、访问哪些资料。公共类型或命名空间常量的声明本身不执行认证，也不会自动赋予全部接口权限。
+
+4. **本次实现只接入创建成功后的凭证签发。** `createUser` 仍允许匿名调用；其余四个接口尚未接入 HTTP 认证及本规范要求的身份授权。下述权限矩阵规定这些接口应当遵守的规则，不能据此认为现有路由已经受到保护。
 
 ## 2. 身份与主体标识
 
@@ -30,11 +32,24 @@
 
 1. **`createUser` 是公开的创建入口，不要求调用方先拥有用户或服务凭证。** 注册前没有内部用户 ID 是正常情况，也不以验证外部账户身份作为本接口的调用前提。输入合法性、账户唯一性等业务条件仍按创建用例执行。
 
-2. **成功响应必须同时包含本次创建的用户资料和对应身份凭证。** 凭证中的身份固定为 `Kind=user`、`Namespace=member`，`SubjectID` 取本次成功创建的内部用户 ID。身份类别、命名空间和主体 ID 均由服务端确定，不能由请求参数指定；本接口不能签发管理服务身份。
+2. **Controller 在创建成功后，为新用户签发身份凭证。** 先调用 `Service.CreateUser`，只有成功取得新建资料后，才调用 `authnjwt.Current().Issue(ctx.Request.Context(), principal)`。`Kind` 固定为 `authn.PrincipalKindUser`，`Namespace` 固定为 `identity.UserNamespaceMember`，`SubjectID` 取新建资料 ID 的十进制字符串。身份类别、命名空间和主体 ID 均由服务端确定，不能由请求参数指定；本接口不能签发管理服务身份。Service 继续只负责创建用户，不接收 HTTP Context，也不签发凭证。
 
-3. **失败或重复注册不能成为取得已有用户凭证的途径。** 创建失败不签发凭证；发现账户已存在时，按既有业务错误处理，不能查询出已有用户后为匿名调用方签发该用户的凭证。凭证签发失败也不能返回缺少凭证的成功结果；具体错误输出遵守[接口返回规范](../../application/api-response.md)，不据此承诺已完成的数据库操作会自动撤销。
+3. **成功响应使用嵌套资料对象，同时交付凭证与失效时间。** HTTP 状态为 200，统一外层为 `data/error`，`error` 为 `null`。`CreateUserResponse` 独立声明以下字段，资料字段位于 `data.user_profile` 内，不再平铺到 `data`。Controller 只在创建、签发均成功后调用一次 `response.Success`，响应设置 `Cache-Control: no-store`。
 
-4. **未经认证的外部账户字段只表达调用方声明。** 如果请求仍包含 `account_source`、`external_account_id`，这些值不证明调用方拥有对应外部账户，不能作为已经验证的外部身份或账户绑定依据。签发的身份只指向本次创建的本地用户，不能根据这些字段认领已有用户。
+   | `data` 字段 | Go 类型 | 含义与来源 |
+   | --- | --- | --- |
+   | `user_profile` | `UserProfile` | 本次创建的资料，复用本 Controller 分组的共享 DTO；`user_id` 仍为十进制字符串 |
+   | `access_token` | `string` | 签发结果的 `Credential.Value`，只包含令牌正文，不带 `Bearer` 前缀 |
+   | `token_type` | `string` | 签发结果的 `Credential.Scheme`，当前为 `Bearer` |
+   | `expires_at` | `time.Time` | 直接使用签发结果的 `ExpiresAt`，JSON 为 UTC RFC3339 字符串；不由 Controller 重新计算有效期 |
+
+4. **创建失败或账户重复时不调用签发器。** 创建失败沿用已有错误映射；重复账户返回 HTTP 409、`CONFLICT` 和 `USER_ACCOUNT_ALREADY_EXISTS`。不能查询出已有用户后为匿名调用方签发其凭证，也不能通过重复匿名注册补发上次未取得的令牌。
+
+5. **创建已完成但签发失败时，返回错误并保留已创建的用户。** Controller 记录包含新建 `user_id` 和原始错误的英文日志，不记录令牌；响应返回 HTTP 500、`INTERNAL_ERROR` 和原始 `err.Error()`，不附业务码。此时不返回缺少凭证的成功结果，也不回滚或删除已经创建的记录；凭证恢复机制不在本次实现范围内。
+
+6. **响应等待超时不取消创建和签发，晚到凭证不再发送。** 本接口等待 10 秒；超时先返回 HTTP 503 和 `SERVICE_UNAVAILABLE`，表示业务结果尚未确认。Controller 传入签发器的是等待中间件已隔离取消的内部 Request Context，已经开始的处理继续执行；晚到的资料和凭证响应均被丢弃。超时、断开连接或写出失败都不证明创建回滚，不能据此无条件重试注册或认定能够取回凭证。
+
+7. **未经认证的外部账户字段只表达调用方声明。** 请求中的 `account_source`、`external_account_id` 不证明调用方拥有对应外部账户，不能作为已经验证的外部身份或账户绑定依据。签发的身份只指向本次创建的本地用户，不能根据这些字段认领已有用户。
 
 ## 5. 本人查询与本人修改
 

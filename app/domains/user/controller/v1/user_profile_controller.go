@@ -3,11 +3,15 @@ package v1
 
 import (
 	"errors"
+	"log"
 	"strconv"
 
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
+	"go-service-template/app/identity"
+	"go-service-template/internal/authn"
+	authnjwt "go-service-template/internal/authn/jwt"
 	"go-service-template/internal/check"
 	"go-service-template/internal/composition"
 	"go-service-template/internal/response"
@@ -56,10 +60,13 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	response.Success(ctx, result)
 }
 
-// CreateUser 使用首次自注册的外部身份创建用户，内部 ID、初始状态和版本由 Service 决定。
+// CreateUser 允许匿名注册，创建成功后为本次生成的内部用户 ID 签发 user/member 凭证。
 // Request DTO 由领域 Validator 绑定后传入，本方法不再读取或解析 HTTP 请求体。
-// 当前接口不接入外部身份认证，不要求已有 operator_user_id。
+// 外部账户字段仅为调用方声明，不核验外部身份，也不据此为已有用户补发凭证。
+// 签发失败返回 500，但不会回滚已经完成的创建；仅在创建和签发均成功时输出成功响应。
 func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
+	// 本接口的成功响应包含敏感凭证，要求 HTTP 缓存不保存响应。
+	ctx.Header("Cache-Control", "no-store")
 	profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
 		AccountSource: request.AccountSource, ExternalAccountID: request.ExternalAccountID,
 		UserName: request.UserName, AvatarURL: request.AvatarURL,
@@ -68,7 +75,28 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	result := userprofiledto.CreateUserResponse(userProfileDTO(profile))
+	// 身份类别和命名空间由服务端固定，主体只能取本次成功创建的内部 ID。
+	// Service 返回错误时已提前结束，重复注册不会进入签发步骤。
+	principal := authn.Principal{
+		Kind:      authn.PrincipalKindUser,
+		Namespace: identity.UserNamespaceMember,
+		SubjectID: strconv.FormatInt(profile.ID, 10),
+	}
+	// 沿用本次请求的 Context。外层响应等待中间件已隔离取消，超过 10 秒等待时间
+	// 仍会继续内部处理；晚到的凭证响应由外层丢弃，不表示创建已回滚。
+	issued, err := authnjwt.Current().Issue(ctx.Request.Context(), principal)
+	if err != nil {
+		// 签发发生在 Controller，故障也在此处记录；不打印凭证或完整响应 DTO。
+		log.Printf("Issue user credential failed: user_id=%d error=%v", profile.ID, err)
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	result := userprofiledto.CreateUserResponse{
+		UserProfile: userProfileDTO(profile),
+		AccessToken: issued.Credential.Value,
+		TokenType:   issued.Credential.Scheme,
+		ExpiresAt:   issued.ExpiresAt,
+	}
 	response.Success(ctx, result)
 }
 
@@ -155,7 +183,7 @@ func userProfileDTOList(profiles []*models.UserProfile) []userprofiledto.UserPro
 }
 
 // mapUserProfileErrorCodes 集中选择本 Controller 的通用码和业务码，不修改错误文案。
-// Service 解释可确定的业务失败；其原样返回的未知错误和技术故障由默认分支归为内部错误。
+// Service 解释可确定的业务失败；签发失败、未知错误和技术故障由默认分支归为内部错误。
 func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessErrorCode) {
 	switch {
 	case errors.Is(err, check.ErrInvalidRule):
@@ -177,8 +205,8 @@ func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessE
 	}
 }
 
-// failUserProfileOperation 原样采用 Service 错误的 Error()，不补造字段明细。
-// Service 已在故障发生处记录原始原因，这里只分类并输出响应。
+// failUserProfileOperation 原样采用接收错误的 Error()，不补造字段明细。
+// Service 故障在 Service 中记录，签发故障在 CreateUser 中记录；这里仅分类并输出响应。
 func failUserProfileOperation(ctx *gin.Context, err error) {
 	code, businessCode := mapUserProfileErrorCodes(err)
 	response.Fail(ctx, response.ErrorInfo{
