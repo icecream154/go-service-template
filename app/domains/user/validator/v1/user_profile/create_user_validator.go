@@ -1,12 +1,12 @@
-// Package v1 绑定并校验用户 V1 接口的请求参数，再将 Request DTO 交给 Controller。
-package v1
+// Package userprofile 绑定并校验用户 V1 用户资料接口的请求参数，再交给 Controller。
+package userprofile
 
 import (
 	"errors"
 	"log"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	"go-service-template/internal/check"
 	"go-service-template/internal/response"
@@ -29,7 +29,7 @@ func NewCreateUserValidator(controller *userv1controller.UserProfileController) 
 // CreateUser 为本次请求创建 DTO，绑定和字段校验通过后才调用 Controller。
 // 账户唯一性、ID 生成及创建操作继续由现有 Service 处理。
 func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
-	var request userv1dto.CreateUserRequest
+	var request userprofiledto.CreateUserRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
 		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
@@ -53,7 +53,7 @@ func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
 // validateCreateUserRequest 校验绑定后的创建用户字段，不改写 DTO 或访问业务状态。
 // 按请求字段顺序组合领域规则，每个字段最多返回一条问题。
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
-func validateCreateUserRequest(request *userv1dto.CreateUserRequest) ([]response.FieldError, error) {
+func validateCreateUserRequest(request *userprofiledto.CreateUserRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
 	if err := models.ValidateAccountSource(request.AccountSource); err != nil {
 		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {

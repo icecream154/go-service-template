@@ -3,7 +3,7 @@ package routers
 
 import (
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1validator "go-service-template/app/domains/user/validator/v1"
+	userprofilevalidator "go-service-template/app/domains/user/validator/v1/user_profile"
 
 	"github.com/gin-gonic/gin"
 )
@@ -13,15 +13,15 @@ type UserRouter struct {
 	// userProfiles 处理 V1 用户资料请求，不保存单次请求的数据。
 	userProfiles *userv1controller.UserProfileController
 	// createUserValidator 绑定创建用户请求，再交给同一个用户资料控制器处理。
-	createUserValidator *userv1validator.CreateUserValidator
+	createUserValidator *userprofilevalidator.CreateUserValidator
 	// queryUserProfileByUserIDValidator 绑定并校验按 ID 查询请求。
-	queryUserProfileByUserIDValidator *userv1validator.QueryUserProfileByUserIDValidator
+	queryUserProfileByUserIDValidator *userprofilevalidator.QueryUserProfileByUserIDValidator
 	// queryUserProfilePageValidator 绑定并校验分页查询请求。
-	queryUserProfilePageValidator *userv1validator.QueryUserProfilePageValidator
+	queryUserProfilePageValidator *userprofilevalidator.QueryUserProfilePageValidator
 	// updateUserProfileValidator 绑定并校验完整替换资料的请求。
-	updateUserProfileValidator *userv1validator.UpdateUserProfileValidator
+	updateUserProfileValidator *userprofilevalidator.UpdateUserProfileValidator
 	// batchQueryUserProfilesValidator 绑定并校验批量查询请求。
-	batchQueryUserProfilesValidator *userv1validator.BatchQueryUserProfilesValidator
+	batchQueryUserProfilesValidator *userprofilevalidator.BatchQueryUserProfilesValidator
 }
 
 // NewRouter 创建用户资料控制器及各用例的 Validator，不执行数据库查询。
@@ -29,11 +29,11 @@ func NewRouter() *UserRouter {
 	controller := userv1controller.NewUserProfileController()
 	return &UserRouter{
 		userProfiles:                      controller,
-		createUserValidator:               userv1validator.NewCreateUserValidator(controller),
-		queryUserProfileByUserIDValidator: userv1validator.NewQueryUserProfileByUserIDValidator(controller),
-		queryUserProfilePageValidator:     userv1validator.NewQueryUserProfilePageValidator(controller),
-		updateUserProfileValidator:        userv1validator.NewUpdateUserProfileValidator(controller),
-		batchQueryUserProfilesValidator:   userv1validator.NewBatchQueryUserProfilesValidator(controller),
+		createUserValidator:               userprofilevalidator.NewCreateUserValidator(controller),
+		queryUserProfileByUserIDValidator: userprofilevalidator.NewQueryUserProfileByUserIDValidator(controller),
+		queryUserProfilePageValidator:     userprofilevalidator.NewQueryUserProfilePageValidator(controller),
+		updateUserProfileValidator:        userprofilevalidator.NewUpdateUserProfileValidator(controller),
+		batchQueryUserProfilesValidator:   userprofilevalidator.NewBatchQueryUserProfilesValidator(controller),
 	}
 }
 

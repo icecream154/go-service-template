@@ -58,7 +58,7 @@ machine_id: 1
 | POST | `batchQueryUserProfiles` | 按 ID 批量查询，返回已存在资料和缺失 ID |
 | GET | `queryUserProfilePage` | 按昵称、启用状态筛选并分页查询 |
 
-请求与响应字段见[用户领域 DTO](app/domains/user/dto/v1/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。创建为首次自注册，不要求已有发起方用户 ID；更新显式提供 `operator_user_id` 和目标 `user_id`，当前限定本人修改。认证尚未接入，来源、外部账户及发起方 ID 都由请求声明，不代表已验证身份。
+请求与响应字段见[用户资料 DTO](app/domains/user/dto/v1/user_profile/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。创建为首次自注册，不要求已有发起方用户 ID；更新显式提供 `operator_user_id` 和目标 `user_id`，当前限定本人修改。认证尚未接入，来源、外部账户及发起方 ID 都由请求声明，不代表已验证身份。
 
 `GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
 
@@ -101,7 +101,9 @@ Service 错误集中在对应 Service 文件顶部；每个用例在同一区域
 
 顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
-Controller 与 DTO 放在对应领域的 `controller/v1`、`dto/v1` 中，领域内复用的业务响应字段放在 `dto/v1/shared`，统一响应外层由 `internal/response` 提供。新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、DTO 和注册方法；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
+Controller 保留在对应领域的 `controller/v1` 中；Validator 与 DTO 先按版本、再按 Controller 分组，用户资料分别位于 `validator/v1/user_profile` 和 `dto/v1/user_profile`。每个用例独立组织文件，两个分组包均命名为 `userprofile`，导入时分别使用 `userprofilevalidator`、`userprofiledto` 别名。同一 Controller 内复用的 `UserProfile` 放在该 DTO 分组的 `user_profile.go` 中；只有跨 Controller 复用且语义一致的结构，才按需建立 `dto/v1/shared` 包。统一响应外层由 `internal/response` 提供。
+
+新增 V2 时单独注册 `/api/v2`，在相关领域增加相应 Controller、Validator、DTO 和注册方法，Validator 与 DTO 延续版本下按 Controller 分组的组织方式；Service、领域模型、Repository 和表结构继续按业务组织，不随接口版本复制。
 
 ## 数据库连接
 
@@ -191,7 +193,9 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
-| `app/domains/*/controller/v1`、`dto/v1` | V1 请求处理与请求、响应数据结构；Controller 内维护业务码和错误映射 |
+| `app/domains/*/controller/v1` | V1 请求处理；Controller 内维护业务码和错误映射 |
+| `app/domains/*/validator/v1/<controller>` | 按 Controller 分组的 V1 请求绑定与校验，每个用例一个 Validator 文件 |
+| `app/domains/*/dto/v1/<controller>` | 按 Controller 分组的 V1 请求、响应定义；同组共享结构按具体业务概念组织文件 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |
 | `internal/snowflake` | 严格加载机器号配置，初始化并提供进程共享的雪花发号器 |
 | `config/snowflake` | 各部署环境的机器号配置模板，部署时按进程分配 |

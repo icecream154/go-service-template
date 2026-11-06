@@ -1,6 +1,4 @@
-package v1
-
-import "go-service-template/app/domains/user/dto/v1/shared"
+package userprofile
 
 // BatchQueryUserProfilesRequest 表示按一组明确用户 ID 批量读取资料。
 type BatchQueryUserProfilesRequest struct {
@@ -11,7 +9,7 @@ type BatchQueryUserProfilesRequest struct {
 // BatchQueryUserProfilesResponse 区分已找到的资料和未找到的用户 ID。
 type BatchQueryUserProfilesResponse struct {
 	// UserProfileList 按请求中 ID 首次出现的顺序返回资料，无结果时输出 []。
-	UserProfileList []shared.UserProfile `json:"user_profile_list"`
+	UserProfileList []UserProfile `json:"user_profile_list"`
 	// MissingUserIDList 按请求顺序返回未找到的 ID，无缺失时输出 []。
 	MissingUserIDList []string `json:"missing_user_id_list"`
 }

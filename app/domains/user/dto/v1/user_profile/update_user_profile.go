@@ -1,6 +1,4 @@
-package v1
-
-import "go-service-template/app/domains/user/dto/v1/shared"
+package userprofile
 
 // UpdateUserProfileRequest 表示完整替换昵称、头像的请求，所有字段均须出现。
 type UpdateUserProfileRequest struct {
@@ -18,4 +16,4 @@ type UpdateUserProfileRequest struct {
 }
 
 // UpdateUserProfileResponse 表示更新成功后的资料及递增后的版本。
-type UpdateUserProfileResponse = shared.UserProfile
+type UpdateUserProfileResponse = UserProfile

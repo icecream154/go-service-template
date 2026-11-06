@@ -43,7 +43,7 @@
 | 校验相关常量类别 | 声明文件 | 可见性与示例 | 引用方式 |
 | --- | --- | --- | --- |
 | 领域规则 | `app/domains/<domain>/models/<entity>_validation.go`，与对应实体的领域规则放在一起 | 只供规则内部使用时保持包内可见，例如 `minUserNameRuneCount`、`userNamePattern`；需要跨包公开规则元数据时可以导出，例如 `MaxUserNameRuneCount` | models 的规则函数引用同包声明；Validator 和 Service 调用领域规则函数。需要规则元数据的调用方可以读取公开常量，不重复实现已有领域规则 |
-| 接口专属 | `app/domains/<domain>/validator/v<version>/<use_case>_validator.go`，与该用例 Validator 放在一起 | 仅供本包使用时采用包含完整用例名的包内常量，例如 `maxQueryOrderPageConditionCount`；同一 HTTP 适配层确有合法跨包使用需求时可以按需导出 | 私有校验函数引用约束和格式常量，入口方法在绑定前引用默认值；Service 不反向引用这些接口专属常量 |
+| 接口专属 | `app/domains/<domain>/validator/v<version>/<controller>/<use_case>_validator.go`，与该用例 Validator 放在一起 | 仅供本包使用时采用包含完整用例名的包内常量，例如 `maxQueryOrderPageConditionCount`；同一 HTTP 适配层确有合法跨包使用需求时可以按需导出 | 私有校验函数引用约束和格式常量，入口方法在绑定前引用默认值；Service 不反向引用这些接口专属常量 |
 | 业务用例输入契约 | `app/domains/<domain>/service/<object>_service.go` 的对应用例区域，与该用例的 Params 放在一起 | 需要 Validator 等其他包直接引用时导出，例如 `MinUserProfilePageNumber`、`MaxUserProfileBatchSize`；只在 Service 包内部使用时保持包内可见 | 跨包调用方通过 Service 包名引用导出常量；Service 在同包内引用所属声明，不重复定义 |
 
 1. **用例输入契约描述 Service 接受的参数及其共同约束。** 它由 Service 的 Params 及其配套校验相关常量组成。相关声明放在 Service 文件的对应用例区域，随后组织私有 Params 校验函数和用例处理方法，不再拆成独立的 Params 文件或校验文件。
@@ -52,7 +52,7 @@
 
 3. **命名与注释统一遵守第 2.5 节。** 常量的前缀、业务对象、计量单位和格式后缀按同一套规则组合；注释补充边界、默认值应用条件等信息，不因声明位置不同而另设命名方式。
 
-4. **常量可见性由合法的跨包使用需求决定。** 小写开头表示整个包内可见，而非仅在声明文件内可见；大写开头表示允许其他包引用，不按 Service、Validator 或 models 统一规定可见性。具体导出判断和引用方式见第 2.4 节。
+4. **常量可见性由合法的跨包使用需求决定。** 小写开头表示整个包内可见，而非仅在声明文件内可见。Validator 中，同一领域、同一版本、同一 Controller 分组的文件属于同一个包；其他 Controller 分组属于不同包，不能直接访问其包内常量。大写开头表示允许其他包引用，不按 Service、Validator 或 models 统一规定可见性。具体导出判断和引用方式见第 2.4 节。
 
 5. **业务含义不同的常量应分别声明。** 例如，批量数量限制与分页大小即使都为 100，也保留各自的常量。“集中声明一次”针对同一条规则或默认约定，不要求合并所有取值相同的数值或字符串。
 
@@ -183,7 +183,9 @@ Go 按包管理依赖。即使只引用与 Params 放在一起的某个常量，
 
 ```mermaid
 flowchart TD
-    V["validator/v1"] --> C["controller/v1"]
+    V["validator/v1/&lt;controller&gt;"] --> C["controller/v1"]
+    V --> D["dto/v1/&lt;controller&gt;"]
+    C --> D
     V -->|"引用校验相关常量"| S["service"]
     C --> S
     C --> A["internal/composition"]
@@ -292,7 +294,7 @@ func RuneCountAtMost(value string, maximum int) error
      models/
        <entity>.go
        <entity>_validation.go
-     validator/v<version>/
+     validator/v<version>/<controller>/
        <use_case>_validator.go
    ```
 
@@ -360,7 +362,9 @@ func RuneCountAtMost(value string, maximum int) error
 
 **每个用例采用相同的文件结构和入口步骤，单次请求数据独立创建。** 读者应能从入口直接看清默认值、绑定、校验及后续调用的顺序。
 
-1. **一个用例对应一个独立 Validator，文件内部采用固定顺序。** 按结构体、构造函数、请求入口和私有校验函数组织，不把多个用例藏在一个通用入口中分发。以下名称只表示方法结构，不指向具体项目文件。
+1. **Validator 先按版本和 Controller 分组，一个用例对应一个独立文件。** 文件位于 `validator/v<version>/<controller>/<use_case>_validator.go`，对应 DTO 位于 `dto/v<version>/<controller>/<use_case>.go`；每个 Controller 分组分别构成 Go 包，Controller 文件仍放在 `controller/v<version>/`。完整命名和 DTO 共享规则遵守[接口路由与命名规范](api-routing.md)。
+
+   **各 Validator 文件内部采用固定顺序。** 按结构体、构造函数、请求入口和私有校验函数组织，不把多个用例藏在一个通用入口中分发。以下名称只表示方法结构，不指向具体项目文件。
 
    ```text
    <UseCase>Validator 结构体

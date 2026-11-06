@@ -1,5 +1,5 @@
-// Package shared 定义用户 V1 接口复用的数据结构。
-package shared
+// Package userprofile 定义用户 V1 用户资料接口的请求、响应及组内复用结构。
+package userprofile
 
 // UserProfile 表示用户的基本资料及修改资料所需的当前状态、版本。
 type UserProfile struct {

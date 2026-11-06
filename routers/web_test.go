@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/internal/response"
 	"go-service-template/routers"
 
@@ -111,7 +111,7 @@ func TestRecoveryPreservesWrittenResponseAndAbortsHandlers(t *testing.T) {
 func TestSuccessPreservesUserProfileDTO(t *testing.T) {
 	router := routers.New()
 	router.GET("/test/profile-success", func(ctx *gin.Context) {
-		response.Success(ctx, userv1dto.QueryUserProfileByUserIDResponse{
+		response.Success(ctx, userprofiledto.QueryUserProfileByUserIDResponse{
 			UserID:    9223372036854775807,
 			UserName:  "example",
 			IsEnabled: true,

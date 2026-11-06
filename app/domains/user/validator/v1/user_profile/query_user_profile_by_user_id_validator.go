@@ -1,11 +1,11 @@
-package v1
+package userprofile
 
 import (
 	"errors"
 	"log"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/internal/check"
 	"go-service-template/internal/check/scalar"
 	"go-service-template/internal/response"
@@ -27,7 +27,7 @@ func NewQueryUserProfileByUserIDValidator(controller *userv1controller.UserProfi
 
 // QueryUserProfileByUserID 依次绑定、校验请求，全部通过后才调用 Controller。
 func (v *QueryUserProfileByUserIDValidator) QueryUserProfileByUserID(ctx *gin.Context) {
-	var request userv1dto.QueryUserProfileByUserIDRequest
+	var request userprofiledto.QueryUserProfileByUserIDRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
 		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
@@ -51,7 +51,7 @@ func (v *QueryUserProfileByUserIDValidator) QueryUserProfileByUserID(ctx *gin.Co
 // validateQueryUserProfileByUserIDRequest 复用公共检查验证 ID 文本的格式、范围和正数要求。
 // 请求文本保持原值，用户是否存在由 Service 查询时判断。
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
-func validateQueryUserProfileByUserIDRequest(request *userv1dto.QueryUserProfileByUserIDRequest) ([]response.FieldError, error) {
+func validateQueryUserProfileByUserIDRequest(request *userprofiledto.QueryUserProfileByUserIDRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
 	if _, err := scalar.ParsePositiveInt64(request.UserID); err != nil {
 		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {

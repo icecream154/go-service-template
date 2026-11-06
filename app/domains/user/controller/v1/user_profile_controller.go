@@ -5,8 +5,7 @@ import (
 	"errors"
 	"strconv"
 
-	userv1dto "go-service-template/app/domains/user/dto/v1"
-	"go-service-template/app/domains/user/dto/v1/shared"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/internal/check"
@@ -41,7 +40,7 @@ func NewUserProfileController() *UserProfileController {
 // QueryUserProfileByUserID 接收 Validator 已绑定和校验的请求，查询并构造用户资料响应。
 // user_id 的格式及范围已校验，本方法将其十进制文本转换为 Service 使用的内部标识。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
-func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userv1dto.QueryUserProfileByUserIDRequest) {
+func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userprofiledto.QueryUserProfileByUserIDRequest) {
 	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
 	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userservice.QueryUserProfileByUserIDParams{
@@ -52,14 +51,14 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 		return
 	}
 
-	result := userv1dto.QueryUserProfileByUserIDResponse(userProfileDTO(profile))
+	result := userprofiledto.QueryUserProfileByUserIDResponse(userProfileDTO(profile))
 	response.Success(ctx, result)
 }
 
 // CreateUser 使用首次自注册的外部身份创建用户，内部 ID、初始状态和版本由 Service 决定。
 // Request DTO 由领域 Validator 绑定后传入，本方法不再读取或解析 HTTP 请求体。
 // 当前接口不接入外部身份认证，不要求已有 operator_user_id。
-func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.CreateUserRequest) {
+func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
 	profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
 		AccountSource: request.AccountSource, ExternalAccountID: request.ExternalAccountID,
 		UserName: request.UserName, AvatarURL: request.AvatarURL,
@@ -68,14 +67,14 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	result := userv1dto.CreateUserResponse(userProfileDTO(profile))
+	result := userprofiledto.CreateUserResponse(userProfileDTO(profile))
 	response.Success(ctx, result)
 }
 
 // UpdateUserProfile 使用 Validator 已校验的完整资料及版本调用 Service。
 // 更新头像必须是有效的非空地址，以非 nil 指针传入 Service，不表达清空操作。
 // 发起方权限、用户状态和实际版本冲突继续由 Service 判断。
-func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userv1dto.UpdateUserProfileRequest) {
+func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userprofiledto.UpdateUserProfileRequest) {
 	profile, err := composition.Current().UserProfile.UpdateUserProfile(userservice.UpdateUserProfileParams{
 		OperatorUserID: request.OperatorUserID, UserID: request.UserID, ExpectedVersion: *request.ExpectedVersion,
 		UserName: request.UserName, AvatarURL: &request.AvatarURL,
@@ -84,13 +83,13 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	result := userv1dto.UpdateUserProfileResponse(userProfileDTO(profile))
+	result := userprofiledto.UpdateUserProfileResponse(userProfileDTO(profile))
 	response.Success(ctx, result)
 }
 
 // BatchQueryUserProfiles 批量读取明确的一组用户资料，返回已找到的资料和缺失 ID。
 // 数量和 ID 格式由 Validator 校验；Service 对重复 ID 去重并保留首次出现的顺序。
-func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userv1dto.BatchQueryUserProfilesRequest) {
+func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userprofiledto.BatchQueryUserProfilesRequest) {
 	userIDs := make([]int64, 0, len(request.UserIDList))
 	for _, value := range request.UserIDList {
 		// Validator 已确认该文本可表示正 int64，这里只转换 Service 参数。
@@ -108,7 +107,7 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 	for _, userID := range missingIDs {
 		missing = append(missing, strconv.FormatInt(userID, 10))
 	}
-	result := userv1dto.BatchQueryUserProfilesResponse{
+	result := userprofiledto.BatchQueryUserProfilesResponse{
 		UserProfileList: userProfileDTOList(profiles), MissingUserIDList: missing,
 	}
 	response.Success(ctx, result)
@@ -116,7 +115,7 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 
 // QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
 // 默认值和输入校验由 Validator 完成，本方法只映射 Service 参数。
-func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userv1dto.QueryUserProfilePageRequest) {
+func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
 	var isEnabled *bool
 	if request.IsEnabled != nil {
 		value := *request.IsEnabled == "true"
@@ -130,7 +129,7 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	result := userv1dto.QueryUserProfilePageResponse{
+	result := userprofiledto.QueryUserProfilePageResponse{
 		UserProfileList: userProfileDTOList(profiles), PageNumber: request.PageNumber,
 		PageSize: request.PageSize, TotalCount: totalCount,
 	}
@@ -138,16 +137,16 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 }
 
 // userProfileDTO 只选择接口约定的业务字段，保留头像的 nil 与空字符串语义。
-func userProfileDTO(profile *models.UserProfile) shared.UserProfile {
-	return shared.UserProfile{
+func userProfileDTO(profile *models.UserProfile) userprofiledto.UserProfile {
+	return userprofiledto.UserProfile{
 		UserID: profile.ID, UserName: profile.UserName, AvatarURL: profile.AvatarURL,
 		IsEnabled: profile.IsEnabled, Version: profile.Version,
 	}
 }
 
 // userProfileDTOList 始终创建非 nil 切片，确保空结果编码为 []。
-func userProfileDTOList(profiles []*models.UserProfile) []shared.UserProfile {
-	result := make([]shared.UserProfile, 0, len(profiles))
+func userProfileDTOList(profiles []*models.UserProfile) []userprofiledto.UserProfile {
+	result := make([]userprofiledto.UserProfile, 0, len(profiles))
 	for _, profile := range profiles {
 		result = append(result, userProfileDTO(profile))
 	}

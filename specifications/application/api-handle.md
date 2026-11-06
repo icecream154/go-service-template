@@ -74,6 +74,27 @@ MySQL 组件为每个启用的命名连接创建独立连接池，完成连通�
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
+### 2.3 处理链中的文件在哪里
+
+用户资料接口的 Validator 和 DTO 都按“版本 → Controller → 用例”组织，Controller 目录保持按版本划分：
+
+```text
+app/domains/user/
+  controller/v1/
+    user_profile_controller.go
+  validator/v1/user_profile/
+    create_user_validator.go
+    ...其他用例的 Validator 文件
+  dto/v1/user_profile/
+    create_user.go
+    ...其他用例的请求与响应文件
+    user_profile.go
+```
+
+两个 `user_profile` 目录分别是独立的 `userprofile` 包。Router 使用 `userprofilevalidator` 别名导入 Validator 包；Validator 和 Controller 使用 `userprofiledto` 别名导入 DTO 包。每个 DTO 用例文件保留完整的 Request、Response 名称，同一分组共享的 `UserProfile` 结构放在 `user_profile.go`，各用例直接在同包引用。
+
+目前这些 DTO 只在用户资料 Controller 内复用，因此不建立 `dto/v1/shared` 包。将来真正存在跨 Controller 且语义一致的 DTO 时，再按需建立版本内的共享包；具体约定见[接口路由与命名规范](api-routing.md)。
+
 ## 3. 跟随一次 createUser 请求
 
 ### 3.1 客户端发送请求
@@ -121,10 +142,10 @@ Gin 为本次请求准备 `*gin.Context`，其中的 `Request` 提供原始 HTTP
 
 ### 3.3 Validator 创建 DTO，Bind 填充字段
 
-进入 [CreateUserValidator.CreateUser](../../app/domains/user/validator/v1/create_user_validator.go) 后，首先为本次请求创建 DTO：
+进入 [CreateUserValidator.CreateUser](../../app/domains/user/validator/v1/user_profile/create_user_validator.go) 后，首先为本次请求创建 DTO：
 
 ```go
-var request userv1dto.CreateUserRequest
+var request userprofiledto.CreateUserRequest
 if err := commonvalidator.Bind(ctx, &request); err != nil {
     response.Fail(ctx, response.InvalidArgument(err.Error()))
     return
@@ -140,7 +161,7 @@ if err := commonvalidator.Bind(ctx, &request); err != nil {
 
 POST 需要 `Content-Type: application/json`。绑定器不把 Query 和 JSON 合并，也不为每个用例手工解析字段。
 
-[CreateUserRequest](../../app/domains/user/dto/v1/create_user.go) 通过字段及标签描述参数，例如：
+[CreateUserRequest](../../app/domains/user/dto/v1/user_profile/create_user.go) 通过字段及标签描述参数，例如：
 
 ```go
 AccountSource string  `form:"account_source" json:"account_source"`
@@ -189,7 +210,7 @@ v.controller.CreateUser(ctx, &request)
 [UserProfileController.CreateUser](../../app/domains/user/controller/v1/user_profile_controller.go) 接收 `ctx` 和已校验的 DTO：
 
 ```go
-func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.CreateUserRequest) {
+func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
     profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
         AccountSource:     request.AccountSource,
         ExternalAccountID: request.ExternalAccountID,
@@ -200,7 +221,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
         failUserProfileOperation(ctx, err)
         return
     }
-    result := userv1dto.CreateUserResponse(userProfileDTO(profile))
+    result := userprofiledto.CreateUserResponse(userProfileDTO(profile))
     response.Success(ctx, result)
 }
 ```
@@ -246,7 +267,7 @@ Repository 返回原始 GORM 或驱动错误，不在这里决定 HTTP 状态码
 
 创建成功时，Service 使用 `profileModel` 将回填后的表对象转换为 [models.UserProfile](../../app/domains/user/models/user_profile.go)。创建结果来自成功写入的对象，这条成功路径不会再执行一次查询。
 
-Controller 随后调用 `userProfileDTO`，只选择对外公开的字段，构造 `CreateUserResponse`。该响应类型是 [shared.UserProfile](../../app/domains/user/dto/v1/shared/user_profile.go) 的别名，保留了用例专属名称。
+Controller 随后调用 `userProfileDTO`，只选择对外公开的字段，构造 `CreateUserResponse`。该响应类型是同一 DTO 包内 [UserProfile](../../app/domains/user/dto/v1/user_profile/user_profile.go) 的别名，既复用用户资料字段，又保留用例专属名称；Controller 通过 `userprofiledto.UserProfile` 引用这个共享结构。
 
 最后由 [response.Success](../../internal/response/response.go) 完成统一外层包装并写入响应：
 
@@ -362,10 +383,10 @@ HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体
 
 | 接口 | Validator 入口 | 相比创建接口的主要差异 |
 | --- | --- | --- |
-| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/query_user_profile_by_user_id_validator.go) | GET Query 绑定 ID 文本，校验为正 int64；Controller 转为整数，Service 查询，未命中返回领域错误 |
-| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；校验分页范围、昵称和状态文本；仓储执行总数及本页查询 |
-| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组，Controller 转为整数数组；Service 按首次出现顺序去重，返回资料与缺失 ID |
-| `updateUserProfile` | [UpdateUserProfile](../../app/domains/user/validator/v1/update_user_profile_validator.go) | 校验目标、发起方、版本和完整资料；Service 使用显式事务、行锁及版本条件完成更新 |
+| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/user_profile/query_user_profile_by_user_id_validator.go) | GET Query 绑定 ID 文本，校验为正 int64；Controller 转为整数，Service 查询，未命中返回领域错误 |
+| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/user_profile/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；校验分页范围、昵称和状态文本；仓储执行总数及本页查询 |
+| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/user_profile/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组，Controller 转为整数数组；Service 按首次出现顺序去重，返回资料与缺失 ID |
+| `updateUserProfile` | [UpdateUserProfile](../../app/domains/user/validator/v1/user_profile/update_user_profile_validator.go) | 校验目标、发起方、版本和完整资料；Service 使用显式事务、行锁及版本条件完成更新 |
 
 补充阅读时容易混淆的细节：
 
@@ -394,8 +415,8 @@ HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体
 | 3 | [internal/runtime/runtime.go](../../internal/runtime/runtime.go)、[internal/composition/services.go](../../internal/composition/services.go) | DB、Repository、Service 分别在哪里创建与保存 |
 | 4 | [routers/web.go](../../routers/web.go) | Gin、中间件、API 前缀和版本 |
 | 5 | [用户领域 Router](../../app/domains/user/routers/router.go) | 完整路径如何拼接、实际注册哪个 Validator 方法 |
-| 6 | [create_user_validator.go](../../app/domains/user/validator/v1/create_user_validator.go)、[bind.go](../../internal/validator/bind.go) | 请求绑定、字段校验、失败时提前返回 |
-| 7 | [create_user.go](../../app/domains/user/dto/v1/create_user.go) | 请求字段类型及标签、专属响应类型 |
+| 6 | [create_user_validator.go](../../app/domains/user/validator/v1/user_profile/create_user_validator.go)、[bind.go](../../internal/validator/bind.go) | 请求绑定、字段校验、失败时提前返回 |
+| 7 | [create_user.go](../../app/domains/user/dto/v1/user_profile/create_user.go)、[user_profile.go](../../app/domains/user/dto/v1/user_profile/user_profile.go) | 请求字段类型及标签、专属响应类型及同组共享字段 |
 | 8 | [user_profile_controller.go](../../app/domains/user/controller/v1/user_profile_controller.go) | `CreateUser`、`userProfileDTO`、`failUserProfileOperation` |
 | 9 | [user_profile_service.go](../../app/domains/user/service/user_profile_service.go) | 共享仓储查找、发号、创建流程及模型转换 |
 | 10 | [user_profile_repository.go](../../app/domains/user/repository/user_profile_repository.go)、[user_profile.go](../../app/domains/user/tables/user_profile.go) | SQL 的执行入口、表映射及回填 |

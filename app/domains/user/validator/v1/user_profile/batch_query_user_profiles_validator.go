@@ -1,4 +1,4 @@
-package v1
+package userprofile
 
 import (
 	"errors"
@@ -6,7 +6,7 @@ import (
 	"log"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/internal/check"
 	"go-service-template/internal/check/collection"
@@ -31,7 +31,7 @@ func NewBatchQueryUserProfilesValidator(controller *userv1controller.UserProfile
 // BatchQueryUserProfiles 为本次请求创建 DTO，绑定和字段校验通过后才调用 Controller。
 // 重复 ID 的去重、资料排序和缺失目标的解释继续由 Service 处理。
 func (v *BatchQueryUserProfilesValidator) BatchQueryUserProfiles(ctx *gin.Context) {
-	var request userv1dto.BatchQueryUserProfilesRequest
+	var request userprofiledto.BatchQueryUserProfilesRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
 		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
@@ -55,7 +55,7 @@ func (v *BatchQueryUserProfilesValidator) BatchQueryUserProfiles(ctx *gin.Contex
 // validateBatchQueryUserProfilesRequest 先按用例契约检查数量，再复用公共检查验证元素。
 // 数量按去重前计算，不改写输入顺序；列表字段最多返回一条问题。
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
-func validateBatchQueryUserProfilesRequest(request *userv1dto.BatchQueryUserProfilesRequest) ([]response.FieldError, error) {
+func validateBatchQueryUserProfilesRequest(request *userprofiledto.BatchQueryUserProfilesRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
 	if err := collection.SliceLengthInRange(request.UserIDList, userservice.MinUserProfileBatchSize, userservice.MaxUserProfileBatchSize); err != nil {
 		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {

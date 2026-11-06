@@ -1,7 +1,4 @@
-// Package v1 定义用户 V1 接口的请求和响应。
-package v1
-
-import "go-service-template/app/domains/user/dto/v1/shared"
+package userprofile
 
 // QueryUserProfileByUserIDRequest 表示按内部用户 ID 查询用户资料的请求参数。
 type QueryUserProfileByUserIDRequest struct {
@@ -10,5 +7,5 @@ type QueryUserProfileByUserIDRequest struct {
 }
 
 // QueryUserProfileByUserIDResponse 表示查询成功后返回的用户基本资料。
-// 通过类型别名复用 shared.UserProfile，作为统一响应的 data 字段输出。
-type QueryUserProfileByUserIDResponse = shared.UserProfile
+// 通过类型别名复用同包 UserProfile，作为统一响应的 data 字段输出。
+type QueryUserProfileByUserIDResponse = UserProfile

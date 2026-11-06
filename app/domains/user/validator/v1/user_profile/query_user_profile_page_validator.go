@@ -1,4 +1,4 @@
-package v1
+package userprofile
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 	"math"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/internal/check"
@@ -32,7 +32,7 @@ func NewQueryUserProfilePageValidator(controller *userv1controller.UserProfileCo
 // QueryUserProfilePage 依次绑定、校验请求，全部通过后才调用 Controller。
 // 绑定前提供省略参数时的默认页码与每页数量，显式零值仍交给校验函数拒绝。
 func (v *QueryUserProfilePageValidator) QueryUserProfilePage(ctx *gin.Context) {
-	request := userv1dto.QueryUserProfilePageRequest{
+	request := userprofiledto.QueryUserProfilePageRequest{
 		PageNumber: userservice.DefaultUserProfilePageNumber,
 		PageSize:   userservice.DefaultUserProfilePageSize,
 	}
@@ -59,7 +59,7 @@ func (v *QueryUserProfilePageValidator) QueryUserProfilePage(ctx *gin.Context) {
 // validateQueryUserProfilePageRequest 组合用例分页边界、领域昵称规则和接口布尔文本检查。
 // 按字段顺序汇总问题，每个字段最多一条；不改写输入，也不查询业务状态。
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
-func validateQueryUserProfilePageRequest(request *userv1dto.QueryUserProfilePageRequest) ([]response.FieldError, error) {
+func validateQueryUserProfilePageRequest(request *userprofiledto.QueryUserProfilePageRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
 	pageSizeErr := scalar.IntInRange(request.PageSize, userservice.MinUserProfilePageSize, userservice.MaxUserProfilePageSize)
 	if pageSizeErr != nil && (errors.Is(pageSizeErr, check.ErrInvalidRule) || !errors.Is(pageSizeErr, check.ErrInvalidValue)) {

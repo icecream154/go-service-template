@@ -280,13 +280,32 @@ DTO 文件名      = 完整业务用例名转为 snake_case + .go
 1. 动作、业务对象、`List`、`Page`、`batch` 前缀、`By...` 限定等都是完整用例名的一部分。不得在 DTO 名中省略、替换同义词或增添另一套业务限定。
 2. 例如 `queryUserProfileByUserId` 必须使用 `QueryUserProfileByUserIDRequest` 和 `QueryUserProfileByUserIDResponse`，不能改用 `GetUserRequest`、`UserProfileRequest` 或 `QueryUserProfileResponse`。
 3. 不同业务用例必须分别声明自己的请求、响应 DTO 名称，即使当前字段完全相同，也不能共用某个用例的顶层 DTO 名，或共用 `CommonRequest`、`CommonResponse` 代替各自的 DTO。
-4. 共享字段可以通过 `shared` 子结构、组合或指向共享结构的类型别名复用，但必须保留各用例专属的 DTO 声明和名称。“专属”约束顶层声明名和用途，不要求复制相同字段。不能直接以 `shared.UserProfile` 等共享结构名代替用例对应的 Response 名。
+4. 共享字段可以通过同包结构、组合或指向共享结构的类型别名复用，但必须保留各用例专属的 DTO 声明和名称。“专属”约束顶层声明名和用途，不要求复制相同字段。不能直接以 `UserProfile` 等共享结构名代替用例对应的 Response 名。
 5. 没有业务入参或没有业务返回字段时，也声明对应命名的空 Request 或 Response DTO。空 DTO 不改变 GET 参数位置，也不要求增加无意义的请求体或响应字段；GET 的空 Request 不表示客户端需要发送 `{}`。
 6. 业务用例改名时，必须同步修改 Controller 方法、Request、Response、DTO 文件名及相关引用、文档，不能只修改路由末段或其中一个 DTO 名。
 
-请求和响应 DTO 放在对应领域的 `dto/v{主版本号}` 中，语义一致的共享结构放在该版本的 `shared` 中，如 `dto/v1`、`dto/v1/shared`。V2 接口使用 `dto/v2`、`dto/v2/shared`，不复用 V1 目录承载新的版本契约。一个 DTO 文件组织同一用例的请求、响应定义。
+Validator 和 DTO 的目录及包组织遵守以下约定：
 
-Controller 分组用于组织路由，DTO 继续按完整业务用例命名，不额外拼接 `Controller`。不同 Controller 承载的独立业务契约必须使用可区分的用例名称，避免在同一版本的 DTO 目录中产生同名但含义不同的类型。
+1. **先按接口主版本划分，再按 Controller 分组。** Validator 使用 `validator/v<version>/<controller>/`，DTO 使用 `dto/v<version>/<controller>/`。`<controller>` 取 Controller 类型名去掉 `Controller` 后缀，再转换为 snake_case；例如 `UserProfileController` 对应 `user_profile`。Controller 自身仍采用 `controller/v<version>/<controller>_controller.go`，不增加同名目录。
+
+2. **每个用例在所属分组中独立组织文件。** Validator 文件使用 `<use_case>_validator.go`，DTO 文件使用 `<use_case>.go` 并同时组织该用例的请求、响应定义。用例及类型继续使用完整名称，不因已有 Controller 目录而省略业务对象，也不额外拼接 `Controller`。不同 Controller 的独立业务契约仍使用可区分的用例名称。
+
+   ```text
+   app/domains/<domain>/
+     controller/v<version>/
+       <controller>_controller.go
+     validator/v<version>/<controller>/
+       <use_case>_validator.go
+     dto/v<version>/<controller>/
+       <use_case>.go
+       <shared_concept>.go
+   ```
+
+3. **仅在同一 Controller 内复用的 DTO 放在该分组中。** 共享结构按具体业务概念命名文件，例如用户资料分组中的 `dto/v1/user_profile/user_profile.go`。其他用例在同包直接引用 `UserProfile`；不为这类局部复用再建立 `shared` 子包。只有真正跨 Controller 共享且语义一致的结构，才按需放入该版本的 `dto/v<version>/shared/`；共享包不反向导入各 Controller 的 DTO 包，各分组也不互相导入来复用结构。
+
+4. **Controller 分组目录分别构成独立 Go 包。** 例如两个 `user_profile` 目录都声明 `package userprofile`，使用时以 `userprofilevalidator`、`userprofiledto` 等导入别名区分职责。目录分组不是同一个 `v1` 包内的纯文件夹分类；包内标识符只在对应分组包中共享。Validator 和 Controller 可以依赖 DTO，DTO 不反向依赖它们。
+
+5. **不同接口主版本保留独立目录和契约。** V2 使用 `validator/v2/<controller>/`、`dto/v2/<controller>/`；跨 Controller 的共享结构同样按版本组织。不能在 V1 目录中承载 V2 的新契约，也不要求没有跨 Controller 复用需求的版本预先建立 `shared` 包。
 
 领域 Router 在已有版本分组下，依次注册 domain、Controller 和业务用例，不重复拼接 `/api/v1`：
 
@@ -294,11 +313,11 @@ Controller 分组用于组织路由，DTO 继续按完整业务用例命名，�
 func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	user := v1.Group("/user")
 	userProfile := user.Group("/userProfile")
-	userProfile.GET("/queryUserProfileByUserId", r.userProfiles.QueryUserProfileByUserID)
+	userProfile.GET("/queryUserProfileByUserId", r.queryUserProfileByUserIDValidator.QueryUserProfileByUserID)
 }
 ```
 
-Controller 从 Query 参数解析 `user_id`，校验后填充请求 DTO。路由、方法、DTO 的名称对齐要求不扩展为必须将 Repository 的数据库操作名称也改成对外接口名。
+路由进入对应用例的 Validator，绑定 Query 参数到请求 DTO 并校验后，再交给 Controller。路由、方法、DTO 的名称对齐要求不扩展为必须将 Repository 的数据库操作名称也改成对外接口名。
 
 ### 8.1 Request DTO 的标准绑定与输入语义
 

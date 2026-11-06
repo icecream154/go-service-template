@@ -1,4 +1,4 @@
-package v1
+package userprofile
 
 import (
 	"errors"
@@ -6,7 +6,7 @@ import (
 	"log"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
-	userv1dto "go-service-template/app/domains/user/dto/v1"
+	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
 	"go-service-template/internal/check"
@@ -32,7 +32,7 @@ func NewUpdateUserProfileValidator(controller *userv1controller.UserProfileContr
 // UpdateUserProfile 为本次请求创建 DTO，绑定和字段校验通过后才调用 Controller。
 // 本人权限、启用状态和实际资料版本继续由 Service 判断。
 func (v *UpdateUserProfileValidator) UpdateUserProfile(ctx *gin.Context) {
-	var request userv1dto.UpdateUserProfileRequest
+	var request userprofiledto.UpdateUserProfileRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
 		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
@@ -56,7 +56,7 @@ func (v *UpdateUserProfileValidator) UpdateUserProfile(ctx *gin.Context) {
 // validateUpdateUserProfileRequest 组合数值检查、用例版本边界和完整领域字段规则。
 // 按请求字段顺序汇总问题，每个字段最多一条；头像必须是非空的 HTTP/HTTPS 地址。
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
-func validateUpdateUserProfileRequest(request *userv1dto.UpdateUserProfileRequest) ([]response.FieldError, error) {
+func validateUpdateUserProfileRequest(request *userprofiledto.UpdateUserProfileRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
 	if err := scalar.PositiveInt64(request.OperatorUserID); err != nil {
 		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
