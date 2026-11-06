@@ -154,12 +154,12 @@ if err := commonvalidator.Bind(ctx, &request); err != nil {
 
 [internal/validator/bind.go](../../internal/validator/bind.go) 是通用绑定入口：
 
-| HTTP 方法 | 参数来源 | Gin 绑定方法 | DTO 标签 |
+| HTTP 方法 | 参数来源 | 映射实现 | DTO 标签 |
 | --- | --- | --- | --- |
-| GET | Query | `ShouldBindQuery` | `form` |
-| POST | JSON 请求体 | `ShouldBindJSON` | `json` |
+| GET | Query | Gin 的 `binding.MapFormWithTag` | `form` |
+| POST | JSON 请求体 | 标准库的 `json.NewDecoder(...).Decode` | `json` |
 
-POST 需要 `Content-Type: application/json`。绑定器不把 Query 和 JSON 合并，也不为每个用例手工解析字段。
+POST 需要 `Content-Type: application/json`。绑定器不把 Query 和 JSON 合并，也不为每个用例手工解析字段。这两条映射路径都不调用 Gin 的自动校验器，也不修改进程全局的校验器设置。
 
 [CreateUserRequest](../../app/domains/user/dto/v1/user_profile/create_user.go) 通过字段及标签描述参数，例如：
 
@@ -168,9 +168,11 @@ AccountSource string  `form:"account_source" json:"account_source"`
 AvatarURL     *string `form:"avatar_url" json:"avatar_url"`
 ```
 
-Gin 根据标签把 JSON 字段填入 DTO，并完成类型转换。解析或类型转换失败时，Validator 立即返回 HTTP 400，Controller 和 Service 都不会执行。
+GET 映射器或 JSON 解码器根据对应标签填入 DTO，并完成类型转换。JSON 语法错误、输入与字段类型不兼容等属于绑定失败，Validator 入口立即返回 HTTP 400，Controller 和 Service 都不会执行。
 
-绑定只负责把输入变成 Go 数据。字段是否为空、长度是否超限等规则，由下一步的请求校验判断。当前通用绑定使用 Gin 默认 JSON 解码行为；它没有另外实现严格字段检查、请求体大小限制或尾部 JSON 检查。Request DTO 不自定义 `UnmarshalJSON`，相关约束见[请求 DTO 规范](api-routing.md#81-request-dto-的标准绑定与输入语义)。
+绑定只负责把输入变成 Go 数据。Request DTO 禁止使用 `binding` 等自动校验标签，也不自定义 `UnmarshalJSON`；字段是否必填、是否为空、长度或范围是否超限等规则，由下一步的私有校验函数显式判断，可继续调用 `check` 和 models 的规则。相关约束见[请求 DTO 规范](api-routing.md#81-request-dto-的标准绑定与输入语义)。
+
+通用绑定沿用上述映射器、解码器的默认行为，不另外增加未知字段、重复参数、尾部 JSON 或请求体大小的拒绝策略。
 
 ### 3.4 私有校验函数判断输入是否有效
 
@@ -277,6 +279,8 @@ Controller 随后调用 `userProfileDTO`，只选择对外公开的字段，构�
 response.Success(ctx, result)
 ```
 
+公共响应组件先将包含 `data/error` 的完整对象编码成 JSON 字节，再设置状态码、响应头并写入正文。Controller 的调用方式不变；编码失败和写入失败由 response 处理，具体见第 5.3 节。
+
 示例响应如下，用户 ID 仅用于说明结构，实际值由雪花生成器产生：
 
 ```json
@@ -319,7 +323,7 @@ HTTP JSON
 
 | 对象 | 表达什么 | 转换发生在哪里 |
 | --- | --- | --- |
-| Request DTO | 当前接口的输入字段、JSON/Query 格式 | Gin 绑定到 DTO |
+| Request DTO | 当前接口的输入字段、JSON/Query 格式 | 公共 Bind 通过 Query 映射或 JSON 解码填充 |
 | Service Params | 业务用例接受的输入 | Controller 手工映射 |
 | `tables.UserProfile` | 数据库列、GORM 标签、SQL 可空值 | Service 构造，Repository 写入或读取 |
 | `models.UserProfile` | 业务层返回的用户资料 | Service 的 `profileModel` 转换 |
@@ -331,7 +335,7 @@ HTTP JSON
 
 单条查询、创建和更新的 Service 结果就是 `models.UserProfile`，直接返回该模型。批量查询的 `BatchQueryUserProfilesResult` 将 `UserProfiles` 和 `MissingUserIDs` 放在一起；分页查询的 `QueryUserProfilePageResult` 包含 `UserProfiles` 和 `TotalCount`。这两个结构都声明在 Service 对应用例的 Params 下方，Controller 再将它们映射成各自的 Response DTO，HTTP 字段及外层结构保持一致。返回类型和空结果约定见[Service 的输出契约](api-service-validator.md#74-service-的输出契约)。
 
-这些转换只有 HTTP 到 Request DTO 的部分交给 Gin 自动完成。其余映射在 Controller 和 Service 中明确编写，阅读时可以直接跟随字段赋值查看数据去向。
+这些转换只有 HTTP 到 Request DTO 的部分交给公共 Bind 调用标准映射、解码能力完成。其余映射在 Controller 和 Service 中明确编写，阅读时可以直接跟随字段赋值查看数据去向。
 
 ## 5. 失败时，请求在哪里结束
 
@@ -345,6 +349,8 @@ HTTP JSON
 | Service 业务处理 | 更新时实际版本与提交版本不同 | 409、`CONFLICT`、`USER_PROFILE_VERSION_CONFLICT` | Controller 输出错误 |
 | Repository 查询 | 目标资料未找到 | 404、`NOT_FOUND`、`USER_PROFILE_NOT_FOUND` | Service 解释为资料不存在，Controller 分类并输出 |
 | Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出收到的错误文案 |
+| response 编码 | DTO 无法编码为 JSON | 尚未写出时尝试返回默认 500 | response 记录原因并终止后续处理 |
+| response 写入 | 连接错误或正文未完整写入 | 不再追加错误响应 | response 记录原因并终止后续处理 |
 | 请求处理链 | 未处理的 `panic` | 交给公共异常恢复中间件 | 结束当前请求处理链 |
 
 ### 5.1 内部错误如何变成接口错误
@@ -374,9 +380,17 @@ HTTP JSON
 
 ### 5.2 Fail、return 和异常恢复各负责什么
 
-`response.Fail` 调用 `AbortWithStatusJSON`，写出统一错误 JSON，并阻止后续 Gin 处理器执行。**它不会自动结束当前 Go 函数**，调用处仍需紧接 `return`，避免继续访问数据库或重复写出响应。
+`response.Fail` 先中止后续 Gin 处理链，再通过公共输出路径编码、写出统一错误 JSON。**它不会自动结束当前 Go 函数**，调用处仍需紧接 `return`，避免继续访问数据库或重复写出响应。`Success` 作为 Controller 的最后一步调用；正常成功输出不额外中止处理链，遇到输出故障时由 response 中止后续处理。
 
 普通 `error` 通过上述分支显式处理；`panic` 由 `gin.CustomRecovery` 捕获。尚未写出响应时，恢复回调输出统一内部错误；响应头或正文已经写出时，只终止后续处理，不覆盖原状态或追加第二段 JSON。
+
+### 5.3 响应编码和写入失败在哪里处理
+
+1. **编码失败时，由 response 在写出前准备兜底响应。** 例如 DTO 包含 JSON 无法表达的值，完整响应编码会返回错误。response 记录原始原因并中止后续处理链；尚未写出时，尝试返回 HTTP 500 和默认的 `INTERNAL_ERROR`、`internal server error`，不把编码错误作为业务错误交回 Controller，也不递归生成兜底响应。
+
+2. **写入失败时，由 response 记录并停止发送。** 例如用户已经创建成功，但客户端随后关闭连接，正文写入可能失败。组件记录写入错误或短写，不重试、不再追加一份错误 JSON；进入输出入口时如果响应已经写出，同样只记录并终止。服务端写入状态不能证明客户端已完整收到响应。
+
+3. **输出失败不改变已经完成的业务结果。** 编码或写入发生在 Service 返回之后，响应组件不会重新创建用户，也不能据此撤销已经提交的数据库操作。该阶段日志由 response 负责，Controller 无须重复记录；错误处理的完整约定见[接口返回规范第 7 节](api-response.md#7-响应编码与写出失败)。
 
 ## 6. 其余接口如何套用这条链路
 
@@ -399,7 +413,7 @@ HTTP JSON
 
 ## 7. 请求完成与进程退出
 
-正常响应写出后，Controller 和 Validator 依次返回，Gin 的请求日志中间件记录最终状态与耗时，HTTP 服务将响应发送给客户端。共享 Service、Repository 和数据库连接池继续供后续请求使用，不在每个请求结束时关闭。
+正常响应写入 Writer 后，Controller 和 Validator 依次返回，Gin 的请求日志中间件记录最终状态与耗时，HTTP 服务继续完成网络发送；Writer 返回成功不保证客户端已完整收到结果。输出失败由 response 按第 5.3 节处理。共享 Service、Repository 和数据库连接池继续供后续请求使用，不在每个请求结束时关闭。
 
 进程收到退出信号时，由 [main.serve](../../cmd/web/main.go) 调用 `http.Server.Shutdown`，停止接收新连接并等待在途请求。HTTP 收尾后，`run` 的 `defer` 才调用 `Runtime.Close`，由 MySQL Manager 关闭其持有的连接池。
 

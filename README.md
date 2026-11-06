@@ -93,7 +93,7 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 | 用户资料查询执行失败，例如下层返回 `driver: bad connection` | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"driver: bad connection"}}` |
 | 未处理异常 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
-五个接口均使用 Router → 对应用例 Validator → Controller 链路。领域 Validator 为每次请求创建 Request DTO，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数校验。已知字段问题汇总为 `details`，消息使用第一条字段错误的 `Error()`；规则错误和未知失败单独返回 500。校验全部通过后才将 DTO 传给 Controller。通用 `Bind` 使用 Gin 原生绑定：GET 读取 Query，POST 读取 JSON；绑定失败使用其错误文案并终止，不继续检查部分 DTO。完整链路见[接口处理流程](specifications/application/api-handle.md)。
+五个接口均使用 Router → 对应用例 Validator → Controller 链路。领域 Validator 为每次请求创建 Request DTO，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数显式校验，可复用 `check` 和 models 的规则。已知字段问题汇总为 `details`，消息使用第一条字段错误的 `Error()`；规则错误和未知失败单独返回 500。校验全部通过后才将 DTO 传给 Controller。通用 `Bind` 只做映射：GET 使用 Gin 的 `binding.MapFormWithTag` 读取 Query，POST 使用标准库 JSON 解码器读取请求体；不执行自动校验，DTO 禁止使用 `binding` 等校验标签。解析或类型转换失败时使用绑定错误文案并终止，不继续检查部分 DTO。完整链路见[接口处理流程](specifications/application/api-handle.md)。
 
 业务调用链为 Controller → Service → Repository。Controller 的业务入参只有 Request DTO，由其内部构造 Service Params；Validator 已保证成功的纯类型转换可以忽略错误返回值。Service 从仓储取得表结构，再映射为领域实体；单条资料用例直接返回 `models.UserProfile`，批量和分页用例分别返回 `BatchQueryUserProfilesResult`、`QueryUserProfilePageResult`。Controller 根据模型或 Result 构造用例专属响应 DTO，通过 `response.Success` 放入 `data`。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的业务错误；Controller 在自己的文件中选择通用码和可选业务码，直接使用收到的 `err.Error()` 输出。数据库连接、SQL 执行、发号等技术故障由 Service 记录上下文后原样返回，不包装或替换为统一失败错误。
 
