@@ -48,6 +48,7 @@ Repository 返回表结构或 error
 main → run
   → bootstrap.Init
       → env.Init：读取部署环境和区域
+      → 加载 JWT 配置、校验密钥并初始化共享签发与认证组件
       → 取得雪花数据中心编号
       → 加载雪花配置并初始化共享发号器
       → 加载 MySQL 配置
@@ -68,6 +69,7 @@ main → run
 
 | 位置 | 启动时准备的对象 | 请求中如何使用 |
 | --- | --- | --- |
+| [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 通过 `authnjwt.Current()` 获取；目前尚未接入 HTTP 中间件或业务接口 |
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |

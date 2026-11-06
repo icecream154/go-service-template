@@ -6,6 +6,9 @@ import "errors"
 // 各错误彼此独立，ErrExpiredCredential 不自动匹配 ErrInvalidCredential。
 // 本包不声明 HTTP 状态、业务错误码或新的错误包装类型，也不为技术故障另设统一认证失败错误。
 var (
+	// ErrInvalidPrincipal 表示签发方提交的身份不完整，或不在签发组件允许的身份范围内。
+	// 这是签发输入错误，不表示某份外部凭证无效，也不能据此选择未认证响应。
+	ErrInvalidPrincipal = errors.New("authentication principal is invalid")
 	// ErrMissingCredential 表示没有提供凭证：Scheme 和 Value 均为空或仅含空白。
 	// 仅缺少其中一部分属于 ErrInvalidCredential，不能把残缺凭证当作未提供。
 	ErrMissingCredential = errors.New("authentication credential is missing")

@@ -1,18 +1,22 @@
-# 公共身份认证契约
+# 公共身份认证与 JWT 实现
 
 ## 1. 适用范围与文件职责
 
-1. **`internal/authn` 声明公共认证契约，`app/identity` 声明项目采用的命名空间。** `authn` 表示 authentication，即身份认证。公共契约回答“使用什么凭证认证、认证成功得到什么身份、认证失败如何返回”，不绑定某个业务用户模型或具体凭证协议；项目层集中定义身份体系的名称及含义，具体声明与引用方式见第 2.4 节。
+1. **`internal/authn` 声明公共认证契约，JWT 子包提供具体实现，`app/identity` 声明项目命名空间。** `authn` 表示 authentication，即身份认证。公共契约回答“如何签发和验证凭证、认证成功得到什么身份、失败如何返回”，不绑定某个业务用户模型；项目层集中定义身份体系的名称及含义，具体声明与引用方式见第 2.4 节。
 
    | 文件 | 声明内容 | 职责 |
    | --- | --- | --- |
    | [principal.go](../../internal/authn/principal.go) | `PrincipalKind`、身份类别常量、`Principal` | 统一表达认证成功后的调用方身份 |
    | [authenticator.go](../../internal/authn/authenticator.go) | `Credential`、`Authenticator` | 统一认证输入和调用方法 |
-   | [error.go](../../internal/authn/error.go) | 通用认证错误值 | 为明确的凭证失败提供可识别的错误 |
+   | [issuer.go](../../internal/authn/issuer.go) | `IssuedCredential`、`Issuer` | 统一签发输入、凭证结果和有效期信息 |
+   | [error.go](../../internal/authn/error.go) | 通用认证错误值 | 区分签发输入与凭证验证的明确失败 |
+   | [jwt/config.go](../../internal/authn/jwt/config.go) | JWT 配置与加载方法 | 加载指定环境配置，校验字段并读取签名密钥 |
+   | [jwt/provider.go](../../internal/authn/jwt/provider.go) | `Provider` | 使用 HS256 签发和验证 JWT |
+   | [jwt/runtime.go](../../internal/authn/jwt/runtime.go) | `Init`、`Current` | 初始化并访问进程共享的 JWT 实例 |
    | [user_namespace.go](../../app/identity/user_namespace.go) | 项目用户命名空间常量 | 维护用户身份体系的名称、语义与扩展约定 |
-   | [service_namespace.go](../../app/identity/service_namespace.go) | 服务命名空间的声明位置与扩展注释 | 按实际接入需要维护服务身份体系，当前不声明常量 |
+   | [service_namespace.go](../../app/identity/service_namespace.go) | 项目服务命名空间常量 | 维护管理服务等服务身份体系的名称、语义与扩展约定 |
 
-2. **公共包只提供契约，不自动执行认证。** 创建 `Credential`、填写 `Principal` 或声明一个 `Authenticator` 变量，都不会校验凭证、建立可信身份或访问外部依赖。具体认证实现必须履行本文约定；公共结构体没有构造函数或自动校验方法。
+2. **根包类型只表达契约，签发与验证必须显式调用具体实现。** 创建 `Credential`、填写 `Principal` 或声明一个 `Authenticator` 变量，都不会校验凭证、建立可信身份或访问外部依赖。`internal/authn/jwt` 的 `Issue`、`Authenticate` 执行具体签发与验证；导入包或初始化共享实例不会自动让 HTTP 接口启用认证。
 
 3. **公共认证契约与业务模型、传输方式和响应格式独立。** 包不依赖 Gin、业务 domain、Request DTO 或 `response`，不声明业务权限、对外状态码或业务错误码。业务用户资料、组织关系及其他领域数据保留在各自模型中。
 
@@ -45,13 +49,14 @@ type Principal struct {
 
 ### 2.2 身份的确定与使用
 
-1. **完整身份由 `Kind`、`Namespace`、`SubjectID` 共同确定。** 比较身份时必须同时考虑三个字段，不能只比较 `SubjectID`。例如下列结果表示不同的主体；表格用于说明身份语义，项目已声明的命名空间只有 `member`，其他名称不是已登记常量：
+1. **完整身份由 `Kind`、`Namespace`、`SubjectID` 共同确定。** 比较身份时必须同时考虑三个字段，不能只比较 `SubjectID`。例如下列结果表示不同的主体；表格用于说明身份语义，项目已声明的命名空间为 `member` 和 `admin`，其他名称不是已登记常量：
 
    | Kind | Namespace | SubjectID | 含义 |
    | --- | --- | --- | --- |
    | `user` | `member` | `123` | 普通用户体系中的用户 123 |
    | `user` | `staff` | `123` | 员工体系中的员工 123 |
    | `user` | `externalAccounts` | `account-abc` | 已验证的外部账户，不要求已有内部用户 ID |
+   | `service` | `admin` | `adminService` | 管理服务体系中的一个具体服务，主体标识仅为示例 |
    | `service` | `internalServices` | `orderService` | 内部服务体系中的订单服务 |
 
 2. **身份字段按认证实现约定的原文保存，不由公共包自动规范化。** 公共结构不会修剪首尾空白、转换大小写或解析数字。身份比较采用字段的精确值；如果某个身份体系需要规范化，必须由该认证实现按明确规则完成，不能在不同使用位置临时采用不同处理方式。
@@ -81,9 +86,9 @@ type Principal struct {
    | 声明位置 | 常量命名方式 | 必须搭配的 Kind | 已声明内容 |
    | --- | --- | --- | --- |
    | `app/identity/user_namespace.go` | `UserNamespace<身份体系>` | `authn.PrincipalKindUser` | `UserNamespaceMember = "member"` |
-   | `app/identity/service_namespace.go` | `ServiceNamespace<身份体系>` | `authn.PrincipalKindService` | 暂无常量，只有声明位置及扩展约定的注释 |
+   | `app/identity/service_namespace.go` | `ServiceNamespace<身份体系>` | `authn.PrincipalKindService` | `ServiceNamespaceAdmin = "admin"` |
 
-2. **常量名称表达主体类别和具体身份体系，注释说明身份范围。** 使用 Go 导出标识符的命名方式，不使用全大写下划线。`UserNamespaceMember` 表示普通用户账户体系，`member` 不表示会员等级或角色；新增常量时说明其可信身份来源、覆盖的账户或服务范围，以及 `SubjectID` 在该体系中的含义。服务文件在实际身份体系明确后再增加对应常量，不因公共包存在 `PrincipalKindService` 就登记一个空泛的服务命名空间。
+2. **常量名称表达主体类别和具体身份体系，注释说明身份范围。** 使用 Go 导出标识符的命名方式，不使用全大写下划线。`UserNamespaceMember` 表示普通用户账户体系，`member` 不表示会员等级或角色；`ServiceNamespaceAdmin` 表示管理服务身份体系，`admin` 不表示用户的管理员角色。新增常量时说明其可信身份来源、覆盖的账户或服务范围，以及 `SubjectID` 在该体系中的含义。服务文件在实际身份体系明确后再增加对应常量，不因公共包存在 `PrincipalKindService` 就登记一个空泛的服务命名空间。
 
 3. **认证实现与身份使用方引用同一常量，并确认类别与命名空间匹配。** 例如，以下片段只演示如何组合公共类型与项目常量，`verifiedSubjectID` 表示认证过程已经确认的普通用户标识，结构体赋值本身不执行认证：
 
@@ -116,7 +121,9 @@ type Credential struct {
 
 3. **缺少凭证与凭证不完整是不同失败。** `Scheme` 和 `Value` 均为空或仅含空白时，使用 `ErrMissingCredential`；仅有一个字段缺失或为空白，以及凭证不符合对应方案要求时，使用 `ErrInvalidCredential`。已经提供完整输入、但认证实现不支持该方案时，使用 `ErrUnsupportedScheme`。
 
-## 4. Authenticator 的调用契约
+## 4. 认证与签发的调用契约
+
+### 4.1 Authenticator：验证已有凭证
 
 ```go
 type Authenticator interface {
@@ -137,6 +144,26 @@ type Authenticator interface {
 
 5. **身份类别与凭证方案分别判断。** 同一种令牌方案可以表示用户，也可以表示服务。认证实现必须依据经过验证的信息及可信配置生成 `Kind`、`Namespace` 和 `SubjectID`，不能仅按凭证名称或未经验证的身份声明决定结果。
 
+### 4.2 Issuer：为可信身份签发凭证
+
+```go
+type IssuedCredential struct {
+    Credential Credential
+    IssuedAt   time.Time
+    ExpiresAt  time.Time
+}
+
+type Issuer interface {
+    Issue(ctx context.Context, principal Principal) (IssuedCredential, error)
+}
+```
+
+1. **签发者接收由可信调用流程确定的身份，不自行证明身份来源。** 调用方必须先确认有权为该主体签发凭证，再调用 `Issue`。主体格式及允许组合的检查不能代替业务授权；不能把未经验证的外部请求字段直接作为签发身份。
+
+2. **签发成功同时返回凭证及其签发、失效时间。** `Credential` 保存方案与凭证正文，`IssuedAt`、`ExpiresAt` 与凭证内的时间一致。签发失败返回零值 `IssuedCredential` 和非 nil 错误，不交付部分签名结果；签发输入无效使用 `ErrInvalidPrincipal`，取消和技术故障保留实际错误。
+
+3. **签发和认证共用 Context 与并发使用约定。** 调用方传入非 nil Context；执行过程应响应取消，失败后不返回可用结果。实现可以共享只读配置和密钥，单次身份及凭证使用局部变量。
+
 ## 5. 通用认证错误
 
 ### 5.1 错误的声明与含义
@@ -149,12 +176,15 @@ type Authenticator interface {
    | `ErrUnsupportedScheme` | `authentication scheme is not supported` | 完整凭证使用了当前认证实现不支持的方案 |
    | `ErrInvalidCredential` | `authentication credential is invalid` | 凭证不完整、格式或验证结果无效，或已确认被撤销 |
    | `ErrExpiredCredential` | `authentication credential has expired` | 已确认凭证真实性，并确定其有效期已经结束 |
+   | `ErrInvalidPrincipal` | `authentication principal is invalid` | 签发调用传入不完整或不受支持的身份 |
 
 2. **凭证过期必须是经过验证后的判断。** 不能只解码出一个过去的时间，就返回 `ErrExpiredCredential`；未通过真实性验证的输入仍属于无效凭证。无法区分具体凭证失败原因时，可以返回 `ErrInvalidCredential`，但技术故障不属于此范围。
 
+3. **签发身份无效与接收到的凭证无效分别表达。** `ErrInvalidPrincipal` 用于 `Issue` 拒绝调用方给出的身份，不表示客户端持有一份无效凭证。认证时发现凭证中的身份不符合要求，返回 `ErrInvalidCredential`，不使用签发输入错误。
+
 ### 5.2 错误的识别与传递
 
-1. **调用方使用 `errors.Is` 识别错误，不比较错误文案。** 四个错误是彼此独立的值，没有父子分类关系。例如：
+1. **调用方使用 `errors.Is` 识别错误，不比较错误文案。** 上述错误是彼此独立的值，没有父子分类关系。例如：
 
    ```go
    errors.Is(authn.ErrExpiredCredential, authn.ErrExpiredCredential) // true
@@ -166,3 +196,75 @@ type Authenticator interface {
 2. **认证实现只把能够确认的凭证失败映射为通用认证错误。** 具体凭证验证组件明确报告签名不匹配、已撤销或过期时，可以按照其含义返回对应错误值。无法确认是凭证问题时，不替换成 `ErrInvalidCredential`，也不通过重新创建相同文案的 `errors.New` 值模拟已有错误。
 
 3. **技术故障和 Context 错误原样返回。** 网络、数据库、配置或其他执行故障，以及取消和截止时间错误，保留收到的原错误。不得为了统一认证失败而将其替换成四个凭证错误之一，也不得在失败后返回零值身份和 `nil`。公共包不负责重试、记录日志或决定错误的对外表现。
+
+## 6. HS256 JWT 实现
+
+### 6.1 组件职责与依赖
+
+1. **`jwt.Provider` 同时实现 `authn.Issuer` 和 `authn.Authenticator`。** 组件使用 [`github.com/golang-jwt/jwt/v5` v5.3.1](https://pkg.go.dev/github.com/golang-jwt/jwt/v5@v5.3.1) 执行 JWT 签名与解析，算法固定为 HS256，不接受凭证自行选择其他算法。它不依赖 Gin、业务模型或 `app/identity`，不从数据库查询用户或服务状态。
+
+2. **允许的身份组合由应用装配传入。** `New(config, allowedNamespaces)` 的第二个参数为 `map[authn.PrincipalKind][]string`，明确每种主体类别允许使用哪些命名空间。构造时校验并复制这份配置；空允许集合、未知主体大类或无效命名空间不能创建组件。命名空间必须为非空白的有效 UTF-8 文本，按原文精确匹配。组件保存的配置和密钥不随调用方修改输入集合而改变。
+
+3. **签名保证凭证完整性，不对正文加密。** 凭证只保存身份及验证必需的信息，不放入密码、密钥或其他敏感业务字段。HS256 使用共享密钥，持有该密钥的一方同时具有签发能力；普通调用方只持有签发后的凭证，不持有服务端密钥。
+
+### 6.2 配置文件与字段
+
+1. **每个部署环境只读取自己的 JWT 配置文件。** 配置位于 `config/authn/jwt/dev.yml`、`test.yml`、`prod.yml`。`LoadConfig` 接收该叶子目录及 `dev`、`test` 或 `prod`，文件缺失不回退到其他环境；拒绝空文档、多文档、未知或重复字段及不符合约定的字段类型。
+
+   ```yaml
+   issuer: go-service-template/dev
+   audience: go-service-template
+   signing_key_env: JWT_SIGNING_KEY
+   token_ttl: 1h
+   ```
+
+   | 字段 | 含义及约束 |
+   | --- | --- |
+   | `issuer` | 本组件认可的签发方，非空白且不带首尾空白；不同环境模板分别使用对应环境后缀 |
+   | `audience` | 凭证适用的接收方，非空白且不带首尾空白；验证时必须匹配 |
+   | `signing_key_env` | 保存签名密钥的环境变量名，不是密钥正文；名称匹配 `[A-Za-z_][A-Za-z0-9_]*` |
+   | `token_ttl` | 新凭证有效期，使用 `1h` 等 Go 时长文本，至少 1 秒且必须是整秒 |
+
+2. **配置模板的 `1h` 是显式配置值，不是缺失时的回退值。** 四个字段都必须提供。`LoadConfig` 读取并校验配置字段，不读取密钥；`New` 或 `Init` 构造实例时才读取指定环境变量，密钥不保存到导出的 `Config` 中。
+
+3. **签名密钥从部署环境注入，不提供默认密钥。** `JWT_SIGNING_KEY` 的内容为标准 Base64 编码，解码后至少 32 字节，应由安全随机源生成；缺失、空值、非法 Base64、包含空白或长度不足均使初始化失败。长度检查不证明密钥具有足够随机性，不能用人工口令代替随机密钥。HS256 的密钥长度要求见 [RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518.html#section-3.2)。
+
+4. **同一部署的实例共享并持久保存密钥，不同环境使用独立密钥。** 服务重启时重新读取部署注入的既有密钥，不自动生成新密钥。替换密钥并重启后，使用旧密钥签发的凭证无法通过新实例验证；本组件不提供多密钥轮换或在线重载。配置和初始化错误仅说明字段、阶段或变量名，不回显密钥值。
+
+### 6.3 启动初始化与访问
+
+1. **`bootstrap.Init` 在数据库创建前完成 JWT 配置加载和初始化。** 启动层按已确定的环境读取 JWT 配置，通过 `authnjwt.Init` 发布共享实例。装配层使用项目常量传入 `user/member`、`service/admin` 两个允许组合，公共 JWT 包不写死这些业务命名空间。配置或密钥不合法时，错误向上传递，应用停止启动并且不监听 HTTP。
+
+2. **`Init` 只允许成功初始化一次，`Current` 返回已经发布的实例。** 初始化失败不发布部分实例，成功初始化后再次调用 `Init` 返回错误并保留原实例。初始化必须早于业务并发调用；成功后使用 `authnjwt.Current()` 获取同一个只读配置的 Provider。初始化前调用 `Current` 会 panic，表示调用顺序错误；也可以通过 `New` 单独构造不影响共享实例的 Provider。组件不持有连接或后台任务，无须增加停机关闭步骤。
+
+3. **组件初始化不等于接口认证已启用。** 此阶段提供可被调用的签发与验证组件，不注册 HTTP 认证中间件，不修改业务接口，也不自动调用 `Issue`。各领域的接口权限仍由领域专属规范维护，不能因为 Provider 已创建就认为接口已经受到保护。
+
+### 6.4 签发与验证过程
+
+1. **签发将可信身份和固定验证参数写入凭证。** `Issue` 先检查 Context 以及身份类别、命名空间、主体标识；主体标识必须为非空白的有效 UTF-8 文本，保留原文，不自动修剪。随后产生 UTC 秒级的签发与到期时间，凭证包含 `kind`、`namespace`、`sub`、`iss`、`aud`、`iat`、`nbf`、`exp`。`sub` 对应 `SubjectID`，`nbf` 与签发时间一致，`exp` 按 `token_ttl` 计算；签名算法为 HS256，头部 `typ` 为 `JWT`，返回方案为 `Bearer`。
+
+2. **认证先验证凭证，再返回身份。** `Authenticate` 接受大小写不敏感的 `Bearer` 方案，但不修剪方案或凭证正文。它检查固定算法、签名、`typ`、签发方、接收方、必填时间字段、有效期和完整身份；要求 `iat <= nbf < exp`，不接纳未来签发或尚未生效的凭证，不提供过期宽限。验证以已签名的 `exp` 为准，不用当前 `token_ttl` 重新计算已有凭证的期限。身份组合必须在构造时传入的允许集合中，成功后才返回 `Principal`。
+
+3. **过期错误只用于其他验证均已通过的凭证。** 签名错误、签发方或接收方不符、身份组合无效等情况使用 `ErrInvalidCredential`，即使同时过期也不降为单纯过期。单纯过期使用 `ErrExpiredCredential`；凭证缺失、残缺、方案不支持分别遵守第 3、5 节约定。Context 取消保持其原始错误，任何失败均返回零值结果，不输出部分身份或凭证。
+
+4. **Provider 可由多个调用并发复用。** 每次操作单独创建声明和结果，构造后不更改密钥、配置或允许集合。签发和认证检查调用方 Context 的取消；本地密码运算不是可抢占的任务，不通过另起后台任务来模拟取消。
+
+### 6.5 调用方式与能力边界
+
+1. **调用方通过公共接口使用同一个 Provider。** 以下片段中，`authnjwt` 是 `go-service-template/internal/authn/jwt` 的导入别名，`principal` 已由可信流程确定；必须先处理错误再使用结果，不记录凭证正文：
+
+   ```go
+   provider := authnjwt.Current()
+   issued, err := provider.Issue(ctx, principal)
+   if err != nil {
+       return err
+   }
+
+   verified, err := provider.Authenticate(ctx, issued.Credential)
+   if err != nil {
+       return err
+   }
+   // verified 是已通过本组件验证的身份，后续业务仍需执行自己的授权规则。
+   ```
+
+2. **凭证有效不代表主体的实时业务状态或操作权限已通过。** 本组件不检查用户是否停用、服务是否被移出管理名单或某个对象是否属于调用方；这些判断不能由验签结果代替。它也不提供凭证刷新、丢失恢复或单个凭证撤销机制，不能将重复注册或自行提交一个主体 ID 当作重新签发凭证的依据。
