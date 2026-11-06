@@ -3,7 +3,6 @@ package v1
 import (
 	"fmt"
 
-	userapierror "go-service-template/app/domains/user/apierror"
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/app/domains/user/models"
@@ -62,12 +61,18 @@ func validateUpdateUserProfileRequest(request *userv1dto.UpdateUserProfileReques
 	}
 
 	if err := models.ValidateUserName(request.UserName); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "username",
+			Reason: err.Error(),
+		})
 	}
 
 	// 更新接口要求有效头像，缺失、null 和空字符串都由有值规则拒绝。
 	if err := models.ValidateAvatarURL(request.AvatarURL); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "avatar_url",
+			Reason: err.Error(),
+		})
 	}
 	return details
 }

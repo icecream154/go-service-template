@@ -2,7 +2,6 @@
 package v1
 
 import (
-	userapierror "go-service-template/app/domains/user/apierror"
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/app/domains/user/models"
@@ -43,13 +42,22 @@ func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
 func validateCreateUserRequest(request *userv1dto.CreateUserRequest) []response.FieldError {
 	details := make([]response.FieldError, 0, 4)
 	if err := models.ValidateAccountSource(request.AccountSource); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "account_source",
+			Reason: err.Error(),
+		})
 	}
 	if err := models.ValidateExternalAccountID(request.ExternalAccountID); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "external_account_id",
+			Reason: err.Error(),
+		})
 	}
 	if err := models.ValidateUserName(request.UserName); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "user_name",
+			Reason: err.Error(),
+		})
 	}
 
 	// 头像可省略或为 null，显式空字符串也保留原有语义。
@@ -57,7 +65,10 @@ func validateCreateUserRequest(request *userv1dto.CreateUserRequest) []response.
 		return details
 	}
 	if err := models.ValidateAvatarURL(*request.AvatarURL); err != nil {
-		details = append(details, userapierror.FieldValidationDetail(err))
+		details = append(details, response.FieldError{
+			Field:  "avatar_url",
+			Reason: err.Error(),
+		})
 	}
 	return details
 }

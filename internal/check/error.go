@@ -43,8 +43,17 @@ func (e *Violation) Error() string {
 // 即使外层再包装 IndexError、KeyError，errors.Is 仍能沿错误链识别这个类别。
 func (e *Violation) Is(target error) bool { return e != nil && target == ErrInvalidValue }
 
-// RuleError 携带规则定义或参数错误，应在装配规则时修正，不归因于待检查数据。
-// 它与 Violation 使用相同的字段结构，但表达不同的失败类别。
+// RuleError 表示调用检查函数时提供的检查条件本身无效。
+// 以 scalar.IntInRange(value, minimum, maximum) 为例：
+//
+//	scalar.IntInRange(20, 1, 10) // 返回 Violation：范围有效，但数据 20 超出 1～10。
+//	scalar.IntInRange(5, 10, 1)  // 返回 RuleError：下限 10 大于上限 1，检查条件不成立。
+//
+// 第二种情况下，无论用户传入什么数值都无法满足条件，需要开发者修正代码或配置，
+// 用户修改请求不能解决。检查函数通过返回 error 报告此问题，不因此触发 panic。
+// 若在请求处理阶段遇到，应按内部错误处理，不能转换为用户字段校验失败；
+// 来自配置的检查条件应在启动装配时验证，发现无效条件就拒绝启动。
+// RuleError 与 Violation 使用相同的字段结构，但表达不同的失败类别。
 type RuleError struct {
 	// Rule 标识哪条基础检查规则的定义无效，不是对外错误码。
 	Rule string

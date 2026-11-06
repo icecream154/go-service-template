@@ -67,6 +67,10 @@ type FieldError struct {
 	Reason string `json:"reason"`
 }
 
+func (err FieldError) Error() string {
+	return err.Field + ": " + err.Reason
+}
+
 // InvalidArgument 绑定 HTTP 400 和参数错误码；空白文案使用默认说明。
 func InvalidArgument(message string, details ...FieldError) ErrorInfo {
 	failure := newErrorInfo(CodeInvalidArgument, message)

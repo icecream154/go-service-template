@@ -41,7 +41,8 @@ func validateQueryUserProfileByUserIDRequest(request *userv1dto.QueryUserProfile
 	details := make([]response.FieldError, 0, 1)
 	if _, err := scalar.ParsePositiveInt64(request.UserID); err != nil {
 		details = append(details, response.FieldError{
-			Field: "user_id", Reason: "must be a positive 64-bit integer",
+			Field:  "user_id",
+			Reason: "must be a positive 64-bit integer",
 		})
 	}
 	return details

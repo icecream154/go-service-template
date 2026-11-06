@@ -55,7 +55,10 @@ func validateBatchQueryUserProfilesRequest(request *userv1dto.BatchQueryUserProf
 		_, err := scalar.ParsePositiveInt64(value)
 		return err
 	}); err != nil {
-		details = append(details, response.FieldError{Field: "user_id_list", Reason: "each item must be a positive 64-bit integer string"})
+		details = append(details, response.FieldError{
+			Field:  "user_id_list",
+			Reason: "each item must be a positive 64-bit integer string",
+		})
 	}
 	return details
 }

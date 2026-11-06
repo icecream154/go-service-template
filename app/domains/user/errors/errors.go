@@ -17,18 +17,3 @@ var (
 	// ErrUserProfilePermissionDenied 表示发起方不允许修改目标用户的资料。
 	ErrUserProfilePermissionDenied = errors.New("user profile operation is not permitted")
 )
-
-// InvalidArgumentError 表示业务用例收到的某个参数不符合约束。
-// Field 和 Reason 描述可公开的参数问题，不包含数据库错误或其他内部详情。
-// 它只表达内部校验结果，HTTP 类别和字段明细由接口适配层转换。
-type InvalidArgumentError struct {
-	// Field 是不合法的参数名称。
-	Field string
-	// Reason 说明该参数违反的约束。
-	Reason string
-}
-
-// Error 返回内部参数校验说明；接口适配层通过 errors.As 读取字段，不比较此文案。
-func (err *InvalidArgumentError) Error() string {
-	return err.Field + ": " + err.Reason
-}

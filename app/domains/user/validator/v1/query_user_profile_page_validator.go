@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 
-	userapierror "go-service-template/app/domains/user/apierror"
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/app/domains/user/models"
@@ -64,12 +63,18 @@ func validateQueryUserProfilePageRequest(request *userv1dto.QueryUserProfilePage
 	}
 	if request.UserName != "" {
 		if err := models.ValidateUserName(request.UserName); err != nil {
-			details = append(details, userapierror.FieldValidationDetail(err))
+			details = append(details, response.FieldError{
+				Field:  "username",
+				Reason: err.Error(),
+			})
 		}
 	}
 	if request.IsEnabled != nil {
 		if _, err := scalar.ParseBoolText(*request.IsEnabled); err != nil {
-			details = append(details, response.FieldError{Field: "is_enabled", Reason: "must be true or false"})
+			details = append(details, response.FieldError{
+				Field:  "is_enabled",
+				Reason: "must be true or false",
+			})
 		}
 	}
 	return details
