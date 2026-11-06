@@ -12,12 +12,42 @@
    | `ErrorInfo`、`FieldError`、`BusinessErrorCode` 类型 | `internal/response/error.go` | 接口层构造，公共响应组件输出；`BusinessErrorCode` 类型不包含各业务码的声明 |
    | 具体 `BusinessErrorCode` 常量 | 对应的 `controller/v<version>/<object>_controller.go` 顶部 | 由该 Controller 声明自己使用的业务码，并在本文件维护映射 |
    | `Violation`、`RuleError`、`IndexError`、`KeyError` | `internal/check/error.go` | 各公共检查方法返回，调用方识别其含义 |
-   | 领域规则自己定义的错误 | 所属 `models/<entity>_validation.go`，与规则放在一起 | models 返回，Validator 或 Service 使用；已有公共检查错误可以直接复用 |
+   | models 本层的命名错误值 | 所属 `models/<entity>_validation.go`，与规则放在一起 | 只用 `errors.New` 声明本层独立判断产生的错误；下层错误原样返回 |
    | 接口专属校验问题 | 对应的 `validator/v<version>/<use_case>_validator.go` | Validator 直接构造 `FieldError`，无须额外声明一套 Validator 错误类型 |
-   | Service 自己定义的错误值或错误类型 | 对应的 `service/<object>_service.go` 顶部 | Service 返回，Controller 通过 `errors.Is`、`errors.As` 识别 |
+   | Service 本层的命名错误值 | 对应的 `service/<object>_service.go` 顶部 | 只用 `errors.New` 声明本层独立判断产生的错误；下层错误原样返回 |
    | 接收到的错误与两个错误码的对应关系 | 对应的 Controller 文件内部 | Controller 的私有映射函数集中处理，包括 Service 返回的错误 |
 
 3. **正常失败通过返回值传递，不使用 `panic`。** 文中的“返回错误”指返回 Go `error` 或已经构造好的字段明细。成功返回 `nil`；`panic` 只由框架异常恢复流程兜底，不作为参数错误和业务失败的传递方式。
+
+### 1.1 Service 与 models 的错误声明和返回约束
+
+1. **Service 和 models 均禁止声明新的 error 类型。** 不新增实现 `error` 的结构体、别名类型或错误包装类型，不自行实现 `Error()`、`Unwrap()`、`Is()` 等错误方法。本层需要声明错误时，只使用标准库 `errors.New` 创建命名错误值。
+
+2. **“错误常量”使用包级 `var` 声明，初始化后不重新赋值。** Go 的 `const` 不能保存 `errors.New` 的结果。这里的“常量”表示供各调用点引用的固定错误值，实际写法如下；同一个错误只声明一次，不在每次失败时重新创建。
+
+   ```go
+   // ErrRecordNotEditable 表示本层判断资料当前不允许编辑。
+   var ErrRecordNotEditable = errors.New("record is not editable")
+   ```
+
+3. **本层错误只表达本层独立判断出的失败，不依赖下层错误。** 例如，下层成功返回资料且没有错误，Service 根据资料状态判断当前不允许编辑，可以返回 `ErrRecordNotEditable`。models 自己检查实体字段关系或状态时，也可以返回本层声明的错误。不能根据下层 `err` 的类型、内容或分类，换成另一个本层错误。
+
+4. **下层只要返回非 `nil` 错误，Service 和 models 就原样返回该错误值。** 该约束覆盖公共检查、models、Repository、数据库驱动、发号器等下层调用，不因错误属于参数问题、业务失败或执行故障而例外。
+
+   ```go
+   if err := models.ValidateRecordName(params.Name); err != nil {
+       return err
+   }
+
+   record, err := repository.GetRecord(params.RecordID)
+   if err != nil {
+       return nil, err
+   }
+   ```
+
+5. **原样返回不允许增加包装、复制消息或替换错误。** 禁止使用 `fmt.Errorf` 的 `%w` 或 `%v` 包装下层错误，禁止 `errors.Join`、`errors.New(err.Error())`，也禁止将下层错误替换成本层已声明的错误。需要记录操作上下文时可以写入日志，随后仍返回原来的 `err`；不能以补充字段名、转换业务含义或准备响应文案为由改变错误。
+
+6. **公共检查和下层组件已有的错误类型保持原有归属。** `check` 的四种错误类型由公共包维护，Service 和 models 接收后直接传递；本节不要求修改这些公共类型。Controller、Validator 识别接收到的错误，再完成各自负责的响应处理。
 
 ## 2. 接口错误结构与字段来源
 
@@ -83,9 +113,9 @@ func (err FieldError) Error() string {
 
 ### 2.3 错误文案的责任
 
-1. **错误产生或返回的位置负责提供完整、可公开的 `Error()` 文案。** 文案使用非空白英文，说明失败原因；错误类别由类型或标识决定，不能依赖文案比较。因为接口层直接使用 `Error()`，文案变更也会影响实际接口输出。
+1. **本层自行声明的错误在声明处确定文案。** Service 和 models 使用 `errors.New` 提供非空白英文说明，错误类别由错误值或已有类型决定，不能依赖文案比较。因为接口层直接使用 `Error()`，文案变更也会影响实际接口输出。
 
-2. **不适合公开的底层原因在返回到接口层之前处理。** 例如，Service 捕获数据库执行错误后，可以记录原始原因，返回本 Service 声明的 `ErrRecordQueryFailed`，其文案为 `failed to query record`。Controller 只映射错误码并使用这个错误的 `Error()`，不承担再次替换文案的职责。需要保留错误链时，可以由具体错误类型保存原因并实现 `Unwrap()`，其 `Error()` 仍提供适合公开的说明。
+2. **下层错误的文案随原错误传递，Service 和 models 不重新准备。** 例如，数据库查询返回 `err` 时，Service 可以记录操作上下文，但仍返回同一个 `err`，不能改成 `ErrRecordQueryFailed` 或其他固定说明。Controller 接收这个错误，选择错误码并直接使用其 `Error()`；不在中间层设置“记录后替换”的例外。
 
 3. **Validator 可以在构造字段明细时准备接口需要的说明。** `Reason` 可以直接使用底层 `err.Error()`，也可以在该 Validator 中组织更明确的字段说明。一旦构造成 `FieldError` 并返回，后续输出环节不再加工其内容。
 
@@ -136,7 +166,7 @@ func (err FieldError) Error() string {
 
 2. **接口自己的校验逻辑发现输入不符合要求时，直接生成字段明细。** 例如结束时间早于开始时间，可以在 Validator 中构造 `FieldError{Field: "end_time", Reason: "must not be earlier than start_time"}`。这里不需要先创建一个普通 `error`，再把同一段说明转换为字段明细。
 
-3. **调用 models 的领域规则得到输入违规时，采用同样的构造方式。** models 可以直接返回公共检查错误，也可以返回自己定义的领域规则错误。Validator 识别其含义后，用当前请求字段名构造明细；`Reason` 直接取 `err.Error()`，或由 Validator 按接口需要组织。领域包装中包含 `RuleError` 或无法识别的原因时，不构造参数明细，按内部错误处理。
+3. **调用 models 的领域规则得到输入违规时，采用同样的构造方式。** models 原样返回下层错误；没有下层错误、由本层独立判断失败时，返回本层通过 `errors.New` 声明的错误值。Validator 识别其含义后，用当前请求字段名构造明细；`Reason` 直接取 `err.Error()`，或由 Validator 按接口需要组织。接收到 `RuleError` 或无法识别的错误时，不构造参数明细，按内部错误处理。
 
 ### 4.2 字段明细的准备与传递
 
@@ -189,20 +219,22 @@ func (err FieldError) Error() string {
 
    ```go
    // errors: shared
-   var ErrRecordNotFound = errors.New("record not found")
+   var ErrRecordDisabled = errors.New("record is disabled")
 
    // errors: CreateRecord
-   var ErrRecordAlreadyExists = errors.New("record already exists")
+   var ErrRecordLimitReached = errors.New("record limit reached")
 
    // errors: UpdateRecord
    var ErrRecordVersionConflict = errors.New("record version conflict")
    ```
 
-2. **固定失败原因使用命名错误值，需要携带信息时再定义错误类型。** 命名错误值使用 `Err<对象><原因>`，结构化类型使用 `<对象><原因>Error`。Controller 需要识别的声明使用导出名称；名称包含所属业务对象，避免同一个 Service 包中不同文件重名。结构化错误的声明及 `Error()`、必要的 `Is()` 或 `Unwrap()` 方法放在对应错误区域。
+   上述错误均来自本层对成功取得的数据所做的判断：资料已停用、已有资料数量达到业务限制、提交版本与实际版本不一致。下层若已返回错误，就直接返回下层错误，不改成这些错误值。
 
-3. **顶部只收纳本 Service 拥有的错误定义。** 不在这里重新声明 `check` 的四种类型，也不复制 models 已有的领域错误。Service 可以直接返回下层错误，或者在需要表达用例含义时转换为本 Service 的错误；不要求每经过一层就换一种包装。
+2. **所有自有错误都使用 `errors.New` 声明，不定义错误类型。** 名称使用 `Err<对象><原因>`。Controller 需要识别的声明使用导出名称；名称包含所属业务对象，避免同一个 Service 包中不同文件重名。声明方式及禁止事项遵守第 1.1 节。
 
-4. **错误声明说明产生条件和文案含义。** 各用例方法的注释说明可能返回的 Service 错误，以及可能直接传递的公共检查或领域规则错误。Controller 引用这些声明进行映射，不比较 `Error()` 字符串。
+3. **顶部只收纳本 Service 独立产生的错误值。** 不重新声明 `check` 的四种类型，不复制 models 或其他下层已有的错误，也不为下层故障增加一个同义的 Service 错误。下层返回的错误一律原样返回。
+
+4. **错误声明说明产生条件和文案含义。** 各用例方法的注释说明可能返回的 Service 错误，以及调用链可能返回的下层错误；下层错误必须原样传递。Controller 引用相应声明进行映射，不比较 `Error()` 字符串。
 
 ### 5.2 按用例组织文件
 
@@ -246,7 +278,7 @@ func (err FieldError) Error() string {
 
 1. **Service 独立保障自己的输入和业务条件。** Params 校验可以复用 `check` 和 models；依赖数据库状态、操作权限或并发条件的判断由用例组织。Validator 已校验过 HTTP 输入，不代表其他入口也已校验。
 
-2. **Service 返回错误时确定其语义和文案。** 例如查询无结果可以转换为本 Service 的 `ErrRecordNotFound`，明确识别的唯一约束冲突可以转换为 `ErrRecordAlreadyExists`。其他错误保持真实类别，不能为了获得某个 HTTP 状态而伪装成参数错误或业务冲突。
+2. **Service 区分下层返回错误和本层业务判断失败。** 下层查询返回未命中错误、唯一约束错误或连接错误时，均直接返回原始 `err`；不转换成 `ErrRecordNotFound`、`ErrRecordAlreadyExists` 或执行失败错误。在没有下层错误的前提下，本层独立检查输入、数据或状态发现不满足要求时，才返回本层声明的命名错误。
 
 3. **Service 不决定接口错误码，也不构造 HTTP 字段明细。** Service 不依赖 `response`、Controller、Validator 或 Request DTO。HTTP `Code`、`BusinessCode` 由 Controller 选择；没有既有响应明细时 `Details` 为空，Controller 不在收到 Service 错误后重新执行字段校验来补齐它。
 
@@ -258,8 +290,8 @@ func (err FieldError) Error() string {
 
    ```go
    const (
-       codeRecordNotFound        response.BusinessErrorCode = "CATALOG_RECORD_NOT_FOUND"
-       codeRecordAlreadyExists  response.BusinessErrorCode = "CATALOG_RECORD_ALREADY_EXISTS"
+       codeRecordDisabled        response.BusinessErrorCode = "CATALOG_RECORD_DISABLED"
+       codeRecordLimitReached    response.BusinessErrorCode = "CATALOG_RECORD_LIMIT_REACHED"
        codeRecordVersionConflict response.BusinessErrorCode = "CATALOG_RECORD_VERSION_CONFLICT"
    )
    ```
@@ -267,6 +299,8 @@ func (err FieldError) Error() string {
    以上是通用示例，不规定任何具体领域必须提供这些业务码。常量属于所在 Go 包，文件本身不构成可见性边界。
 
 2. **同一 Controller 的全部错误分类集中在本文件的私有映射函数中。** 映射覆盖该 Controller 接收的 Service 错误、需要识别的领域错误及公共检查错误。Controller 的各个处理方法复用该函数，不分别编写同义映射，也不另建领域 `apierror` 包保存本 Controller 的业务码和映射。
+
+3. **下层错误由 Controller 直接识别，不要求 Service 预先转换。** 例如，Controller 可以识别仓储或驱动提供的明确未命中错误，选择 `NOT_FOUND`；具体业务码取决于当前用例能否确定其业务含义。唯一约束错误必须确认具体约束，不能把所有重复键都映射为同一个对象已存在。无法确定含义时按内部错误处理，不比较错误消息来猜测原因。
 
 ### 6.2 映射与响应装配
 
@@ -278,10 +312,10 @@ func (err FieldError) Error() string {
        switch {
        case errors.Is(err, check.ErrInvalidRule):
            return response.CodeInternalError, ""
-       case errors.Is(err, recordservice.ErrRecordNotFound):
-           return response.CodeNotFound, codeRecordNotFound
-       case errors.Is(err, recordservice.ErrRecordAlreadyExists):
-           return response.CodeConflict, codeRecordAlreadyExists
+       case errors.Is(err, recordservice.ErrRecordDisabled):
+           return response.CodeConflict, codeRecordDisabled
+       case errors.Is(err, recordservice.ErrRecordLimitReached):
+           return response.CodeConflict, codeRecordLimitReached
        case errors.Is(err, recordservice.ErrRecordVersionConflict):
            return response.CodeConflict, codeRecordVersionConflict
        case errors.Is(err, check.ErrInvalidValue):
@@ -321,7 +355,7 @@ func (err FieldError) Error() string {
      → response 输出 HTTP 400
    ```
 
-2. **业务用例失败时，由 Controller 选择错误码并输出。** Service 返回自己声明的错误或允许直接传递的下层错误；Controller 识别原因，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
+2. **业务用例失败时，由 Controller 选择错误码并输出。** Service 对所有下层错误均原样返回；本层独立判断失败时返回自己声明的命名错误。Controller 识别原因，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
 
    ```text
    Service 校验 Params 或执行用例

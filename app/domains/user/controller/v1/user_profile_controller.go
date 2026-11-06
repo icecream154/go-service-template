@@ -2,18 +2,31 @@
 package v1
 
 import (
-	"log"
+	"errors"
 	"strconv"
 
-	userapierror "go-service-template/app/domains/user/apierror"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/app/domains/user/dto/v1/shared"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
+	"go-service-template/internal/check"
 	"go-service-template/internal/composition"
 	"go-service-template/internal/response"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	// codeUserProfileNotFound 表示目标资料不存在，固定归属 NOT_FOUND。
+	codeUserProfileNotFound response.BusinessErrorCode = "USER_PROFILE_NOT_FOUND"
+	// codeUserProfileAccountAlreadyExists 表示注册账户已存在，固定归属 CONFLICT。
+	codeUserProfileAccountAlreadyExists response.BusinessErrorCode = "USER_ACCOUNT_ALREADY_EXISTS"
+	// codeUserProfileDisabled 表示停用用户不能修改资料，固定归属 CONFLICT。
+	codeUserProfileDisabled response.BusinessErrorCode = "USER_DISABLED"
+	// codeUserProfileVersionConflict 表示资料版本已过期，固定归属 CONFLICT。
+	codeUserProfileVersionConflict response.BusinessErrorCode = "USER_PROFILE_VERSION_CONFLICT"
+	// codeUserProfilePermissionDenied 表示无权修改目标资料，固定归属 PERMISSION_DENIED。
+	codeUserProfilePermissionDenied response.BusinessErrorCode = "USER_PROFILE_PERMISSION_DENIED"
 )
 
 // UserProfileController 处理用户资料请求，并将领域模型转换为响应 DTO。
@@ -31,9 +44,11 @@ func NewUserProfileController() *UserProfileController {
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userv1dto.QueryUserProfileByUserIDRequest) {
 	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
-	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userID)
+	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userservice.QueryUserProfileByUserIDParams{
+		UserID: userID,
+	})
 	if err != nil {
-		failUserProfileOperation(ctx, "Query user profile", err)
+		failUserProfileOperation(ctx, err)
 		return
 	}
 
@@ -50,7 +65,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
 		UserName: request.UserName, AvatarURL: request.AvatarURL,
 	})
 	if err != nil {
-		failUserProfileOperation(ctx, "Create user", err)
+		failUserProfileOperation(ctx, err)
 		return
 	}
 	result := userv1dto.CreateUserResponse(userProfileDTO(profile))
@@ -66,7 +81,7 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 		UserName: request.UserName, AvatarURL: &request.AvatarURL,
 	})
 	if err != nil {
-		failUserProfileOperation(ctx, "Update user profile", err)
+		failUserProfileOperation(ctx, err)
 		return
 	}
 	result := userv1dto.UpdateUserProfileResponse(userProfileDTO(profile))
@@ -82,9 +97,11 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 		userID, _ := strconv.ParseInt(value, 10, 64)
 		userIDs = append(userIDs, userID)
 	}
-	profiles, missingIDs, err := composition.Current().UserProfile.BatchQueryUserProfiles(userIDs)
+	profiles, missingIDs, err := composition.Current().UserProfile.BatchQueryUserProfiles(userservice.BatchQueryUserProfilesParams{
+		UserIDs: userIDs,
+	})
 	if err != nil {
-		failUserProfileOperation(ctx, "Batch query user profiles", err)
+		failUserProfileOperation(ctx, err)
 		return
 	}
 	missing := make([]string, 0, len(missingIDs))
@@ -110,7 +127,7 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 		UserName: request.UserName, IsEnabled: isEnabled,
 	})
 	if err != nil {
-		failUserProfileOperation(ctx, "Query user profile page", err)
+		failUserProfileOperation(ctx, err)
 		return
 	}
 	result := userv1dto.QueryUserProfilePageResponse{
@@ -137,11 +154,34 @@ func userProfileDTOList(profiles []*models.UserProfile) []shared.UserProfile {
 	return result
 }
 
-// failUserProfileOperation 复用领域接口映射，只将未预期错误的原始详情写入服务端日志。
-func failUserProfileOperation(ctx *gin.Context, operation string, err error) {
-	failure := userapierror.FromError(err)
-	if failure.Code == response.CodeInternalError {
-		log.Printf("%s failed: error=%v", operation, err)
+// mapUserProfileErrorCodes 集中选择本 Controller 的通用码和业务码，不修改错误文案。
+// Service 的执行故障已记录原始原因并转换为命名错误，由默认分支归为内部错误。
+func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessErrorCode) {
+	switch {
+	case errors.Is(err, check.ErrInvalidRule):
+		return response.CodeInternalError, ""
+	case errors.Is(err, userservice.ErrUserProfileNotFound):
+		return response.CodeNotFound, codeUserProfileNotFound
+	case errors.Is(err, userservice.ErrAccountAlreadyExists):
+		return response.CodeConflict, codeUserProfileAccountAlreadyExists
+	case errors.Is(err, userservice.ErrUserDisabled):
+		return response.CodeConflict, codeUserProfileDisabled
+	case errors.Is(err, userservice.ErrUserProfileVersionConflict):
+		return response.CodeConflict, codeUserProfileVersionConflict
+	case errors.Is(err, userservice.ErrUserProfilePermissionDenied):
+		return response.CodePermissionDenied, codeUserProfilePermissionDenied
+	case errors.Is(err, check.ErrInvalidValue):
+		return response.CodeInvalidArgument, ""
+	default:
+		return response.CodeInternalError, ""
 	}
-	response.Fail(ctx, failure)
+}
+
+// failUserProfileOperation 原样采用 Service 错误的 Error()，不补造字段明细。
+// Service 已在故障发生处记录原始原因，这里只分类并输出响应。
+func failUserProfileOperation(ctx *gin.Context, err error) {
+	code, businessCode := mapUserProfileErrorCodes(err)
+	response.Fail(ctx, response.ErrorInfo{
+		Code: code, BusinessCode: businessCode, Message: err.Error(),
+	})
 }

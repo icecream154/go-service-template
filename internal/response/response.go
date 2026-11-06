@@ -22,12 +22,12 @@ func Success[T any](ctx *gin.Context, data T) {
 
 // Fail 输出结构化错误并终止后续 Gin 处理链；调用方仍须 return 结束当前函数。
 // 通用类别必须已登记，HTTP 状态码由类别的固定映射决定。
-// 无效错误定义及内部错误统一输出固定内容，不暴露原文案、业务码或详情。
+// 合法错误对象的消息、业务码和字段明细原样输出，包括 INTERNAL_ERROR。
+// 未登记的类别或空白必填内容属于无效错误定义，使用框架默认内部错误兜底。
 func Fail(ctx *gin.Context, failure ErrorInfo) {
 	definition, valid := failure.Code.definition()
 	if !valid || strings.TrimSpace(failure.Message) == "" ||
-		(failure.BusinessCode != "" && strings.TrimSpace(string(failure.BusinessCode)) == "") ||
-		failure.Code == CodeInternalError {
+		(failure.BusinessCode != "" && strings.TrimSpace(string(failure.BusinessCode)) == "") {
 		failure = InternalError()
 		definition, _ = failure.Code.definition()
 	}

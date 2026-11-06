@@ -23,14 +23,14 @@ const (
 	// CodeRateLimited 表示请求超过允许的频率或额度，对应 HTTP 429。
 	CodeRateLimited ErrorCode = "RATE_LIMITED"
 	// CodeInternalError 表示未预期的内部错误或未处理异常，对应 HTTP 500。
-	// 对外仅返回固定文案，原始错误详情由调用方记录到服务端日志。
+	// 消息由错误产生处提供；本组件不因选择该类别而替换消息或字段明细。
 	CodeInternalError ErrorCode = "INTERNAL_ERROR"
 	// CodeServiceUnavailable 表示服务暂时无法处理请求，例如临时过载或依赖不可用，对应 HTTP 503。
 	CodeServiceUnavailable ErrorCode = "SERVICE_UNAVAILABLE"
 )
 
 // BusinessErrorCode 表示对外公开的具体业务失败原因，可不提供。
-// 业务码及其通用类别归属由各领域的接口适配层集中维护，本组件不声明业务码。
+// 具体业务码及其通用类别归属由对应 Controller 在自身文件内维护，本组件只声明类型。
 type BusinessErrorCode string
 
 // ErrorInfo 是对外错误结构，不直接序列化内部 error 或数据库驱动错误。
@@ -41,21 +41,21 @@ type ErrorInfo struct {
 	Code ErrorCode `json:"code"`
 
 	// BusinessCode 可选，表示该类别下需要对外区分的具体业务失败原因，空值时省略。
-	// 与 Code 的通用分类不同，业务码及其归属由所属领域的接口适配层集中定义。
+	// 与 Code 的通用分类不同，具体业务码及映射由所属 Controller 集中定义。
 	// 同一业务码固定归属一个 Code，不要求与内部领域 error 一一对应。
 	BusinessCode BusinessErrorCode `json:"business_code,omitempty"`
 
 	// Message 必填，使用非空白英文说明失败原因，供人阅读，不作为程序判断错误的依据。
-	// 内部错误统一使用固定文案，不包含底层错误或其他内部信息。
+	// 接口层直接采用接收到的 err.Error()，包括内部错误；错误产生处负责提供可公开文案。
 	Message string `json:"message"`
 
 	// Details 可选，提供请求参数校验的字段明细，包括参数名和违反的约束。
-	// 没有明细时省略；内部错误不输出该字段。
+	// 直接采用 Validator 等发生处已构造的明细，不修改字段、原因或顺序；没有明细时省略。
 	Details []FieldError `json:"details,omitempty"`
 }
 
 // WithBusinessCode 返回附带业务码的错误副本，不修改原错误定义。
-// 调用方应复用领域接口适配层的映射，保证同一业务码始终归属同一通用类别。
+// Controller 通过自身映射保证同一业务码始终归属同一通用类别。
 func (failure ErrorInfo) WithBusinessCode(code BusinessErrorCode) ErrorInfo {
 	failure.BusinessCode = code
 	return failure
@@ -63,10 +63,13 @@ func (failure ErrorInfo) WithBusinessCode(code BusinessErrorCode) ErrorInfo {
 
 // FieldError 定位请求中的一个校验问题，Reason 为可对外展示的原因。
 type FieldError struct {
-	Field  string `json:"field"`
+	// Field 是实际请求字段或接口约定的字段路径，由 Validator 确定。
+	Field string `json:"field"`
+	// Reason 是已准备好的失败说明，可直接采用底层 Error() 或由 Validator 组织。
 	Reason string `json:"reason"`
 }
 
+// Error 返回字段及其失败说明，可作为字段校验失败响应的 Message。
 func (err FieldError) Error() string {
 	return err.Field + ": " + err.Reason
 }
@@ -103,7 +106,8 @@ func RateLimited(message string) ErrorInfo {
 	return newErrorInfo(CodeRateLimited, message)
 }
 
-// InternalError 仅返回固定安全文案，原始原因由调用方记录到服务端日志。
+// InternalError 构造框架兜底使用的默认内部错误，原始原因由调用方记录到服务端日志。
+// 已有具体错误时，接口层可以直接构造 CodeInternalError 并采用该错误的 Error()。
 func InternalError() ErrorInfo {
 	return newErrorInfo(CodeInternalError, "")
 }

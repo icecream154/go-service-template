@@ -126,7 +126,7 @@ Gin 为本次请求准备 `*gin.Context`，其中的 `Request` 提供原始 HTTP
 ```go
 var request userv1dto.CreateUserRequest
 if err := commonvalidator.Bind(ctx, &request); err != nil {
-    response.Fail(ctx, response.InvalidArgument(""))
+    response.Fail(ctx, response.InvalidArgument(err.Error()))
     return
 }
 ```
@@ -162,13 +162,21 @@ Gin 根据标签把 JSON 字段填入 DTO，并完成类型转换。解析或类
 | `user_name` | 非空白、合法 UTF-8，最多 64 个 Unicode 码点 |
 | `avatar_url` | 创建时可省略、为 `null` 或空字符串；非空时须为有效 HTTP/HTTPS 地址，最多 512 个 Unicode 码点 |
 
-校验针对绑定后的字段，不改变原值，也不查询数据库。领域规则返回带内部字段标识的 `FieldValidationError`，由 [FieldValidationDetail](../../app/domains/user/apierror/field_validation.go) 映射为 HTTP 字段名和公开原因。问题按字段顺序汇总为 `[]response.FieldError`，每个字段最多一条。
+校验针对绑定后的字段，不改变原值，也不查询数据库。领域规则直接返回公共检查错误，Validator 确认属于输入违规后，使用当前请求字段名和错误的 `Error()` 构造 `response.FieldError`。问题按字段顺序汇总，每个字段最多一条。`RuleError` 或无法识别的错误通过第二个返回值交给入口处理，不混入参数明细。
 
 入口方法根据校验结果决定是否继续：
 
 ```go
-if details := validateCreateUserRequest(&request); len(details) > 0 {
-    response.Fail(ctx, response.InvalidArgument("", details...))
+details, err := validateCreateUserRequest(&request)
+if err != nil {
+    log.Printf("Validate CreateUser request failed: error=%v", err)
+    response.Fail(ctx, response.ErrorInfo{
+        Code: response.CodeInternalError, Message: err.Error(),
+    })
+    return
+}
+if len(details) > 0 {
+    response.Fail(ctx, response.InvalidArgument(details[0].Error(), details...))
     return
 }
 v.controller.CreateUser(ctx, &request)
@@ -189,7 +197,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
         AvatarURL:         request.AvatarURL,
     })
     if err != nil {
-        failUserProfileOperation(ctx, "Create user", err)
+        failUserProfileOperation(ctx, err)
         return
     }
     result := userv1dto.CreateUserResponse(userProfileDTO(profile))
@@ -197,15 +205,15 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userv1dto.
 }
 ```
 
-Controller 将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_params.go)，然后调用启动时已经创建的 Service。成功时转换结果，失败时通过 `failUserProfileOperation` 映射错误。
+Controller 将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_service.go)，然后调用启动时已经创建的 Service。成功时转换结果，失败时通过本文件的 `mapUserProfileErrorCodes` 选择通用码和业务码，由 `failUserProfileOperation` 使用错误的 `Error()` 输出响应。
 
 这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责输入映射和后续响应转换。
 
 ### 3.6 Service 决定如何创建用户
 
-[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用现有的私有 `validateCreateUser`。这些 Service 输入检查位于 [user_profile_validation.go](../../app/domains/user/service/user_profile_validation.go)，用于保障非 HTTP 调用也遵守输入约束。
+[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、参数校验和处理方法；跨用例复用的实现放在文件尾部的 `shared` 区域。
 
-Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值集中声明在 [Service Params](../../app/domains/user/service/user_profile_params.go)，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
+Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值声明在 [Service 文件](../../app/domains/user/service/user_profile_service.go) 各用例的 Params 旁，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
 
 输入通过后，Service 从 `appruntime.Current().Repositories.UserProfile` 取得共享仓储，并执行创建流程：
 
@@ -309,19 +317,19 @@ HTTP JSON
 | 通用绑定 | JSON 格式错误、字段类型不匹配 | 400、`INVALID_ARGUMENT` | 不进入 Controller |
 | 请求字段校验 | 昵称为空、字段超长 | 400、`INVALID_ARGUMENT`、字段明细 | 不进入 Controller |
 | Service 业务处理 | 账户身份已存在 | 409、`CONFLICT`、`USER_ACCOUNT_ALREADY_EXISTS` | Controller 输出错误 |
-| Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 输出固定内部错误 |
+| Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出 Service 准备的错误文案 |
 | 请求处理链 | 未处理的 `panic` | 交给公共异常恢复中间件 | 结束当前请求处理链 |
 
 ### 5.1 内部错误如何变成接口错误
 
-Service 返回 Go 的 `error`，内部可识别的领域错误定义在 [user/errors](../../app/domains/user/errors/errors.go)。Controller 的 `failUserProfileOperation` 调用 [apierror.FromError](../../app/domains/user/apierror/mapper.go)，将它映射成对外 `ErrorInfo`。
+Service 返回 Go 的 `error`，自身的业务错误及内部执行故障类型定义在 [Service 文件顶部](../../app/domains/user/service/user_profile_service.go)。[Controller](../../app/domains/user/controller/v1/user_profile_controller.go) 在文件顶部声明业务码，`mapUserProfileErrorCodes` 只选择通用码和业务码，`failUserProfileOperation` 直接使用收到的 `err.Error()` 构造 `ErrorInfo`，不重新组织文案或补造字段明细。
 
 例如，创建时发生唯一键冲突，Service 会先区分冲突原因：
 
 1. 识别 GORM 重复键错误或 MySQL 1062。
 2. 按账户来源和外部标识复查。
 3. 确认该账户已存在，才转换为 `ErrAccountAlreadyExists`。
-4. `apierror.FromError` 将其映射为 `CONFLICT` 和 `USER_ACCOUNT_ALREADY_EXISTS`。
+4. Controller 的 `mapUserProfileErrorCodes` 将其映射为 `CONFLICT` 和 `USER_ACCOUNT_ALREADY_EXISTS`。
 
 主键冲突等内部异常不能一概归类为“账户已存在”。内部领域错误与对外业务错误码分别维护，也不要求一一对应。
 
@@ -340,7 +348,7 @@ Service 返回 Go 的 `error`，内部可识别的领域错误定义在 [user/er
 
 HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体业务原因；通用类别与 HTTP 状态码的映射由 [internal/response/error.go](../../internal/response/error.go) 统一维护。
 
-未知内部错误的原始原因写入服务端日志；对外固定为 HTTP 500、`INTERNAL_ERROR` 和 `internal server error`，不附带内部业务码或详情。
+数据库、发号等执行故障由 Service 在故障出口记录原始错误，再返回文件顶部声明的命名错误。例如创建失败返回 `ErrUserCreateFailed`，其文案为 `failed to create user`。Controller 将这类失败映射为 HTTP 500、`INTERNAL_ERROR`，响应消息直接采用该错误的 `Error()`，不解包原因或重复记录日志。框架异常恢复仍使用默认的 `internal server error`。完整约定见[错误声明、传递与响应规范](api-error.md)。
 
 ### 5.2 Fail、return 和异常恢复各负责什么
 
@@ -391,6 +399,6 @@ HTTP 状态码为 409。`code` 表达通用类别，`business_code` 表达具体
 | 8 | [user_profile_controller.go](../../app/domains/user/controller/v1/user_profile_controller.go) | `CreateUser`、`userProfileDTO`、`failUserProfileOperation` |
 | 9 | [user_profile_service.go](../../app/domains/user/service/user_profile_service.go) | 共享仓储查找、发号、创建流程及模型转换 |
 | 10 | [user_profile_repository.go](../../app/domains/user/repository/user_profile_repository.go)、[user_profile.go](../../app/domains/user/tables/user_profile.go) | SQL 的执行入口、表映射及回填 |
-| 11 | [apierror/mapper.go](../../app/domains/user/apierror/mapper.go)、[response.go](../../internal/response/response.go) | 内部错误如何映射，最终 JSON 如何写出 |
+| 11 | [Controller 错误映射](../../app/domains/user/controller/v1/user_profile_controller.go)、[response.go](../../internal/response/response.go) | `mapUserProfileErrorCodes` 如何分类，最终 JSON 如何写出 |
 
 沿这个顺序阅读，可以把一个请求的入口、数据形态、业务执行、数据库访问和最终响应对应到具体方法，而无需先遍历整个项目。

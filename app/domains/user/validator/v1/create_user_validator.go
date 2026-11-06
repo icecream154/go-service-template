@@ -2,9 +2,13 @@
 package v1
 
 import (
+	"errors"
+	"log"
+
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	"go-service-template/app/domains/user/models"
+	"go-service-template/internal/check"
 	"go-service-template/internal/response"
 	commonvalidator "go-service-template/internal/validator"
 
@@ -27,11 +31,20 @@ func NewCreateUserValidator(controller *userv1controller.UserProfileController) 
 func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
 	var request userv1dto.CreateUserRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
-		response.Fail(ctx, response.InvalidArgument(""))
+		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
 	}
-	if details := validateCreateUserRequest(&request); len(details) > 0 {
-		response.Fail(ctx, response.InvalidArgument("", details...))
+	details, err := validateCreateUserRequest(&request)
+	if err != nil {
+		log.Printf("Validate CreateUser request failed: error=%v", err)
+		response.Fail(ctx, response.ErrorInfo{
+			Code:    response.CodeInternalError,
+			Message: err.Error(),
+		})
+		return
+	}
+	if len(details) > 0 {
+		response.Fail(ctx, response.InvalidArgument(details[0].Error(), details...))
 		return
 	}
 	v.controller.CreateUser(ctx, &request)
@@ -39,21 +52,31 @@ func (v *CreateUserValidator) CreateUser(ctx *gin.Context) {
 
 // validateCreateUserRequest 校验绑定后的创建用户字段，不改写 DTO 或访问业务状态。
 // 按请求字段顺序组合领域规则，每个字段最多返回一条问题。
-func validateCreateUserRequest(request *userv1dto.CreateUserRequest) []response.FieldError {
-	details := make([]response.FieldError, 0, 4)
+// 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
+func validateCreateUserRequest(request *userv1dto.CreateUserRequest) ([]response.FieldError, error) {
+	var details []response.FieldError
 	if err := models.ValidateAccountSource(request.AccountSource); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "account_source",
 			Reason: err.Error(),
 		})
 	}
 	if err := models.ValidateExternalAccountID(request.ExternalAccountID); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "external_account_id",
 			Reason: err.Error(),
 		})
 	}
 	if err := models.ValidateUserName(request.UserName); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "user_name",
 			Reason: err.Error(),
@@ -62,13 +85,16 @@ func validateCreateUserRequest(request *userv1dto.CreateUserRequest) []response.
 
 	// 头像可省略或为 null，显式空字符串也保留原有语义。
 	if request.AvatarURL == nil || *request.AvatarURL == "" {
-		return details
+		return details, nil
 	}
 	if err := models.ValidateAvatarURL(*request.AvatarURL); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "avatar_url",
 			Reason: err.Error(),
 		})
 	}
-	return details
+	return details, nil
 }

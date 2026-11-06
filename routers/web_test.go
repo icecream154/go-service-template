@@ -35,7 +35,7 @@ func TestUserProfileQueryRejectsInvalidUserID(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, userProfileQueryPath+test.query, nil))
-			failure := assertFailure(t, recorder, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid request parameters")
+			failure := assertFailure(t, recorder, http.StatusBadRequest, "INVALID_ARGUMENT", "user_id: must be a positive 64-bit integer")
 			var details []response.FieldError
 			if err := json.Unmarshal(failure["details"], &details); err != nil {
 				t.Fatalf("decode field details: %v", err)

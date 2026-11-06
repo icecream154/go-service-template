@@ -1,11 +1,14 @@
 package v1
 
 import (
+	"errors"
 	"fmt"
+	"log"
 
 	userv1controller "go-service-template/app/domains/user/controller/v1"
 	userv1dto "go-service-template/app/domains/user/dto/v1"
 	userservice "go-service-template/app/domains/user/service"
+	"go-service-template/internal/check"
 	"go-service-template/internal/check/collection"
 	"go-service-template/internal/check/scalar"
 	"go-service-template/internal/response"
@@ -30,11 +33,20 @@ func NewBatchQueryUserProfilesValidator(controller *userv1controller.UserProfile
 func (v *BatchQueryUserProfilesValidator) BatchQueryUserProfiles(ctx *gin.Context) {
 	var request userv1dto.BatchQueryUserProfilesRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
-		response.Fail(ctx, response.InvalidArgument(""))
+		response.Fail(ctx, response.InvalidArgument(err.Error()))
 		return
 	}
-	if details := validateBatchQueryUserProfilesRequest(&request); len(details) > 0 {
-		response.Fail(ctx, response.InvalidArgument("", details...))
+	details, err := validateBatchQueryUserProfilesRequest(&request)
+	if err != nil {
+		log.Printf("Validate BatchQueryUserProfiles request failed: error=%v", err)
+		response.Fail(ctx, response.ErrorInfo{
+			Code:    response.CodeInternalError,
+			Message: err.Error(),
+		})
+		return
+	}
+	if len(details) > 0 {
+		response.Fail(ctx, response.InvalidArgument(details[0].Error(), details...))
 		return
 	}
 	v.controller.BatchQueryUserProfiles(ctx, &request)
@@ -42,23 +54,30 @@ func (v *BatchQueryUserProfilesValidator) BatchQueryUserProfiles(ctx *gin.Contex
 
 // validateBatchQueryUserProfilesRequest 先按用例契约检查数量，再复用公共检查验证元素。
 // 数量按去重前计算，不改写输入顺序；列表字段最多返回一条问题。
-func validateBatchQueryUserProfilesRequest(request *userv1dto.BatchQueryUserProfilesRequest) []response.FieldError {
-	details := make([]response.FieldError, 0, 1)
+// 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
+func validateBatchQueryUserProfilesRequest(request *userv1dto.BatchQueryUserProfilesRequest) ([]response.FieldError, error) {
+	var details []response.FieldError
 	if err := collection.SliceLengthInRange(request.UserIDList, userservice.MinUserProfileBatchSize, userservice.MaxUserProfileBatchSize); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "user_id_list",
 			Reason: fmt.Sprintf("must contain between %d and %d user IDs", userservice.MinUserProfileBatchSize, userservice.MaxUserProfileBatchSize),
 		})
-		return details
+		return details, nil
 	}
 	if err := collection.Each(request.UserIDList, func(value string) error {
 		_, err := scalar.ParsePositiveInt64(value)
 		return err
 	}); err != nil {
+		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
+			return nil, err
+		}
 		details = append(details, response.FieldError{
 			Field:  "user_id_list",
 			Reason: "each item must be a positive 64-bit integer string",
 		})
 	}
-	return details
+	return details, nil
 }
