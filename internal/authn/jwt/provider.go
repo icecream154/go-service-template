@@ -43,7 +43,7 @@ var (
 	_ authn.Authenticator = (*Provider)(nil)
 )
 
-// New 校验配置、读取签名密钥并复制允许的身份范围，构造独立的 JWT 签发与认证组件。
+// New 校验配置、解码配置中的签名密钥并复制允许的身份范围，构造独立的 JWT 签发与认证组件。
 // allowedNamespaces 由应用装配层提供，只接受 user、service 及其非空命名空间列表。
 // 框架不引用具体业务枚举；调用方后续修改传入的 map 或 slice 不影响本组件。
 func New(config Config, allowedNamespaces map[authn.PrincipalKind][]string) (*Provider, error) {
@@ -68,7 +68,7 @@ func New(config Config, allowedNamespaces map[authn.PrincipalKind][]string) (*Pr
 			scopes[identityScope{kind: kind, namespace: namespace}] = struct{}{}
 		}
 	}
-	key, err := config.loadSigningKey()
+	key, err := config.decodeSigningKey()
 	if err != nil {
 		return nil, err
 	}

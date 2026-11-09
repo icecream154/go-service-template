@@ -15,7 +15,7 @@ var shared struct {
 
 // Init 创建并发布一次默认 JWT 组件，由启动装配层在监听请求前调用。
 // 配置、密钥或允许的身份组合无效时返回错误，不发布部分组件；重复初始化不会替换原实例。
-// 修改环境变量不会改变已发布的密钥，不支持运行中重载，也不自动签发任何凭证。
+// 修改配置文件或传入的 Config 不会改变已发布的密钥，不支持运行中重载，也不自动签发凭证。
 func Init(config Config, allowedNamespaces map[authn.PrincipalKind][]string) error {
 	shared.Lock()
 	defer shared.Unlock()

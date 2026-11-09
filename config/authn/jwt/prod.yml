@@ -1,8 +1,8 @@
-# 本文件只保存环境变量名，不保存密钥原文；签名算法固定为 HS256。
-# JWT_SIGNING_KEY 必须由部署环境注入：至少 32 字节安全随机数据的标准 Base64 文本。
+# signing_key 直接保存签名密钥的标准 Base64 文本，解码后至少 32 字节；算法固定为 HS256。
+# 密钥在准备配置时生成并保存，程序启动不读取密钥环境变量，也不自动生成或替换密钥。
 # 同一部署的实例应共享持久保存的密钥，不在每次启动时重新生成；不同环境使用不同密钥。
 # 修改配置或密钥后重新启动生效；替换密钥会使旧密钥签发的凭证无法通过验证。
 issuer: go-service-template/prod
 audience: go-service-template
-signing_key_env: JWT_SIGNING_KEY
+signing_key: "KW6y5Q6JpNZa06apf98pzA7NoCPou8Kx13s2RNAMR+I="
 token_ttl: 24h

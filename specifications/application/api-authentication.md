@@ -10,7 +10,7 @@
    | [authenticator.go](../../internal/authn/authenticator.go) | `Credential`、`Authenticator` | 统一认证输入和调用方法 |
    | [issuer.go](../../internal/authn/issuer.go) | `IssuedCredential`、`Issuer` | 统一签发输入、凭证结果和有效期信息 |
    | [error.go](../../internal/authn/error.go) | 通用认证错误值 | 区分签发输入与凭证验证的明确失败 |
-   | [jwt/config.go](../../internal/authn/jwt/config.go) | JWT 配置与加载方法 | 加载指定环境配置，校验字段并读取签名密钥 |
+   | [jwt/config.go](../../internal/authn/jwt/config.go) | JWT 配置与加载方法 | 加载指定环境配置，校验字段及直接配置的签名密钥 |
    | [jwt/provider.go](../../internal/authn/jwt/provider.go) | `Provider` | 使用 HS256 签发和验证 JWT |
    | [jwt/runtime.go](../../internal/authn/jwt/runtime.go) | `Init`、`Current` | 初始化并访问进程共享的 JWT 实例 |
    | [authentication.go](../../app/http/middleware/authentication.go) | `RequireAuthentication` 及私有凭证读取、错误处理方法 | 将 HTTP Authorization 头转换为公共凭证，调用认证器并控制后续处理 |
@@ -216,22 +216,22 @@ type Issuer interface {
    ```yaml
    issuer: go-service-template/dev
    audience: go-service-template
-   signing_key_env: JWT_SIGNING_KEY
-   token_ttl: 1h
+   signing_key: "" # 仅为占位，使用前替换为标准 Base64 编码的随机密钥
+   token_ttl: 24h
    ```
 
    | 字段 | 含义及约束 |
    | --- | --- |
    | `issuer` | 本组件认可的签发方，非空白且不带首尾空白；不同环境模板分别使用对应环境后缀 |
    | `audience` | 凭证适用的接收方，非空白且不带首尾空白；验证时必须匹配 |
-   | `signing_key_env` | 保存签名密钥的环境变量名，不是密钥正文；名称匹配 `[A-Za-z_][A-Za-z0-9_]*` |
-   | `token_ttl` | 新凭证有效期，使用 `1h` 等 Go 时长文本，至少 1 秒且必须是整秒 |
+   | `signing_key` | 签名密钥的标准 Base64 文本，解码后至少 32 字节；直接保存在 `Config.SigningKey`，不填写环境变量名或占位表达式 |
+   | `token_ttl` | 新凭证有效期，使用 `24h` 等 Go 时长文本，至少 1 秒且必须是整秒 |
 
-2. **配置模板的 `1h` 是显式配置值，不是缺失时的回退值。** 四个字段都必须提供。`LoadConfig` 读取并校验配置字段，不读取密钥；`New` 或 `Init` 构造实例时才读取指定环境变量，密钥不保存到导出的 `Config` 中。
+2. **四个字段都必须显式提供，密钥随配置一起读取和校验。** `Config.SigningKey` 使用 `string` 和 `yaml:"signing_key"` 保存配置中的密钥文本；`LoadConfig`、`Validate` 检查其内容，`New` 再从该值解码并保存只读的签名密钥。整个过程不读取或展开任何密钥环境变量。环境文件中的 `24h` 是显式配置值，不是缺失时的回退值；上例的空密钥只是文档占位，未替换就会校验失败。
 
-3. **签名密钥从部署环境注入，不提供默认密钥。** `JWT_SIGNING_KEY` 的内容为标准 Base64 编码，解码后至少 32 字节，应由安全随机源生成；缺失、空值、非法 Base64、包含空白或长度不足均使初始化失败。长度检查不证明密钥具有足够随机性，不能用人工口令代替随机密钥。HS256 的密钥长度要求见 [RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518.html#section-3.2)。
+3. **密钥在准备配置时生成，运行时不生成或补入默认值。** 可使用 `openssl rand -base64 32` 生成 32 字节安全随机数据的标准 Base64 文本，将结果直接填入对应环境文件的 `signing_key`。缺失、空值、非规范 Base64、包含空白或解码长度不足均使配置校验失败。长度检查不证明密钥具有足够随机性，不能用人工口令代替随机密钥。HS256 的密钥长度要求见 [RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518.html#section-3.2)。
 
-4. **同一部署的实例共享并持久保存密钥，不同环境使用独立密钥。** 服务重启时重新读取部署注入的既有密钥，不自动生成新密钥。替换密钥并重启后，使用旧密钥签发的凭证无法通过新实例验证；本组件不提供多密钥轮换或在线重载。配置和初始化错误仅说明字段、阶段或变量名，不回显密钥值。
+4. **同一部署的实例使用相同配置密钥，不同环境使用独立密钥。** 服务重启时重新读取环境文件中的既有值，运行中修改文件不影响已创建的 Provider。替换 `signing_key` 并重启后，使用旧密钥签发的凭证无法通过新实例验证；本组件不提供多密钥轮换或在线重载。`Config` 本身包含敏感密钥，不能记录整个配置对象；配置及初始化错误只说明字段或失败原因，不回显密钥值。
 
 ### 6.3 启动初始化与访问
 

@@ -7,12 +7,12 @@
 使用 Go 1.25 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置、`config/snowflake/dev.yml` 中为本进程分配的机器号，以及 `config/authn/jwt/dev.yml` 的 JWT 配置后，在项目根目录执行：
 
 ```sh
-# 首次本地准备时生成密钥；后续启动复用同一份安全保存的值，不要每次重新生成。
-export JWT_SIGNING_KEY="$(openssl rand -base64 32)"
 go run ./cmd/web
 ```
 
-`JWT_SIGNING_KEY` 是标准 Base64 编码的随机签名密钥，解码后至少 32 字节；配置中的 `signing_key_env` 指定变量名。所有环境均须提供密钥，没有内置默认值，缺失或无效时停止启动。同一部署的多个实例应使用同一份密钥，不同环境使用不同密钥；更换密钥会使旧凭证失效。部署时通过受控环境变量注入，不将密钥写入仓库。JWT 固定使用 HS256，配置模板中的有效期为 1 小时；组件初始化本身不启用 HTTP 认证，业务入口通过显式调用使用签发能力，详细约定见[公共身份认证与 JWT 实现](specifications/application/api-authentication.md)。
+JWT 签名密钥直接填写在 `config/authn/jwt/<environment>.yml` 的 `signing_key` 字段中，使用标准 Base64 编码，解码后至少 32 字节。准备配置时可通过 `openssl rand -base64 32` 生成随机密钥，将输出填入该字段；后续启动复用配置中的值，不在每次启动时重新生成。JWT 配置不读取或展开密钥环境变量，密钥缺失、为空或无效时停止启动。
+
+同一部署的多个实例应使用相同的 `signing_key`，不同环境使用独立密钥。修改配置后重启生效，不在线重载；更换密钥会使旧凭证无法通过新实例验证。`Config` 包含密钥，不记录整个配置对象，错误及日志不回显密钥。JWT 固定使用 HS256，当前环境配置中的 `token_ttl` 为 `24h`；组件初始化本身不启用 HTTP 认证，业务入口通过显式调用使用签发能力，详细约定见[公共身份认证与 JWT 实现](specifications/application/api-authentication.md)。
 
 `APP_ENV` 支持 `dev/test/prod`，未设置或为空时默认 `dev`；`APP_REGION` 目前支持 `cn`，未设置或为空时默认 `cn`。环境名和区域值严格匹配，非法值停止启动。
 
