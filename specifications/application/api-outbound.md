@@ -129,7 +129,7 @@ Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 
-**当前 Qwen 已实现独立配置读取、Client 构造、单轮非流式文本生成和空闲连接清理，已有 dev、test、prod 三套 YAML 配置，并引入 OpenAI Go SDK 3.96、声明 Go 1.26。尚未接入 `thirdparty.Init`、`thirdparty.Current` 和 `bootstrap` 的统一装配；启动流程尚不读取这些配置。其他供应商仍为包占位，以下统一装配和获取方式是后续接入约定。**
+**当前 Qwen、MiniMax 均已实现独立配置读取、Client 构造、单轮非流式文本生成和空闲连接清理，并按功能逐层接入进程启动装配。两个 Client 均有 dev、test、prod 三套 YAML 配置，共用项目现有的 OpenAI Go SDK 3.96 依赖；项目使用 Go 1.26。其他供应商仍为包占位。**
 
 ### 按功能组织目录
 
@@ -139,7 +139,9 @@ Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后
 app/integrations/thirdparty/
 ├── clients.go
 ├── ai/
+│   ├── clients.go
 │   ├── llm/
+│   │   ├── clients.go
 │   │   ├── qwen.go
 │   │   ├── gemini.go
 │   │   ├── glm.go
@@ -151,33 +153,48 @@ app/integrations/thirdparty/
     └── tencent_cos.go
 ```
 
-以 Qwen 为例，`ai/llm/qwen.go` 属于 `llm` 包，在该文件内组织 `QwenClient`、`QwenConfig`、`LoadQwenConfig(path)`、`NewQwenClient(config)`、`CloseIdleConnections`，以及用例专属的 `QwenGenerateTextParams`、`QwenGenerateTextResult` 和 SDK 适配。
+以 Qwen 为例，`ai/llm/qwen.go` 属于 `llm` 包，在该文件内组织 `QwenClient`、`QwenConfig`、`LoadQwenConfig(path)`、`NewQwenClient(config)`、`CloseIdleConnections`，以及用例专属的 `QwenGenerateTextParams`、`QwenGenerateTextResult` 和 SDK 适配。`minimax.go` 按相同边界组织 `MiniMaxClient`、`MiniMaxConfig` 及其 Loader、构造方法和用例类型。
 
 ### SDK 封装边界
 
-Qwen Client 私有持有 OpenAI Go SDK 的 `ChatCompletionService`，通过阿里云的 OpenAI 兼容接口调用 Qwen。当前覆盖单轮、非流式文本生成，将项目参数转换为 SDK 请求，并将 SDK 响应转换为项目结果；读取候选结果前处理空候选情况，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其参数、结果，不导入 SDK 类型。
+Qwen 和 MiniMax Client 各自私有持有 OpenAI Go SDK 的 `ChatCompletionService`，分别通过供应商的 OpenAI 兼容接口调用。通过公开的 `NewChatCompletionService` 构造并显式注入配置，避免引入 `OPENAI_*` 环境默认头。当前覆盖单轮、非流式文本生成，将项目参数转换为 SDK 请求，并将 SDK 响应转换为只含 `Content` 的项目结果；读取候选结果前处理空候选情况，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其参数、结果，不导入 SDK 类型。
 
-`QwenGenerateTextParams` 包含 `Model string` 和 `Prompt string`。每次调用 `GenerateText` 都必须提供 Model；模型为空或全空白时在发送请求前报错，非空值原样传给 SDK，不裁剪空白、不设置默认模型。Qwen Client 不保存模型，不同模型复用同一服务地址、认证配置及 Transport：
+`QwenGenerateTextParams` 包含 `Model string` 和 `Prompt string`。每次调用 `GenerateText` 都必须提供 Model，当前仅支持 `QwenModel38Max`（`qwen3.8-max`）、`QwenModel37Plus`（`qwen3.7-plus`）和 `QwenModel38Flash`（`qwen3.8-flash`）三个常量对应的精确值。模型为空、全空白或不受支持时在发送请求前报错，不裁剪空白、不设置默认模型。Qwen Client 不保存模型，支持的模型复用同一服务地址、认证配置及 Transport：
 
 ```go
 params := llm.QwenGenerateTextParams{
-    Model:  "qwen3.8-max",
+    Model:  llm.QwenModel38Max,
+    Prompt: "你是谁",
+}
+```
+
+`MiniMaxGenerateTextParams` 同样要求每次传入非空白 Model，合法值原样发送，不设置默认模型。当前不额外限制 MiniMax 模型白名单；以下只是官方示例模型，不代表默认值或唯一支持的模型：
+
+```go
+params := llm.MiniMaxGenerateTextParams{
+    Model:  "MiniMax-M3.1-Flash",
     Prompt: "你是谁",
 }
 ```
 
 ### 配置注入
 
-每个 SDK 独立声明配置类型和 Loader，`thirdparty` 顶层不维护全局 Config 或统一配置文件。配置目录按“环境 → 功能 → 子功能 → SDK 文件”组织，Qwen 的三套文件为：
+每个 SDK 独立声明配置类型和 Loader，`thirdparty` 顶层不维护全局 Config 或统一配置文件。配置目录按“环境 → 功能 → 子功能 → SDK 文件”组织，当前每个环境包含 Qwen、MiniMax 两份配置：
 
 ```text
 config/integrations/thirdparty/
-├── dev/ai/llm/qwen.yml
-├── test/ai/llm/qwen.yml
-└── prod/ai/llm/qwen.yml
+├── dev/ai/llm/
+│   ├── qwen.yml
+│   └── minimax.yml
+├── test/ai/llm/
+│   ├── qwen.yml
+│   └── minimax.yml
+└── prod/ai/llm/
+    ├── qwen.yml
+    └── minimax.yml
 ```
 
-`QwenConfig` 和每份 `qwen.yml` 只保存 Qwen 的四个连接及认证字段，不包含模型，也不添加 `ai.llm.qwen` 包裹层：
+`QwenConfig`、`MiniMaxConfig` 和各自的 YAML 只保存四个连接及认证字段，不包含模型，也不添加功能层级包裹。Qwen 配置示例：
 
 ```yaml
 base_url: https://llm-5kpwzn91x0zicspu.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
@@ -186,28 +203,46 @@ connect_timeout: 3s
 request_timeout: 60s
 ```
 
-三个环境使用相同字段结构；当前服务地址和超时值相同，API Key 直接明文写入各环境的 `qwen.yml`，不写入日志。文档示例使用占位值，实际配置填写真实密钥。`LoadQwenConfig` 按字段原值读取和校验，不展开 API Key 环境变量；读取成功后通过构造参数注入 Client，调用方法不临时读取环境变量。`connect_timeout` 限制连接建立阶段，`request_timeout` 限制一次完整 SDK 调用，可按业务情况调整。兼容接口及地址格式见[阿里云官方文档](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)。
+MiniMax 配置示例：
+
+```yaml
+base_url: https://api.minimaxi.com/v1
+api_key: "<实际 API Key>"
+connect_timeout: 3s
+request_timeout: 60s
+```
+
+同一 SDK 的三个环境使用相同字段结构；当前服务地址和超时值相同，API Key 直接明文写入各环境的对应 YAML，不写入日志。文档示例使用占位值，实际配置填写真实密钥。各 Loader 按字段原值读取和校验，不展开 API Key 环境变量；读取成功后通过构造参数注入 Client，调用方法不临时读取环境变量。`connect_timeout` 限制连接建立阶段，`request_timeout` 限制一次完整 SDK 调用，可按业务情况调整。兼容接口及地址格式见[阿里云官方文档](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)和 [MiniMax 官方文档](https://platform.minimax.cn/docs/api-reference/text-openai-api)。
 
 ### 初始化、获取与资源清理
 
-Qwen 目前可由调用方通过 Loader 读取配置并调用构造方法创建 Client，使用结束后调用 `CloseIdleConnections` 清理空闲连接。
+装配代码随功能目录逐层组织，只有根 `thirdparty` 维护全局 `Init`、`Current`，子层通过普通 `NewClients` 构造各自的分组：
 
-后续接入统一装配时，`thirdparty/clients.go` 只负责决定已注册 Client 的配置路径，分别调用各 SDK 的 Loader 和构造方法，全部成功后发布共享集合，并统一管理资源清理。`bootstrap.Init` 只调用 `thirdparty.Init` 并管理顺序与失败清理；各 Client 在启动阶段同步构造，启动不发起模型调用。
+1. `thirdparty/clients.go` 提供 `Init(configDir, environment)`，`configDir` 是 `integrations/thirdparty` 配置叶子目录。环境仅支持 `dev/test/prod`，根层选择 `<environment>/ai` 目录并调用 `ai.NewClients`，只管理一次性发布和整体资源生命周期，不读取具体供应商配置。
+2. `ai/clients.go` 的 `ai.NewClients(configDir)` 接收已选环境的 `ai` 目录，调用 `llm.NewClients`，传入其下的 `llm` 目录，返回包含 LLM 的功能分组。
+3. `ai/llm/clients.go` 的 `llm.NewClients(configDir)` 读取该目录中的 `qwen.yml`、`minimax.yml`，分别调用供应商 Loader 和构造方法，返回包含 Qwen、MiniMax 的 LLM 分组；后续构造失败时清理已经创建的实例。
 
-沿用一次性初始化约定：只加载已注册 Client 的配置，其配置缺失或非法时停止启动；仍为占位文件的其他 SDK 无须提前提供配置。发布后的实例及配置保持只读并发复用，配置修改后重启生效。获取层级与功能目录保持一致：
+`bootstrap.Init` 继续只负责根初始化入口的调用和失败清理，无须随供应商增加而引入具体 SDK 装配逻辑。
+
+启动顺序为部署环境、company Client、thirdparty Client、JWT、雪花发号器、数据库、业务 Service。Client 在启动阶段同步构造，不发起模型请求。只加载已注册 Client 的配置，其配置缺失或非法时停止启动；仍为占位文件的其他 SDK 无须提前提供配置。
+
+全部 Client 创建成功后，才在锁保护下发布共享集合；重复初始化返回错误，未初始化时调用 `Current()` 会 panic。`Current()` 返回集合的值副本，各 Client 指针继续复用；发布后的实例及配置保持只读并发复用，配置修改后重启生效。获取层级与功能目录保持一致：
 
 ```go
-client := thirdparty.Current().AI.LLM.Qwen
+qwenClient := thirdparty.Current().AI.LLM.Qwen
+miniMaxClient := thirdparty.Current().AI.LLM.MiniMax
 ```
 
-HTTP 型 SDK 使用项目构造的 HTTP Client 和 Transport，Qwen 通过 `option.WithHTTPClient` 注入并复用连接。初始化后续步骤失败时清理本次创建的空闲连接；正常退出时，待 HTTP 请求及内部工作结束后，再清理这些资源。
+HTTP 型 SDK 使用项目构造的 HTTP Client 和 Transport，通过 `option.WithHTTPClient` 注入并复用连接。根 `Clients.CloseIdleConnections()` 按 AI、LLM 分组逐层调用，最终清理 Qwen、MiniMax 各自的空闲连接，不取消在途请求。启动后续步骤失败或监听失败、尚未处理业务请求时，清理已创建的 company 和 thirdparty 空闲连接；正常退出时，仅在 HTTP 及内部工作均确认结束后执行清理。未完全排空时跳过主动关闭共享资源，沿用既有停机约定。
 
 ### 调用上下文、重试与错误
 
-Controller、Service 和第三方 Client 继续传递标准 `context.Context`。Qwen Client 在传入 Context 上派生带 `request_timeout` 的执行 Context，保留其中的 TraceId 等值，并将该 Context 交给 SDK；总预算覆盖一次完整调用。
+Controller、Service 和第三方 Client 继续传递标准 `context.Context`。两个 LLM Client 均在传入 Context 上派生带 `request_timeout` 的执行 Context，保留其中的 TraceId 等值，并将该 Context 交给 SDK；总预算覆盖一次完整调用。
 
 首期显式使用 `option.WithMaxRetries(0)` 关闭 SDK 自动重试。后续需要重试时，再明确次数及完整操作预算，避免 SDK 与业务层重复重试。HTTP Client 注入和重试选项见[OpenAI Go SDK 官方文档](https://developers.openai.com/api/reference/go)。
 
 SDK 或远端协议错误在对应 Client 边界适配为项目可识别的错误，提供可公开英文文案，内部按需保留原始 cause 和受控诊断信息；Service 收到后原样返回，不向 Controller 传递完整供应商正文或 SDK 对象。错误边界遵守[错误文案责任](api-error.md#23-错误文案的责任)。
+
+MiniMax 还在 Client 边界适配供应商协议错误：即使 HTTP 为 200，响应中的 `base_resp.status_code` 非零也按失败处理，不转换成成功文本。
 
 第三方调用保留 Context 中的 TraceId 供本地关联，默认不向供应商发送 company 使用的自定义 `TraceId` 请求头。供应商明确支持并需要某种关联头时，再在对应 Client 内适配。

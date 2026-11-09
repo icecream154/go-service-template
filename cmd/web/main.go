@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"go-service-template/app/integrations/company"
+	"go-service-template/app/integrations/thirdparty"
 	"go-service-template/bootstrap"
 	"go-service-template/env"
 	"go-service-template/routers"
@@ -50,9 +51,9 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	// ContinueOnError 使参数错误作为返回值处理，避免 flag 包自行退出进程。
 	// 参数帮助信息和后续错误文案保持英文；请求帮助时直接返回，不初始化任何资源。
 	options := flag.NewFlagSet("web", flag.ContinueOnError)
-	// 配置根目录默认 config，包含 integrations/company、authn/jwt、snowflake 和 database/mysql。
+	// 配置根目录默认 config，包含 integrations/company、integrations/thirdparty、authn/jwt、snowflake 和 database/mysql。
 	// 可使用绝对路径，使从其他工作目录启动时仍能定位同一套部署配置。
-	configDir := options.String("config-dir", "config", "Configuration root directory containing integrations/company, authn/jwt, snowflake and database/mysql")
+	configDir := options.String("config-dir", "config", "Configuration root directory containing integrations/company, integrations/thirdparty, authn/jwt, snowflake and database/mysql")
 	// 默认监听所有本机地址的 8080 端口；可指定 127.0.0.1:8081 等地址限制监听范围。
 	address := options.String("addr", ":8080", "HTTP listen address")
 	// 启动预算默认 30 秒，数据库连接和会话检查共享同一个预算，不是每个连接各获 30 秒。
@@ -97,11 +98,13 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	// 收尾预算耗尽时不主动关闭仍可能被使用的连接池，由 main 的失败退出释放进程资源。
 	closeRuntime := true
 	companyClients := company.Current()
+	thirdpartyClients := thirdparty.Current()
 	defer func() {
 		if !closeRuntime {
-			log.Printf("Skip database pool cleanup: HTTP or internal work was not fully drained; process will exit")
+			log.Printf("Skip shared resource cleanup: HTTP or internal work was not fully drained; process will exit")
 			return
 		}
+		thirdpartyClients.CloseIdleConnections()
 		companyClients.CloseIdleConnections()
 		if err := runtime.Close(); err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("close database connections: %w", err))

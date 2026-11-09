@@ -4,11 +4,13 @@
 
 公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[外部接口调用与 Client 规范](specifications/application/api-outbound.md)。两个 Image Client 已提供图片生成和图片编辑任务查询的 HTTP 调用示例，真实服务契约仍待确认。
 
+第三方 Client 按功能、子功能及供应商文件组织，装配也由 thirdparty、AI、LLM 逐层完成。当前 Qwen、MiniMax 已支持独立配置读取、SDK 构造和进程启动初始化，通过 `thirdparty.Current().AI.LLM.Qwen`、`thirdparty.Current().AI.LLM.MiniMax` 获取共享实例；其他供应商仍为包占位。每次文本生成须指定模型，不在配置中保存默认模型。
+
 生产 HTTP 入口在响应等待中间件之前处理 `TraceId`：请求头不存在或为空时生成 16 字节随机数编码的 32 位十六进制值；已有非空值时原样沿用。该值保存到 `Request.Context()` 并通过同名响应头返回。Controller、Service 和 company Client 传递标准 Context，公共 `GetJSON`、`PostJSON` 自动设置出站 `TraceId`；无值的独立调用不由 Client 补生成。直接使用 `routers.New(authenticator)` 时，需自行用 `middleware.TraceID(engine)` 包装 Gin 入口。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)。
 
 ## 启动
 
-使用 Go 1.25 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置、`config/snowflake/dev.yml` 中为本进程分配的机器号，以及 `config/authn/jwt/dev.yml` 的 JWT 配置后，在项目根目录执行：
+使用 Go 1.26 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置、`config/snowflake/dev.yml` 中为本进程分配的机器号、`config/authn/jwt/dev.yml` 的 JWT 配置，以及 `config/integrations/thirdparty/dev/ai/llm/` 下的 `qwen.yml`、`minimax.yml` 后，在项目根目录执行：
 
 ```sh
 go run ./cmd/web
@@ -26,9 +28,11 @@ JWT 签名密钥直接填写在 `config/authn/jwt/<environment>.yml` 的 `signin
 go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeout 30s -shutdown-timeout 10s
 ```
 
-`-config-dir` 是包含 `integrations/company`、`authn/jwt`、`snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
+`-config-dir` 是包含 `integrations/company`、`integrations/thirdparty`、`authn/jwt`、`snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
 
 公司 Client 配置读取 `config/integrations/company/<environment>.yml`。开发环境使用本地地址；测试和生产分别设置 `TEST_PYTHON_SERVICE_TEMPLATE_BASE_URL`、`PROD_PYTHON_SERVICE_TEMPLATE_BASE_URL`，或直接填写配置中的 `base_url`。地址缺失、超时无效或 Client 未注册时停止启动，初始化不调用远端 HTTP 接口。
+
+LLM 分组读取 `config/integrations/thirdparty/<environment>/ai/llm/` 下的 `qwen.yml`、`minimax.yml`，环境仅支持 `dev/test/prod`，已注册 Client 的配置缺失或非法时停止启动。两份文件分别直接保存 `base_url`、`api_key`、`connect_timeout`、`request_timeout` 四个字段；API Key 直接填写在各环境 YAML 中，不展开环境变量，也不写入日志。MiniMax 服务地址为 `https://api.minimaxi.com/v1`，当前连接及请求超时分别为 3 秒、60 秒。启动只构造 SDK Client，不调用模型。每次调用均须提供 Model：Qwen 仅支持 `llm.QwenModel38Max`、`llm.QwenModel37Plus`、`llm.QwenModel38Flash`；MiniMax 要求非空白模型名，当前不另设模型白名单。
 
 测试或生产部署先注入 MySQL YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。MySQL 配置中的 `${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
 
@@ -36,9 +40,9 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → company 包读取并校验环境配置、创建共享 Transport 和两个 Image Client → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败清理本次已创建的 HTTP 空闲连接和数据库连接池，并以非零状态退出。
+启动顺序为：部署环境初始化 → company 包读取并校验环境配置、创建共享 Transport 和两个 Image Client → thirdparty 选择环境目录，经 AI、LLM 分组加载并构造 Qwen、MiniMax，全部成功后发布共享实例 → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败清理本次已创建的 company、thirdparty HTTP 空闲连接和数据库连接池，并以非零状态退出。
 
-SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才正常关闭数据库。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享连接池，并以失败状态退出，由进程退出释放连接；这不代表业务完成或事务已回滚。
+SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才清理 company、thirdparty 的 HTTP 空闲连接并正常关闭数据库。启动后的路由或监听失败、尚未处理业务请求时，也清理这些资源。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享资源，并以失败状态退出，由进程退出释放连接；这不代表业务完成或事务已回滚。
 
 当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
 
@@ -217,8 +221,9 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 管理依赖初始化顺序，调用 company 包加载和装配 Client，处理启动失败时的资源清理 |
+| `bootstrap` | 管理依赖初始化顺序，调用 company、thirdparty 包加载和装配 Client，处理启动失败时的资源清理 |
 | `app/integrations/company` | 加载公司服务配置、创建共享 Transport 和具体 Client、发布默认实例并提供获取入口 |
+| `app/integrations/thirdparty` | 选择环境目录，经 AI、LLM 分组逐层装配已注册 Client；根层发布共享实例，清理按功能分组逐层执行 |
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `internal/response` | 定义统一响应外层、通用错误枚举及固定 HTTP 状态映射、Gin 输出函数 |

@@ -51,6 +51,8 @@ Repository 返回表结构或 error
 main → run
   → bootstrap.Init
       → env.Init：读取部署环境和区域
+      → company.Init：读取公司服务配置、创建共享 Transport 和 Image Client
+      → thirdparty.Init：选择环境目录，经 AI、LLM 分组装配 Qwen、MiniMax 并发布共享实例
       → 加载 JWT 配置、校验密钥并初始化共享签发与认证组件
       → 取得雪花数据中心编号
       → 加载雪花配置并初始化共享发号器
@@ -69,6 +71,8 @@ main → run
 
 环境、配置和数据库连接初始化成功后，程序才开始监听端口。默认地址为 `:8080`；启动方式和配置准备见 [README](../../README.md)。数据库及表结构需要提前准备，启动流程不自动建表，也不创建示例用户。
 
+第三方 Client 的启动装配中，`bootstrap.Init` 只调用根 `thirdparty.Init(configDir, environment)` 并处理资源清理，其 `configDir` 为 `integrations/thirdparty` 叶子目录，环境仅支持 `dev/test/prod`。根层选择 `<environment>/ai` 后交给 `ai.NewClients`，AI 层将 `llm` 目录交给 `llm.NewClients`，由 LLM 层读取 `qwen.yml`、`minimax.yml` 并调用各自的 Loader、构造方法。根层不维护具体供应商文件名，子层不设置全局 `Init` 或 `Current`。注册配置缺失或非法时停止启动，不回退其他环境，也不在启动时调用模型；其他尚未注册的 SDK 占位文件不要求提前提供配置。
+
 `cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器及请求分发外层的 TraceId 中间件；每次请求先确定 TraceId，再选择一个等待包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层 TraceId 和响应等待控制，需要 TraceId 时由调用方用 `middleware.TraceID(engine)` 包装。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过 TraceId 和等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
 
 ### 2.2 共享对象分别由谁持有
@@ -81,12 +85,16 @@ main → run
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
+| [company Client 集合](../../app/integrations/company/clients.go) | 已完成装配的公司内部 HTTP Client | Service 通过 `company.Current()` 按服务、domain、controller 获取 |
+| [thirdparty Client 集合](../../app/integrations/thirdparty/clients.go) | 经 AI、LLM 分组构造的 Qwen、MiniMax SDK Client | Service 通过 `thirdparty.Current().AI.LLM.Qwen` 或 `.MiniMax` 获取共享实例，传入标准 Context |
 | [routers/http_handler.go](../../routers/http_handler.go) | 同一个 Gin Engine、默认与覆盖配置的等待包装器及收尾组件 | 按请求方法和路径选择一个包装器；停机时统一等待内部处理 |
 | [用户领域 Router](../../app/domains/user/routers/router.go) | Controller 和各用例的 Validator | Gin 保存其处理方法，收到请求后调用 |
 
 MySQL 组件为每个启用的命名连接创建独立连接池，完成连通性及会话检查后交给 GORM。用户资料 Repository 复用用户数据库入口；Repository 的构造函数不会另建连接池。
 
 `Current()` 的含义是“取得已经初始化的共享对象”。它本身不创建 Service、Repository 或连接池，也不执行 SQL。初始化前调用会触发异常，因此启动顺序是请求能够正常工作的前提。
+
+`thirdparty.Current()` 返回分组集合的值副本，各 SDK Client 指针仍指向同一共享实例；重复初始化报错，配置及实例发布后只读。修改配置通过重启生效；单次调用的模型由 Params 指定，不改变共享 Client。
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
@@ -520,9 +528,9 @@ HTTP JSON
 
 2. **两次收尾共用一个独立总预算，不复用已取消的进程通知或 HTTP 等待 Context。** `-shutdown-timeout` 指定总预算，默认 10 秒；入口创建独立的标准 Context，依次传给 HTTP 服务和装配对象的 `Shutdown`，不会给每个组件重新分配完整预算。响应等待时间只影响单次响应，不能决定数据库连接池什么时候关闭；HTTP 层排空也不能代替内部处理排空。
 
-3. **共享资源只在 HTTP 和内部处理均确认结束后正常关闭。** 两部分收尾均成功时，入口才执行应用资源清理，关闭数据库等共享依赖。启动装配或监听失败、尚未开始处理请求时，也应正常释放已创建的资源。HTTP 收尾失败可以强制关闭 HTTP 连接，但这不能取消内部跟踪，更不能据此提前关闭仍被业务使用的连接池。
+3. **共享资源只在 HTTP 和内部处理均确认结束后正常关闭。** 两部分收尾均成功时，入口才调用 company、thirdparty 集合的 `CloseIdleConnections()` 清理 HTTP 空闲连接，并关闭数据库。thirdparty 按 AI、LLM 分组逐层清理 Qwen、MiniMax 的空闲连接，不取消在途调用；装配后续实例失败时也清理已创建的实例。启动装配、路由或监听失败、尚未开始处理请求时，应正常释放已创建的资源。HTTP 收尾失败可以强制关闭 HTTP 连接，但这不能取消内部跟踪，更不能据此提前关闭仍被业务使用的连接池。
 
-4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭共享数据库连接池，并以失败状态退出；进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
+4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭 company、thirdparty 和数据库的共享资源，并以失败状态退出；进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
 
 ## 8. 第一次看代码时的阅读顺序
 
