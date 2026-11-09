@@ -37,6 +37,9 @@ func New(config Config, transport *http.Transport) (*Client, error) {
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   config.RequestTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}, nil
 }
