@@ -65,9 +65,25 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 HTTP Controller 将响应等待层隔离取消后的 `ctx.Request.Context()` 传给 Service；后台任务或其他入口提供本次执行的非 nil 生命周期 Context，独立执行的根 Context 由入口创建。Service 不用 `context.Background()` 替换已有上下文、不自行生成 TraceId，也不将 DTO、Params 或请求 Context 放进共享实例字段。
 
-Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用域，后续共享 Logger 从中自动取得 `component=service` 和 `{领域名}.{Service 类型名}.{方法名}`。同一方法内部的流程日志保持同一 operation，使用 message 说明具体步骤，普通步骤可省略 event；方法生命周期才使用 started、finished。调用其他 Service 或 Client 时继续传入当前 Context，由新入口建立自己的作用域，上层 Context 不变。需要流程日志的私有辅助函数显式接收并沿用该 Context，纯校验、转换和构造函数无需机械添加参数。
+Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用域，后续共享 Logger 从中自动取得 `component=service` 和 `{领域名}.{Service 类型名}.{方法名}`。同一方法内部的流程日志保持同一 operation，使用 message 说明具体步骤，普通步骤省略 event。需要记录步骤或失败时，在对应业务位置直接调用日志方法；不要求业务方法维护日志状态、增加计时或 defer，也不要求配齐 started、finished。HTTP 和 Client 等公共边界仍可统一记录生命周期及耗时。调用其他 Service 或 Client 时继续传入当前 Context，由新入口建立自己的作用域，上层 Context 不变。需要流程日志的私有辅助函数显式接收并沿用该 Context，纯校验、转换和构造函数无需机械添加参数。
 
-当前用户资料 Service 的六个公开业务方法及 Controller 调用方已统一 Context 首参，Service 方法入口已建立作用域。本次没有自动增加 Controller 或 Service 生命周期日志，也没有将现有 `log.Printf` 统一改为共享 Logger；只有传入该 Context 的共享 Logger 日志才会带上对应请求和操作信息。Repository 签名、SQL 取消及事务行为保持不变。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
+当前用户资料 Service 的六个公开业务方法及 Controller 调用方已统一 Context 首参，Service 方法入口已建立作用域。其中 `GenerateUserAvatar` 已在 Controller、Service 的业务执行位置接入步骤与失败日志，其他用例的现有 `log.Printf` 仍待迁移。只有传入当前 Context 的共享 Logger 日志才会带上对应请求和操作信息。Repository 签名、SQL 取消及事务行为保持不变。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
+
+### GenerateUserAvatar 接入示例
+
+Controller 在方法入口通过 `WithCurrentOperation` 建立作用域，并将派生 Context 保存回 `ctx.Request`；Service 沿用请求 Context，再建立自己的方法作用域。两层从共享 Logger 写日志，TraceId 保持一致，操作身份分别为 `user.UserProfileController.GenerateUserAvatar` 和 `user.UserProfileService.GenerateUserAvatar`。
+
+| 日志边界 | component | level、event | 记录内容 |
+| --- | --- | --- | --- |
+| Controller 接收请求、处理完成 | `controller` | `INFO`，省略 event | 在实际处理位置记录普通说明，不推断客户端是否已收到响应 |
+| 输入或授权拒绝 | 对应的 `service`、`controller` | `WARN`，省略 event | 在失败分支直接记录固定说明，随后沿用原有错误返回或响应 |
+| Service 或远端调用失败 | 对应的 `controller`、`service` | `ERROR`，省略 event | 在失败分支直接记录固定阶段说明，不保存错误状态供其他位置统一输出 |
+| 提示词优化前后、图片生成前后 | `service` | `INFO`，省略 event | 通过英文 message 说明业务步骤，operation 始终属于同一 Service 方法 |
+| Validator 遇到未知校验故障 | 沿用入站的 `http_entry` 作用域 | `ERROR`，省略 event | 固定的校验失败说明；Validator 不建立新的职责类别或操作身份 |
+
+Controller 和 Service 不为这些业务日志增加计时、状态变量或 defer，不输出方法级的成对生命周期或耗时。日志按业务顺序在发生位置直接记录，panic 继续交给原有异常处理流程。HTTP 状态和对外耗时仍由外层入口记录，公司 Client 的调用生命周期继续由公共层记录。HTTP 等待超时先返回 503 后，内部方法可能继续处理和输出同一 TraceId 的日志，其晚到结果不会改写外层响应日志。
+
+提示词、优化后的文本、图片地址、凭证、原始错误文本及远端正文不进入上述业务日志；业务错误仍原样返回，成功仍只返回头像地址，不更新用户资料。公司图片 Client 原有的调用日志继续保留。文本优化步骤由 Service 描述，Qwen SDK 自身的调用日志尚未接入，不能将业务步骤日志视为 SDK 层日志。
 
 ## 当前数据结构与基础写入范围
 
@@ -77,43 +93,55 @@ Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用�
 
 基础 Logger 通过 `New(config Config, deployment env.Config, output io.Writer)` 构造。日志专属 `Config` 仅声明 `ServiceName`、`InstanceID` 和 `MinLevel`；部署环境复用现有 `env.Config`，装配方可在 `env.Init()` 成功后传入 `env.Current()`。Logger 按值保存部署配置，不重复读取环境变量或依赖全局初始化调用。服务名称、实例标识及传入的环境名称必须非空白，最低级别必须使用已声明的合法值；部署环境的允许值仍由 `env` 包管理。构造过程不读取配置文件、不推断服务名称，也不生成实例标识。
 
-`Debug`、`Info`、`Warn`、`Error` 接收标准 Context、消息及可选的一个 `Fields`，返回 `error`；不需要额外字段时直接省略 `Fields`。每条日志自动补充 UTC 时间、对应级别、Context 中的 TraceId、实际调用位置和三项公共元信息。Context 为 nil 或未保存 TraceId 时省略 `trace_id`，Logger 不补生成标识。
+**应用 Logger 的局部变量统一命名为 `lg`。** 通过 `logger.Current()` 获取共享实例或通过 `logger.New(...)` 创建独立实例时均使用该名称。项目日志包沿用 `logger`，标准库日志包沿用 `log`；应用日志调用 `lg.Info`、`lg.Warn`、`lg.Error`、`lg.Debug`，标准库日志调用 `log.Printf` 等方法。
 
-最低级别以下的日志被过滤；其余日志同步输出为单行 JSON，不抽样、不建立异步队列。编码、写入及短写故障通过返回值交给调用方处理。`Fields` 不接受原始 Go `error` 或 SDK 对象，错误文本须由调用方先做受控处理；耗时必须为有限的非负数，HTTP 状态码来自实际交互。
+```go
+// 1. 取得已初始化的共享 Logger，局部实例统一使用 lg 命名。
+lg := logger.Current()
+// 2. 在业务发生位置直接打印日志，沿用当前 Context 的 TraceId 和操作作用域。
+lg.Info(ctx, "Avatar prompt optimized")
+```
+
+`Debug`、`Info`、`Warn`、`Error` 接收标准 Context、消息及可选的一个 `Fields`，均无返回值；不需要额外字段时直接省略 `Fields`。业务代码通过 `logger.Current()` 取得共享实例，在需要的位置直接调用对应级别方法，无须在日志外层处理输出结果。每条日志自动补充 UTC 时间、对应级别、Context 中的 TraceId、实际调用位置和三项公共元信息。Context 为 nil 或未保存 TraceId 时省略 `trace_id`，Logger 不补生成标识。
+
+最低级别以下的日志被过滤，不触发故障输出；其余日志同步输出为单行 JSON，不抽样、不建立异步队列。参数校验、JSON 编码、写入及短写故障由 Logger 内部统一处理，向独立 stderr 输出故障说明，TraceId 使用引用格式转义；不递归调用 Logger、不重试业务调用，也不替换业务返回或 HTTP 响应。stderr 自身写入失败时不继续报告。`Fields` 不接受原始 Go `error` 或 SDK 对象，错误文本须由调用方先做受控处理；耗时必须为有限的非负数，HTTP 状态码来自实际交互。
+
+业务调用的日志级别表达业务事件的重要程度，Logger 内部的输出故障处理负责日志基础设施本身的错误，两者分别处理。`New`、`Init`、实例及包级 `Sync` 继续返回 `error`，由初始化和退出流程检查；四级打印方法不承担这些生命周期控制职责。
 
 输出 Writer 由调用方提供并管理。`Sync()` 在输出器支持 `Sync() error` 时转交同步，不关闭 Writer；普通 `io.Writer` 的文件、连接或额外缓冲生命周期仍由调用方管理。
 
 以下为基础用法，示例中的公共信息由应用装配方提供：
 
 ```go
-log, err := logger.New(logger.Config{
+// 1. 通过显式配置创建日志器，部署环境已由应用初始化。
+lg, err := logger.New(logger.Config{
     ServiceName: "example-service",
     InstanceID:  "example-instance",
     MinLevel:    logger.LevelInfo,
 }, env.Current(), os.Stdout) // 调用方已完成 env.Init()。
 if err != nil {
+    // 1.1. 构造失败时尚无可用日志器，由装配调用方处理该错误。
     return err
 }
-if err := log.Info(ctx, "Operation completed"); err != nil {
-    return err
-}
+// 2. 在业务位置直接打印日志，日志器内部处理输出故障，业务流程沿用原有结果。
+lg.Info(ctx, "Operation completed")
 ```
 
 需要补充事件、耗时或状态时，传入一份 `Fields`；以下数值用于说明字段形式，实际调用应使用采集结果：
 
 ```go
+// 1. 采用本次操作实际采集到的耗时和 HTTP 状态，示例数值仅展示字段形式。
 durationMS := 123.45
 statusCode := 200
-if err := log.Info(ctx, "HTTP call completed", logger.Fields{
+// 2. 直接记录操作结束，日志输出故障由日志器内部处理，不替换业务结果。
+lg.Info(ctx, "HTTP call completed", logger.Fields{
     Event:      logger.EventFinished,
     DurationMS: &durationMS,
     StatusCode: &statusCode,
-}); err != nil {
-    return err
-}
+})
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client 调用日志已统一使用共享 Logger；第三方 SDK、业务步骤、数据库与其他异常日志尚未全部迁移，未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client 调用，以及 `GenerateUserAvatar` 的 Controller、Service 和未知校验故障日志已统一使用共享 Logger；第三方 SDK、其他业务用例、数据库与其他异常日志尚未全部迁移，未新增测试用例。
 
 ## HTTP 请求与响应日志
 
@@ -132,7 +160,7 @@ if err := log.Info(ctx, "HTTP call completed", logger.Fields{
 
 `finished` 只表示外层响应处理结束。等待超时返回 503 后，内部业务可以继续执行，不能用晚到内部的 200 覆盖本次 HTTP 日志；503 也可能由业务或停机产生，不仅凭状态码判定为等待超时。正常处理未显式写状态时遵循 HTTP 的隐式 200；若请求已取消或处理异常终止且没有选定状态，则不伪造状态码。本地写入成功也不保证客户端已收到完整正文。
 
-原有 `gin.Logger()` 和响应等待层的对外摘要、重复写入故障输出已移除，请求与响应由统一入口各记录一次。现有 Recovery、内部逃逸 panic 及其他业务日志继续按其原有边界处理，本阶段不宣称全部日志来源已经完成关联。日志输出失败使用标准错误输出兜底，不递归写同一个 Logger，也不替换业务响应。
+原有 `gin.Logger()` 和响应等待层的对外摘要、重复写入故障输出已移除，请求与响应由统一入口各记录一次。现有 Recovery、内部逃逸 panic 及其他业务日志继续按其原有边界处理，本阶段不宣称全部日志来源已经完成关联。HTTP 日志直接调用共享 Logger，输出故障由 Logger 内部统一使用 stderr 兜底，HTTP 层不重复报告，也不替换业务响应。
 
 独立调用 `routers.New(authenticator)` 只会安装 Gin 的模板绑定中间件；没有外层 HTTP 日志状态时直接透传，不隐式取得共享 Logger。生产 `NewHTTPHandler` 负责外层装配，要求先完成启动初始化；独立使用完整 HTTP 日志时，也应在初始化 Logger 后按上述顺序包装。
 
@@ -154,9 +182,9 @@ if err := log.Info(ctx, "HTTP call completed", logger.Fields{
 
 失败信息使用固定的阶段说明，不将原始错误对象、URL、Query、请求或响应正文、认证头写入日志；底层错误仍按现有方式返回业务方并保留错误链。调用日志不改变仅接受 HTTP 200、响应读取上限为 16 MiB、不额外重试、原有响应体关闭及关闭错误忽略等调用约定。异常终止会记录失败的 `finished`，panic 继续沿原有路径传播，不在日志层吞掉。
 
-公共请求层通过 `logger.Current()` 取得启动时发布的共享 Logger，输出仍为 stdout 单行 JSON，并遵循最低日志级别过滤。发起公司 HTTP 调用前必须完成 Logger 初始化；未初始化调用仍按共享实例契约 panic，不隐式创建日志器。日志编码或输出失败时使用独立 stderr 兜底，TraceId 采用引用转义格式，不递归写入同一个 Logger，也不替换调用的业务结果。
+公共请求层通过 `logger.Current()` 取得启动时发布的共享 Logger，输出仍为 stdout 单行 JSON，并遵循最低日志级别过滤。发起公司 HTTP 调用前必须完成 Logger 初始化；未初始化调用仍按共享实例契约 panic，不隐式创建日志器。公共层直接调用日志方法，日志编码或输出故障由 Logger 内部统一使用独立 stderr 兜底，TraceId 采用引用转义格式；Client 不重复报告或替换调用的业务结果。
 
-操作作用域应由具体 Client 入口建立。直接调用公共 `base.Client` 不会自动推断具体业务方法或生成 Client 操作名；公共层只使用传入 Context 中已有的作用域。本阶段仅覆盖公司 HTTP Client，第三方 SDK 及其他组件的调用日志另行接入。
+操作作用域应由具体 Client 入口建立。直接调用公共 `base.Client` 不会自动推断具体业务方法或生成 Client 操作名；公共层只使用传入 Context 中已有的作用域。Client 层目前仅覆盖公司 HTTP Client，第三方 SDK 的调用日志另行接入。
 
 ## 启动初始化与共享实例
 

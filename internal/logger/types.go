@@ -1,5 +1,5 @@
 // Package logger 提供统一日志结构、操作上下文识别和同步 JSON 写入能力。
-// Logger 通过参数构造，不维护全局实例；HTTP 操作识别和启动接入尚未实现。
+// Logger 支持独立构造和启动时发布共享实例；四级打印方法在内部处理日志写入故障。
 package logger
 
 import "time"

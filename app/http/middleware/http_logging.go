@@ -2,15 +2,12 @@ package middleware
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
 	"go-service-template/internal/logger"
-	"go-service-template/internal/traceid"
 
 	"github.com/gin-gonic/gin"
 )
@@ -44,12 +41,12 @@ func HTTPLogging(next http.Handler) http.Handler {
 	if next == nil {
 		panic("HTTP logging handler must not be nil")
 	}
-	log := logger.Current()
+	lg := logger.Current()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 2. 在进入响应等待层前记下开始时间，后续耗时包含路由、认证及全部响应等待。
 		// baseContext 已含 TraceId；它只供外层日志使用，不替换业务协程隔离取消后的 Context。
 		state := &httpRequestLog{
-			log:         log,
+			log:         lg,
 			baseContext: r.Context(),
 			method:      r.Method,
 			startedAt:   time.Now(),
@@ -117,10 +114,8 @@ func (state *httpRequestLog) startLocked(routeTemplate string) {
 	state.logContext = logger.WithHTTPOperation(state.baseContext, state.method, routeTemplate)
 	// 2. 开始记录不携带响应状态或耗时，表示 HTTP 处理已开始，而不是业务已经成功。
 	// 同步输出期间继续持有状态锁，确保并发的外层结束不会先输出 finished。
-	if err := state.log.Info(state.logContext, "HTTP request started", logger.Fields{Event: logger.EventStarted}); err != nil {
-		// 2.1. 日志故障仅交给独立错误输出，不改变响应状态或停止业务链。
-		reportHTTPLogError(state.logContext, err)
-	}
+	// 日志器在内部处理输出故障，本层不维护重复的失败处理或改变业务响应。
+	state.log.Info(state.logContext, "HTTP request started", logger.Fields{Event: logger.EventStarted})
 }
 
 // finish 在外层响应路径返回时记录选定状态及耗时，不等待超时后仍执行的内部业务。
@@ -159,17 +154,8 @@ func (state *httpRequestLog) finish(output *httpLogResponseWriter, returnedNorma
 		fields.Error = "HTTP request context ended"
 	}
 	// 5. 外层 finished 表示响应路径结束，状态码不证明客户端已完整收到正文，也不证明内部工作结束。
-	if err := state.log.Info(state.logContext, "HTTP response finished", fields); err != nil {
-		// 5.1. 输出失败仍不能修改已经选定的 HTTP 响应，使用独立错误输出进行兜底。
-		reportHTTPLogError(state.logContext, err)
-	}
-}
-
-// reportHTTPLogError 处理日志器自身的输出故障，避免递归调用同一个故障 Logger。
-func reportHTTPLogError(ctx context.Context, err error) {
-	// 1. TraceId 用引用格式转义后写入 stderr，只报告日志输出错误，不输出请求参数或正文。
-	// stderr 本身失败时不继续重试或启动后台任务，HTTP 业务响应保持原有流程。
-	_, _ = fmt.Fprintf(os.Stderr, "Write HTTP log failed: trace_id=%q error=%v\n", traceid.FromContext(ctx), err)
+	// 日志器统一兜底编码及写入故障，已经选定的 HTTP 响应不受日志输出结果影响。
+	state.log.Info(state.logContext, "HTTP response finished", fields)
 }
 
 // httpLogResponseWriter 只由外层响应协程访问，记录最终状态和实际写入故障。

@@ -357,37 +357,53 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 		// 1.1. 下游 Client 可建立自己的派生作用域，返回后不会改写本方法持有的操作身份。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
-	// 2. 独立检查原始提示词，输入非法时不执行付费或有耗时的远端调用。
+	// 2. 取得共享 Logger 并校验业务输入；日志直接写在发生位置，不维护额外的完成状态。
+	lg := logger.Current()
 	if err := validateGenerateUserAvatarParams(params); err != nil {
-		// 2.1. 原样返回输入错误，不用本层错误替换已有公共检查结果。
+		// 2.1. 输入失败在当前分支直接记录，不输出用户文本，已有检查错误继续原样返回。
+		lg.Warn(ctx, "User avatar generation rejected", logger.Fields{
+			Error: "User avatar generation parameters are invalid",
+		})
 		return nil, err
 	}
-	// 3. 将当前派生 Context 传给文本 Client，保持链路信息以及 Client 自身的有限请求预算。
+	// 3. 在提示词优化调用前记录业务步骤，再将当前 Context 传给文本 Client。
+	// 普通步骤不填生命周期 event，Client 自身的请求预算和业务返回契约保持不变。
+	lg.Info(ctx, "Avatar prompt optimization requested")
 	optimized, err := thirdparty.Current().AI.LLM.Qwen.GenerateText(ctx, llm.GenerateTextParams{
 		Model:  llm.QwenModel38Flash,
 		Prompt: userAvatarPromptInstruction + params.Prompt,
 	})
 	if err != nil {
-		// 3.1. 优化失败即结束用例，保留原有错误和日志，不回退使用原始提示词。
-		log.Printf("Optimize user avatar prompt failed: error=%v", err)
+		// 3.1. 优化调用失败时立即记录阶段并原样返回错误，不输出 SDK 对象或回退到原始提示词。
+		lg.Error(ctx, "User avatar generation failed", logger.Fields{
+			Error: "Avatar prompt optimization failed",
+		})
 		return nil, err
 	}
-	// 4. 空白生成文本属于本用例的远端结果异常，不能按用户输入错误解释或继续生成图片。
+	// 4. 空白生成文本属于本用例的远端结果异常，记录后直接结束，不继续生成图片。
 	if strings.TrimSpace(optimized.Content) == "" {
-		// 4.1. 保持本层已声明错误的语义，仍由 Controller 选择对外错误码。
-		log.Printf("Optimize user avatar prompt failed: error=%v", errEmptyOptimizedAvatarPrompt)
+		// 4.1. 日志保留固定异常说明，本层已声明错误继续原样返回，不记录生成文本。
+		lg.Error(ctx, "User avatar generation failed", logger.Fields{
+			Error: "Avatar prompt optimization returned empty text",
+		})
 		return nil, errEmptyOptimizedAvatarPrompt
 	}
-	// 5. 将同一个 Service Context 传给图片 Client，其请求和调用日志继续沿用本次 TraceId。
+	// 5. 优化结果可用时直接记录步骤完成，并在图片调用前记录即将执行的下一步。
+	lg.Info(ctx, "Avatar prompt optimized")
+	lg.Info(ctx, "Avatar image generation requested")
+	// 6. 将同一个 Service Context 传给图片 Client，其公共请求与调用日志继续沿用本次 TraceId。
 	generated, err := company.Current().PythonServiceTemplate.Image.ImageGen.GenerateImage(ctx, companyimage.GenerateImageParams{
 		Prompt: optimized.Content,
 	})
 	if err != nil {
-		// 5.1. 图片生成失败原样返回，不改写 Client 错误或增加重试。
-		log.Printf("Generate user avatar failed: error=%v", err)
+		// 6.1. 在失败分支直接记录图片生成阶段，原始 Client 错误继续返回，不增加重试。
+		lg.Error(ctx, "User avatar generation failed", logger.Fields{
+			Error: "Avatar image generation failed",
+		})
 		return nil, err
 	}
-	// 6. 成功仅返回头像地址，不访问数据库或修改用户资料。
+	// 7. 图片调用完成后直接记录步骤并返回头像地址，不记录正文、提示词或修改用户资料。
+	lg.Info(ctx, "Avatar image generated")
 	return &GenerateUserAvatarResult{AvatarURL: generated.ImageURL}, nil
 }
 

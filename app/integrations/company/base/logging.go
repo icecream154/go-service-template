@@ -2,12 +2,9 @@ package base
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"time"
 
 	"go-service-template/internal/logger"
-	"go-service-template/internal/traceid"
 )
 
 // httpCallLog 保存一次公共 JSON 调用的日志状态，仅由当前调用所在的 goroutine 使用。
@@ -23,10 +20,8 @@ type httpCallLog struct {
 // start 记录调用开始，操作身份及 TraceId 均由 Logger 从具体 Client 传入的 Context 自动读取。
 func (call *httpCallLog) start() {
 	// 1. 开始时尚未取得远端结果，不预填耗时、状态码或错误；日志写入失败不替换业务返回。
-	if err := call.log.Info(call.ctx, "Company HTTP call started", logger.Fields{Event: logger.EventStarted}); err != nil {
-		// 1.1. 使用独立 stderr 兜底，避免递归调用发生故障的共享 Logger。
-		reportHTTPCallLogError(call.ctx, err)
-	}
+	// 共享 Logger 在内部统一处理编码及输出故障，本层直接记录本次调用的开始。
+	call.log.Info(call.ctx, "Company HTTP call started", logger.Fields{Event: logger.EventStarted})
 }
 
 // finish 记录调用结束，正常结果来自返回错误，异常终止由外层显式传入，不在此恢复 panic。
@@ -53,29 +48,12 @@ func (call *httpCallLog) finish(callErr error, returnedNormally bool) {
 		}
 	}
 	// 4. 每次调用只写一条结束记录；失败使用 ERROR，成功使用 INFO，不额外打印重复错误摘要。
-	var writeErr error
+	// Logger 自行处理输出故障，不改变业务结果、响应出参或正在传播的 panic。
 	if fields.Error != "" {
 		// 4.1. finished 只表示结束，失败事实通过日志级别及受控 error 字段表达。
-		writeErr = call.log.Error(call.ctx, "Company HTTP call finished", fields)
+		call.log.Error(call.ctx, "Company HTTP call finished", fields)
 	} else {
 		// 4.2. 协议处理正常完成时不填 error，结果字段仍仅包含实际采集到的数据。
-		writeErr = call.log.Info(call.ctx, "Company HTTP call finished", fields)
+		call.log.Info(call.ctx, "Company HTTP call finished", fields)
 	}
-	// 5. 日志故障只走独立兜底，不改变业务方收到的错误、响应出参或正在传播的 panic。
-	if writeErr != nil {
-		reportHTTPCallLogError(call.ctx, writeErr)
-	}
-}
-
-// reportHTTPCallLogError 报告日志基础设施故障，不递归调用共享 Logger 或重试业务请求。
-func reportHTTPCallLogError(ctx context.Context, err error) {
-	// 1. 缺少 Context 时保持空标识；这里不创建请求上下文、不生成 TraceId。
-	var id string
-	if ctx != nil {
-		// 1.1. 正常请求沿用当前链路，使用独立 key 读取，不依赖 operation 是否成功识别。
-		id = traceid.FromContext(ctx)
-	}
-	// 2. 只向 stderr 报告 Logger 自身的错误，TraceId 用引用格式转义以避免换行注入。
-	// 不附加请求或远端数据；stderr 本身写入失败时不重试，不影响业务结果。
-	_, _ = fmt.Fprintf(os.Stderr, "Write company HTTP call log failed: trace_id=%q error=%v\n", id, err)
 }

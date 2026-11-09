@@ -77,29 +77,42 @@ func New(config Config, deployment env.Config, output io.Writer) (*Logger, error
 	}, nil
 }
 
-// Debug 输出调试日志。fields 可省略或提供一项；低于最低级别时直接返回 nil。
-// 各级方法均返回参数、编码或写入错误，不通过 Logger 递归记录自身故障。
-func (l *Logger) Debug(ctx context.Context, message string, fields ...Fields) error {
-	// 1. 固定本次级别为 DEBUG，其他字段、级别过滤和写入错误统一交给 write 处理并原样返回。
-	return l.write(ctx, zapcore.DebugLevel, message, fields)
+// Debug 输出调试日志。fields 可省略或提供一项；低于最低级别时不产生输出。
+// 各级打印方法不返回错误，参数、编码或写入故障在 Logger 内部通过独立 stderr 报告。
+func (l *Logger) Debug(ctx context.Context, message string, fields ...Fields) {
+	// 1. 固定本次级别为 DEBUG，复用原有字段填充、级别过滤及同步写入流程。
+	// 直接调用 write，保持调用栈层级不变，使 caller 继续指向业务中实际打印的位置。
+	if err := l.write(ctx, zapcore.DebugLevel, message, fields); err != nil {
+		// 1.1. 日志自身故障统一交给私有兜底，不要求业务方处理或修改其执行结果。
+		reportWriteFailure(ctx, err)
+	}
 }
 
 // Info 输出普通日志，可选字段及错误处理约定与 Debug 相同。
-func (l *Logger) Info(ctx context.Context, message string, fields ...Fields) error {
-	// 1. 固定本次级别为 INFO，复用公共写入流程，避免与其他级别产生不同的字段填充规则。
-	return l.write(ctx, zapcore.InfoLevel, message, fields)
+func (l *Logger) Info(ctx context.Context, message string, fields ...Fields) {
+	// 1. 固定本次级别为 INFO，复用公共写入流程，自动字段及调用位置遵循相同规则。
+	if err := l.write(ctx, zapcore.InfoLevel, message, fields); err != nil {
+		// 1.1. 仅在发生日志故障时向独立 stderr 报告，不递归调用 Logger 或返回业务错误。
+		reportWriteFailure(ctx, err)
+	}
 }
 
 // Warn 输出警告日志，可选字段及错误处理约定与 Debug 相同。
-func (l *Logger) Warn(ctx context.Context, message string, fields ...Fields) error {
-	// 1. 固定本次级别为 WARN，记录警告本身不会触发重试、终止进程或改变传入 Context。
-	return l.write(ctx, zapcore.WarnLevel, message, fields)
+func (l *Logger) Warn(ctx context.Context, message string, fields ...Fields) {
+	// 1. 固定本次级别为 WARN，只执行日志写入，不触发业务重试、终止进程或改变 Context。
+	if err := l.write(ctx, zapcore.WarnLevel, message, fields); err != nil {
+		// 1.1. 写入失败由 Logger 内部独立兜底，调用方仍按原业务路径继续处理。
+		reportWriteFailure(ctx, err)
+	}
 }
 
 // Error 输出故障日志，可选字段及错误处理约定与 Debug 相同。
-func (l *Logger) Error(ctx context.Context, message string, fields ...Fields) error {
-	// 1. 固定本次级别为 ERROR，只执行公共日志写入；写入失败通过返回值交给调用方处理。
-	return l.write(ctx, zapcore.ErrorLevel, message, fields)
+func (l *Logger) Error(ctx context.Context, message string, fields ...Fields) {
+	// 1. 固定本次级别为 ERROR，表达业务故障级别；写入流程与其他日志级别一致。
+	if err := l.write(ctx, zapcore.ErrorLevel, message, fields); err != nil {
+		// 1.1. 日志本身的故障只走独立 stderr，不追加另一条业务错误日志或修改业务返回。
+		reportWriteFailure(ctx, err)
+	}
 }
 
 // Sync 转交输出器的 Sync 方法；输出器未提供该方法时不执行同步操作。
@@ -118,7 +131,8 @@ func (l *Logger) Sync() error {
 	return nil
 }
 
-// write 是四级日志方法的公共写入流程，负责字段来源、同步编码输出及错误返回。
+// write 是四级日志方法的私有写入流程，负责字段来源、同步编码输出及内部错误返回。
+// 返回错误仅供打印方法执行统一兜底，不暴露给业务调用方。
 func (l *Logger) write(ctx context.Context, level zapcore.Level, message string, fields []Fields) error {
 	// 1. 确认 Logger 的编码器和输出器均存在；不完整实例无法保证字段格式和写入行为，直接返回错误。
 	if l == nil || l.encoder == nil || l.output == nil {

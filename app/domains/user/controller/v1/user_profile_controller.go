@@ -15,6 +15,7 @@ import (
 	authnjwt "go-service-template/internal/authn/jwt"
 	"go-service-template/internal/check"
 	"go-service-template/internal/composition"
+	"go-service-template/internal/logger"
 	"go-service-template/internal/response"
 
 	"github.com/gin-gonic/gin"
@@ -162,26 +163,41 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 
 // GenerateUserAvatar 仅允许已认证的 user/member 生成头像，不修改用户资料。
 // Prompt 由 Validator 校验，Service 先经 Qwen 优化再生成图片；调用沿用内部 Request Context。
-// 成功只返回头像地址。
+// 成功只返回头像地址，流程日志在实际执行位置记录，HTTP 状态和耗时由公共入口统计。
 func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *userprofiledto.GenerateUserAvatarRequest) {
-	// 1. 要求可信的 user/member 身份，未满足接口调用资格时不执行提示词优化或图片生成。
+	// 1. 从当前内部 Request Context 派生 Controller 操作作用域，并交回本次请求供后续处理使用。
+	// WithCurrentOperation 自动识别具名方法，保留 TraceId 和响应等待层已经应用的取消隔离。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	// 2. 取得共享 Logger 并记录请求已到达当前 Controller，不记录提示词、凭证或完整请求。
+	lg := logger.Current()
+	lg.Info(requestCtx, "User avatar request received")
+	// 3. 要求可信的 user/member 身份，未满足接口调用资格时不执行提示词优化或图片生成。
 	if _, err := httpauthz.RequireMemberUserID(ctx); err != nil {
-		// 1.1. 通过原有错误映射输出响应，随后立即结束本次 Controller 方法。
+		// 3.1. 在拒绝位置直接记录固定原因，日志故障由 Logger 内部处理，响应继续使用原有错误映射。
+		lg.Warn(requestCtx, "User avatar request rejected", logger.Fields{
+			Error: "User avatar request access denied",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 2. 继续将内部 Request Context 传给 Service，保留 TraceId 与响应等待层已隔离取消的契约。
+	// 4. 将 Controller 派生 Context 传给 Service；Service 在自己的派生节点建立操作作用域。
 	// 提示词仍通过显式 Params 传递，不将 DTO 或业务参数放入 Context。
-	result, err := composition.Current().UserProfile.GenerateUserAvatar(ctx.Request.Context(), userservice.GenerateUserAvatarParams{
+	result, err := composition.Current().UserProfile.GenerateUserAvatar(requestCtx, userservice.GenerateUserAvatarParams{
 		Prompt: request.Prompt,
 	})
 	if err != nil {
-		// 2.1. 任一远端步骤失败时沿用 Service 返回错误，不在 Controller 重新解释流程结果。
+		// 4.1. 在失败分支直接记录 Service 调用结果，具体阶段由 Service 日志表达，原错误继续用于响应。
+		lg.Error(requestCtx, "User avatar request failed", logger.Fields{
+			Error: "User avatar generation service failed",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 3. 成功只返回本次生成的头像地址，不修改或持久化用户资料。
+	// 5. 返回头像地址并记录 Controller 已完成结果处理，不修改用户资料或记录地址与完整响应。
+	// 真实对外响应仍由 HTTP 入口观察，方法处理完成不保证客户端已收到正文。
 	response.Success(ctx, userprofiledto.GenerateUserAvatarResponse{AvatarURL: result.AvatarURL})
+	lg.Info(requestCtx, "User avatar request handled")
 }
 
 // UpdateUserProfile 使用 Validator 已校验的完整资料及版本调用 Service。
