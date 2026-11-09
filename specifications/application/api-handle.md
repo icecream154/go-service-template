@@ -51,6 +51,7 @@ Repository 返回表结构或 error
 main → run
   → bootstrap.Init
       → env.Init：读取部署环境和区域
+      → logger.Init：读取日志配置、生成实例标识并发布共享 Logger
       → company.Init：读取公司服务配置、创建共享 Transport 和 Image Client
       → thirdparty.Init：选择环境目录，经 AI、LLM 分组装配 Qwen、MiniMax 并发布共享实例
       → 加载 JWT 配置、校验密钥并初始化共享签发与认证组件
@@ -71,6 +72,8 @@ main → run
 
 环境、配置和数据库连接初始化成功后，程序才开始监听端口。默认地址为 `:8080`；启动方式和配置准备见 [README](../../README.md)。数据库及表结构需要提前准备，启动流程不自动建表，也不创建示例用户。
 
+Logger 的启动装配中，`bootstrap.Init` 只调用 `logger.Init`，传入 `logger` 配置叶子目录和已有部署配置。`internal/logger` 读取所选环境的 `dev.yml`、`test.yml` 或 `prod.yml`，配置仅包含 `service_name` 和 `min_level`；开发使用 `DEBUG`，测试和生产使用 `INFO`。加载严格限定单文档和已知字段，不展开环境变量或回退其他环境。包内生成一次 32 位十六进制实例标识，构造向 stdout 同步写 JSON 的共享 Logger。初始化失败不发布实例，具体约定见[日志初始化与共享实例](application-log.md#启动初始化与共享实例)。
+
 第三方 Client 的启动装配中，`bootstrap.Init` 只调用根 `thirdparty.Init(configDir, environment)` 并处理资源清理，其 `configDir` 为 `integrations/thirdparty` 叶子目录，环境仅支持 `dev/test/prod`。根层选择 `<environment>/ai` 后交给 `ai.NewClients`，AI 层将 `llm` 目录交给 `llm.NewClients`，由 LLM 层读取 `qwen.yml`、`minimax.yml` 并调用各自的 Loader、构造方法。根层不维护具体供应商文件名，子层不设置全局 `Init` 或 `Current`。注册配置缺失或非法时停止启动，不回退其他环境，也不在启动时调用模型；其他尚未注册的 SDK 占位文件不要求提前提供配置。
 
 `cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器及请求分发外层的 TraceId 中间件；每次请求先确定 TraceId，再选择一个等待包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层 TraceId 和响应等待控制，需要 TraceId 时由调用方用 `middleware.TraceID(engine)` 包装。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过 TraceId 和等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
@@ -79,6 +82,7 @@ main → run
 
 | 位置 | 启动时准备的对象 | 请求中如何使用 |
 | --- | --- | --- |
+| [internal/logger](../../internal/logger/runtime.go) | 已加载日志配置并生成实例标识的共享 Logger | `logger.Current()` 获取；日志方法接收标准 Context，现有业务日志尚未统一切换 |
 | [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 作为 `authn.Authenticator` 传给 Router 的全局可选认证中间件；创建成功后 Controller 取得组件签发凭证 |
 | [HTTP 认证中间件](../../app/http/middleware/authentication.go) | 捕获已装配认证器的 Gin Handler | 认证已提供的凭证并保存 Principal；Controller 调用 authz，共用方法通过 `PrincipalFromContext` 读取 |
 | [TraceId 中间件](../../app/http/middleware/trace_id.go)、[公共读写方法](../../internal/traceid/trace_id.go) | 包装请求分发的 `net/http` Handler；公共方法不保存全局请求状态 | 入站确定 TraceId，保存到标准 Request Context，并通过响应头和 company 请求头传递 |
@@ -95,6 +99,8 @@ MySQL 组件为每个启用的命名连接创建独立连接池，完成连通�
 `Current()` 的含义是“取得已经初始化的共享对象”。它本身不创建 Service、Repository 或连接池，也不执行 SQL。初始化前调用会触发异常，因此启动顺序是请求能够正常工作的前提。
 
 `thirdparty.Current()` 返回分组集合的值副本，各 SDK Client 指针仍指向同一共享实例；重复初始化报错，配置及实例发布后只读。修改配置通过重启生效；单次调用的模型由 Params 指定，不改变共享 Client。
+
+`logger.Current()` 返回已经发布的 Logger 指针，初始化前调用会 panic，重复初始化返回错误。包级 `logger.Sync()` 未初始化时直接返回 nil，因此进程入口可以在初始化前登记最终同步；Logger 没有关闭 stdout 或替换全局标准库日志的隐式行为。
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
@@ -129,7 +135,7 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
-现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。当前机制完成标识生成和传递，尚未自动为日志注入 TraceId，也未创建或导出 Span；后续规划见[日志与可观测性体系设计](application-log.md#4-统一标识与链路上下文)。
+现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。公共 Logger 已能从标准 Context 自动读取 TraceId，并已完成启动初始化；现有请求日志尚未统一切换到该 Logger，也未创建或导出 Span。日志字段及操作作用域见[请求日志规范](application-log.md)。
 
 ## 3. 跟随一次 createUser 请求
 
@@ -530,7 +536,9 @@ HTTP JSON
 
 3. **共享资源只在 HTTP 和内部处理均确认结束后正常关闭。** 两部分收尾均成功时，入口才调用 company、thirdparty 集合的 `CloseIdleConnections()` 清理 HTTP 空闲连接，并关闭数据库。thirdparty 按 AI、LLM 分组逐层清理 Qwen、MiniMax 的空闲连接，不取消在途调用；装配后续实例失败时也清理已创建的实例。启动装配、路由或监听失败、尚未开始处理请求时，应正常释放已创建的资源。HTTP 收尾失败可以强制关闭 HTTP 连接，但这不能取消内部跟踪，更不能据此提前关闭仍被业务使用的连接池。
 
-4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭 company、thirdparty 和数据库的共享资源，并以失败状态退出；进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
+   `run` 在应用初始化前登记最终 `logger.Sync()`，在已有 Client、数据库清理后同步日志；初始化失败或取消时也会同步已经创建的 Logger，尚未初始化时同步为空操作。共享 Logger 没有内部缓冲，stdout 只暴露写入能力，同步不关闭 stdout，也不调用终端或管道不支持的文件系统同步。
+
+4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭 company、thirdparty 和数据库的共享资源，并跳过 Logger 同步，避免等待仍在写日志的内部工作；随后以失败状态退出。进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
 
 ## 8. 第一次看代码时的阅读顺序
 

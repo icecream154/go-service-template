@@ -100,4 +100,23 @@ if err := log.Info(ctx, "HTTP call completed", logger.Fields{
 }
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。HTTP 操作识别仍待中间件提供；尚未在业务入口调用封装，也未创建全局 Logger、加载配置文件、接入启动流程或替换业务日志，未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程；HTTP 操作识别仍待中间件提供，现有业务入口和日志尚未统一迁移，未新增测试用例。
+
+## 启动初始化与共享实例
+
+`bootstrap.Init` 在 `env.Init()` 成功后、其他应用依赖创建前调用 `logger.Init(configDir, deployment)`。这里的 `configDir` 为配置根目录下的 `logger` 叶子目录，`deployment` 直接使用已有 `env.Current()`。配置选择、读取、实例标识生成、Logger 构造及共享实例发布均由 `internal/logger` 完成，bootstrap 只负责调用和初始化顺序。
+
+配置文件为 `config/logger/dev.yml`、`test.yml`、`prod.yml`，只声明以下两个字段，不重复保存部署环境或进程实例标识：
+
+```yaml
+service_name: go-service-template
+min_level: INFO
+```
+
+开发环境的 `min_level` 为 `DEBUG`，测试和生产为 `INFO`。只读取所选环境的文件，缺失时不回退；加载仅接受一份 YAML 文档及已声明字段，不展开环境变量。非法配置阻止启动，不发布部分实例。
+
+`Init` 为本次初始化生成 16 字节随机数并编码为 32 位十六进制 `instance_id`，与配置中的服务名称、最低级别及复用的部署环境一起注入 `New`。共享 Logger 固定向 stdout 同步写入单行 JSON，不创建本地文件，也不接管 stdout 的关闭责任。启动装配只向输出适配器暴露 `Write`，当前没有内部缓冲，因此共享实例同步时不对终端或管道执行文件系统同步；独立调用 `New` 时，调用方仍可注入自己的 Writer，并遵循其原有 `Sync()` 契约。
+
+初始化全部成功后才一次性发布共享实例，后续通过 `logger.Current()` 获取。初始化前调用 `Current()` 会 panic，重复成功调用 `Init` 返回错误，运行中不重新加载配置或替换实例。包级 `logger.Sync()` 在尚未初始化时返回 nil；已初始化时先取得共享实例快照、释放共享锁，再执行实例同步。
+
+进程入口 `run` 在初始化前登记最终日志同步，覆盖初始化失败、主动取消及正常退出路径；成功启动后，先等待 HTTP 和内部工作结束，再清理 Client 和数据库，最后调用 `logger.Sync()`。未完全排空时沿用异常退出流程，跳过共享资源清理及日志同步，避免等待仍在写日志的后台工作；同步不关闭 stdout，也不代表采集平台已持久化数据。最终故障报告继续使用现有标准库日志兜底，不递归写入发生故障的 Logger。
