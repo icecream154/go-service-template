@@ -129,11 +129,11 @@ Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 
-**当前 Qwen、MiniMax 均已实现独立配置读取、Client 构造、单轮非流式文本生成和空闲连接清理，并按功能逐层接入进程启动装配。两个 Client 均有 dev、test、prod 三套 YAML 配置，共用项目现有的 OpenAI Go SDK 3.96 依赖；项目使用 Go 1.26。其他供应商仍为包占位。**
+**当前 Qwen、MiniMax 均已实现独立配置读取、Client 构造、单轮非流式文本生成和空闲连接清理，并按功能逐层接入进程启动装配。两者使用 `llm` 层统一的出入参、错误类型和私有 OpenAI 兼容调用实现，各自保留独立配置、模型范围和供应商协议适配。两个 Client 均有 dev、test、prod 三套 YAML 配置，共用项目现有的 OpenAI Go SDK 3.96 依赖；项目使用 Go 1.26。其他供应商仍为包占位。**
 
 ### 按功能组织目录
 
-先按功能、子功能划分目录，最后通过文件名区分供应商或产品。同一功能目录内的供应商文件属于同一个 Go 包，类型名称包含具体产品名，避免同包重名。
+先按功能、子功能划分目录，最后通过文件名区分供应商或产品。同一功能目录内的文件属于同一个 Go 包；公共用例类型在功能层统一声明，供应商专属 Client、配置和模型常量的名称包含具体产品名。
 
 ```text
 app/integrations/thirdparty/
@@ -142,6 +142,9 @@ app/integrations/thirdparty/
 │   ├── clients.go
 │   ├── llm/
 │   │   ├── clients.go
+│   │   ├── text.go
+│   │   ├── error.go
+│   │   ├── openai_compatible.go
 │   │   ├── qwen.go
 │   │   ├── gemini.go
 │   │   ├── glm.go
@@ -153,28 +156,52 @@ app/integrations/thirdparty/
     └── tencent_cos.go
 ```
 
-以 Qwen 为例，`ai/llm/qwen.go` 属于 `llm` 包，在该文件内组织 `QwenClient`、`QwenConfig`、`LoadQwenConfig(path)`、`NewQwenClient(config)`、`CloseIdleConnections`，以及用例专属的 `QwenGenerateTextParams`、`QwenGenerateTextResult` 和 SDK 适配。`minimax.go` 按相同边界组织 `MiniMaxClient`、`MiniMaxConfig` 及其 Loader、构造方法和用例类型。
+`ai/llm/text.go` 声明公共文本生成参数、结果及参数校验；`error.go` 声明统一错误类型；`openai_compatible.go` 封装私有 OpenAI 兼容调用逻辑。`clients.go` 负责装配已接入的供应商 Client。
+
+`qwen.go` 保留 `QwenClient`、`QwenConfig`、`LoadQwenConfig(path)`、`NewQwenClient(config)`、模型常量，以及 `GenerateText` 和 `CloseIdleConnections` 的薄包装。`minimax.go` 按相同边界组织 MiniMax 专属类型、入口和模型常量，另行处理 `base_resp` 等供应商协议差异。公共类型不再按供应商重复声明。
 
 ### SDK 封装边界
 
-Qwen 和 MiniMax Client 各自私有持有 OpenAI Go SDK 的 `ChatCompletionService`，分别通过供应商的 OpenAI 兼容接口调用。通过公开的 `NewChatCompletionService` 构造并显式注入配置，避免引入 `OPENAI_*` 环境默认头。当前覆盖单轮、非流式文本生成，将项目参数转换为 SDK 请求，并将 SDK 响应转换为只含 `Content` 的项目结果；读取候选结果前处理空候选情况，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其参数、结果，不导入 SDK 类型。
+Qwen 和 MiniMax Client 各自持有私有 OpenAI 兼容调用实现的独立实例，复用构造和执行逻辑，分别使用自己的 SDK、认证、超时与 Transport。公共实现通过 `NewChatCompletionService` 构造 SDK 并显式注入配置，避免引入 `OPENAI_*` 环境默认头；集中处理 Transport 和 HTTP Client 构造、单次调用超时、请求转换、SDK 执行和错误转换、候选文本提取及空闲连接清理。这个私有实现服务于 OpenAI 兼容协议，后续使用其他 SDK 的供应商可以复用公开用例类型、自行实现协议适配。
 
-`QwenGenerateTextParams` 包含 `Model string` 和 `Prompt string`。每次调用 `GenerateText` 都必须提供 Model，当前仅支持 `QwenModel38Max`（`qwen3.8-max`）、`QwenModel37Plus`（`qwen3.7-plus`）和 `QwenModel38Flash`（`qwen3.8-flash`）三个常量对应的精确值。模型为空、全空白或不受支持时在发送请求前报错，不裁剪空白、不设置默认模型。Qwen Client 不保存模型，支持的模型复用同一服务地址、认证配置及 Transport：
+两个 Client 的 `GenerateText` 均接收 `llm.GenerateTextParams`，返回 `*llm.GenerateTextResult`：
 
 ```go
-params := llm.QwenGenerateTextParams{
-    Model:  llm.QwenModel38Max,
-    Prompt: "你是谁",
+type GenerateTextParams struct {
+    Model  string
+    Prompt string
+}
+
+type GenerateTextResult struct {
+    Content string
 }
 ```
 
-`MiniMaxGenerateTextParams` 同样要求每次传入非空白 Model，合法值原样发送，不设置默认模型。当前不额外限制 MiniMax 模型白名单；以下只是官方示例模型，不代表默认值或唯一支持的模型：
+当前只覆盖单轮、非流式文本生成。公共参数的 `validate(supportedModels ...string)` 校验 Model 必填并精确匹配允许值；各 Client 传入自己文件内声明的模型常量，公共参数不维护供应商到模型的映射。模型为空、全空白或不受支持时在发送请求前报错，不裁剪空白、不设置默认模型；Prompt 和生成文本也按原值传递。
+
+| Client | 当前允许的模型常量与精确值 |
+| --- | --- |
+| Qwen | `QwenModel38Max`（`qwen3.8-max`）、`QwenModel37Plus`（`qwen3.7-plus`）、`QwenModel38Flash`（`qwen3.8-flash`） |
+| MiniMax | `MiniMaxModelM31Flash`（`MiniMax-M3.1-Flash`）、`MiniMaxModelM3`（`MiniMax-M3`） |
+
+调用顺序为参数校验、公共 SDK 调用、供应商特有响应校验、公共文本提取。公共调用和文本提取分为两个内部步骤，MiniMax 在两者之间检查 `base_resp`；公共文本提取检查空响应、空候选和文本字段有效性，再返回仅含 `Content` 的结果，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其公共参数、结果，不导入 SDK 类型。
 
 ```go
-params := llm.MiniMaxGenerateTextParams{
-    Model:  "MiniMax-M3.1-Flash",
-    Prompt: "你是谁",
-}
+qwenResult, err := thirdparty.Current().AI.LLM.Qwen.GenerateText(
+    ctx,
+    llm.GenerateTextParams{
+        Model:  llm.QwenModel38Max,
+        Prompt: "你是谁",
+    },
+)
+
+miniMaxResult, err := thirdparty.Current().AI.LLM.MiniMax.GenerateText(
+    ctx,
+    llm.GenerateTextParams{
+        Model:  llm.MiniMaxModelM31Flash,
+        Prompt: "你是谁",
+    },
+)
 ```
 
 ### 配置注入
@@ -241,8 +268,8 @@ Controller、Service 和第三方 Client 继续传递标准 `context.Context`。
 
 首期显式使用 `option.WithMaxRetries(0)` 关闭 SDK 自动重试。后续需要重试时，再明确次数及完整操作预算，避免 SDK 与业务层重复重试。HTTP Client 注入和重试选项见[OpenAI Go SDK 官方文档](https://developers.openai.com/api/reference/go)。
 
-SDK 或远端协议错误在对应 Client 边界适配为项目可识别的错误，提供可公开英文文案，内部按需保留原始 cause 和受控诊断信息；Service 收到后原样返回，不向 Controller 传递完整供应商正文或 SDK 对象。错误边界遵守[错误文案责任](api-error.md#23-错误文案的责任)。
+SDK 或远端协议错误统一适配为 `llm.ClientError`，包含 `Provider`（供应商名称）、`StatusCode`（SDK HTTP 错误状态）、`ProviderCode`（供应商业务错误码）及私有原始 cause。公开英文错误文案不包含远端正文、请求内容或密钥；`Unwrap()` 保留原因，支持通过 `errors.Is` 识别取消、超时，通过 `errors.As` 读取受控分类字段。这些状态字段不直接决定对外 HTTP 状态。Service 收到后原样返回，不向 Controller 传递完整供应商正文或 SDK 对象。错误边界遵守[错误文案责任](api-error.md#23-错误文案的责任)。
 
-MiniMax 还在 Client 边界适配供应商协议错误：即使 HTTP 为 200，响应中的 `base_resp.status_code` 非零也按失败处理，不转换成成功文本。
+缺失有效候选文本或供应商响应字段格式非法时，错误链包含公共 `llm.ErrInvalidResponse`，可用 `errors.Is` 统一识别。MiniMax 仍在自己的 Client 边界检查 `base_resp`：标准 OpenAI 响应可以省略该字段，存在时必须含整数状态码；即使 HTTP 为 200，`base_resp.status_code` 非零也返回 `ClientError` 并记录 `ProviderCode`，在公共文本提取之前结束调用，不转换成成功文本。
 
 第三方调用保留 Context 中的 TraceId 供本地关联，默认不向供应商发送 company 使用的自定义 `TraceId` 请求头。供应商明确支持并需要某种关联头时，再在对应 Client 内适配。

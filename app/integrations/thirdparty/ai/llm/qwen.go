@@ -6,15 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
 	"gopkg.in/yaml.v3"
 )
 
@@ -72,11 +68,9 @@ func (config QwenConfig) validate() error {
 }
 
 // QwenClient 封装阿里云 OpenAI 兼容接口，构造完成后允许并发复用。
-// SDK、配置及 Transport 均为私有字段，不保存单次请求状态。
+// 私有公共实现持有独立的 SDK 和 Transport，不保存单次请求状态。
 type QwenClient struct {
-	sdk            openai.ChatCompletionService
-	requestTimeout time.Duration
-	transport      *http.Transport
+	client *openAICompatibleClient
 }
 
 // NewQwenClient 按注入配置创建 SDK Client，不发起远端请求或接入启动单例。
@@ -85,60 +79,21 @@ func NewQwenClient(config QwenConfig) (*QwenClient, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
-	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok || defaultTransport == nil {
-		return nil, errors.New("default HTTP transport must be an *http.Transport")
+	client, err := newOpenAICompatibleClient(qwenProvider, config.BaseURL, config.APIKey, config.ConnectTimeout, config.RequestTimeout)
+	if err != nil {
+		return nil, err
 	}
-	transport := defaultTransport.Clone()
-	transport.DialContext = (&net.Dialer{
-		Timeout:   config.ConnectTimeout,
-		KeepAlive: 30 * time.Second,
-	}).DialContext
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   config.RequestTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	// 仅构造所需的 SDK 接口，避免继承进程中的 OPENAI_* 环境配置及自定义头。
-	sdk := openai.NewChatCompletionService(
-		option.WithAPIKey(config.APIKey),
-		option.WithBaseURL(config.BaseURL),
-		option.WithHTTPClient(httpClient),
-		option.WithMaxRetries(0),
-	)
-	return &QwenClient{
-		sdk:            sdk,
-		requestTimeout: config.RequestTimeout, transport: transport,
-	}, nil
+	return &QwenClient{client: client}, nil
 }
 
 // CloseIdleConnections 释放自有连接池的空闲连接，不取消正在执行的请求。
 func (c *QwenClient) CloseIdleConnections() {
-	if c != nil && c.transport != nil {
-		c.transport.CloseIdleConnections()
+	if c != nil {
+		c.client.closeIdleConnections()
 	}
 }
 
-// QwenClientError 表达 SDK 调用故障，公开文案不包含供应商正文、请求内容或密钥。
-// StatusCode 在收到 SDK HTTP 错误时保存远端状态，仅供上层分类，不直接决定对外状态。
-type QwenClientError struct {
-	StatusCode int
-	cause      error
-}
-
-func (err *QwenClientError) Error() string {
-	return "Qwen text generation request failed"
-}
-
-// Unwrap 保留原始原因，供 errors.Is 识别执行取消、超时等情况。
-func (err *QwenClientError) Unwrap() error {
-	return err.cause
-}
-
-// ErrQwenInvalidResponse 表示远端未提供当前单轮文本接口所需的候选文本。
-var ErrQwenInvalidResponse = errors.New("Qwen text generation response must contain a text choice")
+const qwenProvider = "Qwen"
 
 // 当前支持的 Qwen 文本生成模型，由每次调用的 Model 参数指定。
 const (
@@ -147,64 +102,19 @@ const (
 	QwenModel38Flash = "qwen3.8-flash"
 )
 
-// QwenGenerateTextParams 表示单轮、非流式文本生成的输入，Prompt 原样交给模型。
-type QwenGenerateTextParams struct {
-	// Model 每次调用必填，仅允许上述模型常量；Client 不补充默认值。
-	Model  string
-	Prompt string
-}
-
-// QwenGenerateTextResult 只返回生成文本，不向业务层暴露 SDK 响应类型。
-type QwenGenerateTextResult struct {
-	Content string
-}
-
-// validate 校验本次调用的模型，不改写参数或补充默认值。
-func (params QwenGenerateTextParams) validate() error {
-	if strings.TrimSpace(params.Model) == "" {
-		return errors.New("Qwen model is required")
-	}
-	switch params.Model {
-	case QwenModel38Max, QwenModel37Plus, QwenModel38Flash:
-		return nil
-	default:
-		return errors.New("Qwen text generation model is not supported")
-	}
-}
-
 // GenerateText 使用本次入参指定的模型调用 Chat Completions，不额外重试。
 // 传入 Context 的值和更早的取消期限继续生效，request_timeout 限制本次完整操作。
 // 不向阿里云发送自定义 TraceId 请求头，不裁剪输入或生成文本。
-func (c *QwenClient) GenerateText(ctx context.Context, params QwenGenerateTextParams) (*QwenGenerateTextResult, error) {
-	if c == nil || c.transport == nil {
+func (c *QwenClient) GenerateText(ctx context.Context, params GenerateTextParams) (*GenerateTextResult, error) {
+	if c == nil || c.client == nil {
 		return nil, errors.New("Qwen client is not initialized")
 	}
-	if ctx == nil {
-		return nil, errors.New("Qwen request context is required")
-	}
-	if err := params.validate(); err != nil {
+	if err := params.validate(QwenModel38Max, QwenModel37Plus, QwenModel38Flash); err != nil {
 		return nil, err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
-	defer cancel()
-	completion, err := c.sdk.New(callCtx, openai.ChatCompletionNewParams{
-		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage(params.Prompt)},
-		Model:    openai.ChatModel(params.Model),
-	})
+	completion, err := c.client.createCompletion(ctx, params)
 	if err != nil {
-		failure := &QwenClientError{cause: err}
-		var apiError *openai.Error
-		if errors.As(err, &apiError) {
-			failure.StatusCode = apiError.StatusCode
-		}
-		return nil, failure
+		return nil, err
 	}
-	if completion == nil || len(completion.Choices) == 0 {
-		return nil, ErrQwenInvalidResponse
-	}
-	message := completion.Choices[0].Message
-	if !message.JSON.Content.Valid() {
-		return nil, ErrQwenInvalidResponse
-	}
-	return &QwenGenerateTextResult{Content: message.Content}, nil
+	return c.client.textResult(completion)
 }
