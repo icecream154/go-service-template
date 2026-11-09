@@ -14,10 +14,11 @@
   → HTTPHandler 按方法和路径选择响应等待配置
   → 响应等待超时中间件：控制客户端等待，不取消内部业务
   → Gin 匹配路由，执行公共中间件
+  → /api 全局可选认证：无 Authorization 头匿名继续，有凭证则验证并保存 Principal
   → 对应用例的 Validator
       → Bind：HTTP 参数映射为 Request DTO
       → validateXxxRequest：校验请求字段
-  → Controller：将 Request DTO 映射为 Service 参数
+  → Controller：按接口要求调用 authz 检查身份，执行接口访问规则，再构造 Service 参数
   → Service：执行业务流程
   → Repository：执行数据库操作
   → MySQL
@@ -56,7 +57,9 @@ main → run
       → runtime.Init：创建数据库连接和 Repository
       → composition.Init：创建默认 Service
   → routers.NewHTTPHandler
-      → routers.New：创建 Controller、Validator 并注册路由
+      → routers.New(authnjwt.Current())：传入共享认证器
+          → /api 分组挂载一次 AuthenticateIfPresent
+          → 创建 Controller、Validator 并注册各版本的领域路由
       → 为同一个 Gin Engine 装配默认及接口覆盖的响应等待包装器
   → net.Listen
   → http.Server.Serve：开始接收 HTTP 请求
@@ -64,13 +67,14 @@ main → run
 
 环境、配置和数据库连接初始化成功后，程序才开始监听端口。默认地址为 `:8080`；启动方式和配置准备见 [README](../../README.md)。数据库及表结构需要提前准备，启动流程不自动建表，也不创建示例用户。
 
-`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine 和各个等待包装器，请求到来时只选择一个包装器执行，不重新创建路由或中间件。`routers.New` 仍只返回 Gin Engine，直接使用它不会启用这层等待控制。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
+`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine 和各个等待包装器，请求到来时只选择一个包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层响应等待控制。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
 
 ### 2.2 共享对象分别由谁持有
 
 | 位置 | 启动时准备的对象 | 请求中如何使用 |
 | --- | --- | --- |
-| [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | `createUser` 的 Controller 在创建成功后取得组件并签发凭证；尚未接入 HTTP 认证中间件 |
+| [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 作为 `authn.Authenticator` 传给 Router 的全局可选认证中间件；创建成功后 Controller 取得组件签发凭证 |
+| [HTTP 认证中间件](../../app/http/middleware/authentication.go) | 捕获已装配认证器的 Gin Handler | 认证已提供的凭证并保存 Principal；Controller 调用 authz，共用方法通过 `PrincipalFromContext` 读取 |
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
@@ -104,6 +108,8 @@ app/domains/user/
 
 目前这些 DTO 只在用户资料 Controller 内复用，因此不建立 `dto/v1/shared` 包。将来真正存在跨 Controller 且语义一致的 DTO 时，再按需建立版本内的共享包；具体约定见[接口路由与命名规范](api-routing.md)。
 
+Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../../app/http/authz/)：`principal.go` 检查是否已有指定身份，`member.go` 按项目成员约定转换用户 ID。这些是读取请求身份的普通函数，不在启动时创建新对象，也不作为额外中间件挂载；各接口的目标访问规则仍留在 Controller。
+
 ## 3. 跟随一次 createUser 请求
 
 ### 3.1 客户端发送请求
@@ -126,11 +132,11 @@ Content-Type: application/json
 
 客户端提交账户身份声明和初始资料。内部用户 ID、启用状态、版本及持久化时间由服务端生成。
 
-`createUser` 允许匿名调用，不要求已有内部用户 ID 或身份凭证。账户来源和外部账户标识仍只是请求中的声明，这一步不会核验外部身份；创建后签发的凭证只对应新建的本地用户。具体契约见 [user 领域接口权限规范](../domains/user/api-authorization.md#4-创建用户与首次凭证签发)。
+`createUser` 允许匿名调用，不要求已有内部用户 ID 或身份凭证；匿名请求省略 Authorization 头。如果携带了错误、过期或格式不合法的凭证，会先被全局认证中间件拒绝。账户来源和外部账户标识仍只是请求中的声明，不会据此核验外部身份；创建后签发的凭证只对应新建的本地用户。具体契约见 [user 领域接口权限规范](../domains/user/api-authorization.md#4-创建用户与首次凭证签发)。
 
-### 3.2 Gin 根据方法和路径找到入口
+### 3.2 Gin 匹配路由并执行全局可选认证
 
-[routers/web.go](../../routers/web.go) 的 `New` 创建 Gin Engine，安装请求日志、异常恢复中间件，并建立 `/api/v1` 分组。
+[routers/web.go](../../routers/web.go) 的 `New(authenticator)` 创建 Gin Engine，安装请求日志、异常恢复中间件；在 `/api` 分组挂载一次 `AuthenticateIfPresent(authenticator)`，再建立 `/v1` 等版本分组。版本及领域路由继承该中间件，不逐接口重复注册认证步骤。
 
 随后，[用户领域 Router](../../app/domains/user/routers/router.go) 注册领域和 Controller 分组：
 
@@ -140,12 +146,15 @@ userProfile := user.Group("/userProfile")
 userProfile.POST("/createUser", r.createUserValidator.CreateUser)
 ```
 
-合并后的完整路径就是 `/api/v1/user/userProfile/createUser`。这里注册的入口是 **Validator 的 `CreateUser` 方法**。
+合并后的完整路径就是 `/api/v1/user/userProfile/createUser`。这里注册的用例入口是 **Validator 的 `CreateUser` 方法**，执行前先经过 `/api` 分组继承的可选认证。
 
 一次请求到来后，Gin 按 HTTP 方法和路径选择已注册的处理链。公共中间件围绕后续处理执行：
 
 - `gin.Logger` 记录方法、路径以及内部处理链的状态码和耗时；外层另行记录选定的 HTTP 状态和等待耗时，不能把晚到的内部成功日志当作客户端收到了成功响应，也不能仅凭 503 判断发生了超时。
 - `gin.CustomRecovery` 捕获当前请求处理链中的未处理 `panic`，框架错误的返回方式见第 5 节。
+- `AuthenticateIfPresent` 只在完全没有 Authorization 头时匿名放行；头显式为空、重复或格式错误时返回 400，凭证无效、过期或方案不支持时返回 401，技术故障返回 500。携带有效凭证时先保存 Principal，再进入 Validator；失败时不降级匿名，公开接口也遵守这一规则。
+
+可选认证只确认身份，不决定接口访问资格。Validator 仍先检查请求参数，Controller 随后按接口规则读取身份并执行访问检查；匿名且参数非法的请求因此可以先返回 400，参数通过后才在受保护 Controller 返回缺少身份的 401。不存在的路由沿用 `NoRoute` 的 404，不通过 `/api` 分组补做认证。完整头部规则和身份读取方式见[HTTP 认证适配层](api-authentication.md#7-http-认证适配层)。
 
 Gin 为本次请求准备 `*gin.Context`，其中的 `Request` 提供原始 HTTP 请求，`Writer` 用于写出响应。Validator、Controller 和响应方法接收的是同一个 `ctx`；它属于单次请求，不保存在共享对象中。这里的 Gin Context 与启动入口用于停止进程的 `context.Context` 是不同对象。
 
@@ -236,7 +245,7 @@ if err != nil {
 
 Controller 先设置 `Cache-Control: no-store`，避免后续含令牌的响应被缓存；设置 Header 本身还没有写出正文。随后将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_service.go)，调用启动时已经创建的 Service。创建失败时，通过本文件的 `mapUserProfileErrorCodes` 选择通用码和业务码，由 `failUserProfileOperation` 使用错误的 `Error()` 输出响应，立即返回，不签发凭证。创建成功后的签发及输出继续见第 3.8 节。
 
-这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责输入映射和后续响应转换。
+这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责接口访问检查、输入映射和后续响应转换。创建接口允许匿名，因此可以直接构造创建 Params；要求身份的其他入口调用 `authz.RequirePrincipal` 或 `authz.RequireMemberUserID`，处理其返回错误，再执行接口自己的目标访问检查并构造业务 Params，具体见第 6 节。
 
 Controller 的业务入参只有 Request DTO，`ctx` 是独立的 HTTP 上下文。Validator 不构造 Service Params；需要将 ID 文本转换为整数等操作时，由 Controller 在构造 Params 时完成。Validator 已按相同解析语义验证成功、且 DTO 值未被修改的纯类型转换，允许忽略错误返回值。例如，按 ID 查询接口在 Controller 中使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。
 
@@ -317,7 +326,7 @@ Repository 返回原始 GORM 或驱动错误，不在这里决定 HTTP 状态码
 
 5. **签发失败返回 500，但不撤销已创建的用户。** Controller 记录包含新建 `user_id` 和原始错误的英文日志，不记录令牌，然后返回 `INTERNAL_ERROR` 与原始 `err.Error()`，不附业务码，立即结束方法。不能先返回资料成功，再追加签发错误。重复账户在 Service 失败分支已终止，不会为已有用户补发凭证。
 
-6. **等待超时后，创建和签发可以继续完成，但凭证响应会被丢弃。** 本接口外层等待 10 秒，超过期限返回 503；传入 `Issue` 的 Request Context 已由等待中间件隔离取消，不会因响应等待结束而取消签发。已经创建的记录不回滚，晚到凭证不发送给客户端。丢失结果时不能通过重复匿名注册取回令牌，本次不提供凭证恢复机制；签发成功也不表示其余四个接口已经启用身份认证和授权。
+6. **等待超时后，创建和签发可以继续完成，但凭证响应会被丢弃。** 本接口外层等待 10 秒，超过期限返回 503；传入 `Issue` 的 Request Context 已由等待中间件隔离取消，不会因响应等待结束而取消签发。已经创建的记录不回滚，晚到凭证不发送给客户端。丢失结果时不能通过重复匿名注册取回令牌，本次不提供凭证恢复机制；其他接口收到后续请求时，仍须重新认证凭证并执行各自的访问检查。
 
 ## 4. 数据对象为什么会多次转换
 
@@ -341,6 +350,7 @@ HTTP JSON
 | --- | --- | --- |
 | Request DTO | 当前接口的输入字段、JSON/Query 格式 | 公共 Bind 通过 Query 映射或 JSON 解码填充 |
 | Service Params | 业务用例接受的输入 | Controller 手工映射 |
+| `authn.Principal` | 已验证的调用方类别、命名空间与主体标识 | 可选认证中间件验证成功后保存；Controller 读取并转换为业务所需的发起方参数 |
 | `tables.UserProfile` | 数据库列、GORM 标签、SQL 可空值 | Service 构造，Repository 写入或读取 |
 | `models.UserProfile` | 业务层返回的用户资料 | Service 的 `profileModel` 转换 |
 | Service `<UseCase>Result` | 某个用例组合的业务结果，例如资料列表和总数、缺失 ID | Service 组织；类型紧接同文件对应 Params 声明 |
@@ -361,8 +371,10 @@ HTTP JSON
 | 失败位置 | 示例 | 当前处理结果 | 是否继续后续业务调用 |
 | --- | --- | --- | --- |
 | Gin 路由匹配 | 方法或路径未匹配 | 404、`NOT_FOUND`、无业务码 | 不进入用例 Validator |
+| 全局可选认证 | 已提供的 Authorization 格式错误、凭证无效或认证故障 | 分别返回 400、401 或 500 | 不进入 Validator；没有该头时匿名继续 |
 | 通用绑定 | JSON 格式错误、字段类型不匹配 | 400、`INVALID_ARGUMENT` | 不进入 Controller |
 | 请求字段校验 | 昵称为空、字段超长 | 400、`INVALID_ARGUMENT`、字段明细 | 不进入 Controller |
+| Controller 接口访问检查 | 匿名调用受保护接口、身份不符或目标超出访问范围 | 缺少或无效身份返回 401，权限不足返回 403 | 不调用对应 Service |
 | Service 业务处理 | 更新时实际版本与提交版本不同 | 409、`CONFLICT`、`USER_PROFILE_VERSION_CONFLICT` | Controller 输出错误 |
 | Repository 查询 | 目标资料未找到 | 404、`NOT_FOUND`、`USER_PROFILE_NOT_FOUND` | Service 解释为资料不存在，Controller 分类并输出 |
 | Service 或数据库 | 发号失败、未预期的 SQL 错误 | 500、`INTERNAL_ERROR`、无业务码 | Controller 直接输出收到的错误文案 |
@@ -462,14 +474,14 @@ HTTP JSON
 
 ## 6. 其余接口如何套用这条链路
 
-当前五个用户资料接口都注册到各自的 Validator，文件均按“结构体、构造函数、入口方法、私有校验函数”组织。各 `validateXxxRequest` 完整组合自身接口规则，基础类型检查复用 `internal/check`，领域字段复用 models，用例边界和默认值引用 Service Params 的声明。
+五个用户资料接口都经过全局可选认证，再进入各自的 Validator；Validator 文件均按“结构体、构造函数、入口方法、私有校验函数”组织。各 `validateXxxRequest` 完整组合请求字段规则，基础类型检查复用 `internal/check`，领域字段复用 models，用例边界和默认值引用 Service Params 的声明。要求身份的 Controller 在字段通过后调用 `authz` 共用检查，再按 [user 领域权限矩阵](../domains/user/api-authorization.md#3-五个接口的权限矩阵)执行目标访问规则；公开创建入口不调用这些要求身份的方法。Validator 不读取身份，共用方法不决定对象归属。
 
 | 接口 | Validator 入口 | 相比创建接口的主要差异 |
 | --- | --- | --- |
-| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/user_profile/query_user_profile_by_user_id_validator.go) | GET Query 绑定 ID 文本，校验为正 int64；Controller 转为整数，Service 将明确未命中解释为资料不存在，技术故障原样返回 |
-| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/user_profile/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；仓储执行总数及本页查询，Service 通过 `QueryUserProfilePageResult` 返回资料和总数 |
-| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/user_profile/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组，Controller 转为整数数组；Service 去重后通过 `BatchQueryUserProfilesResult` 返回资料与缺失 ID |
-| `updateUserProfile` | [UpdateUserProfile](../../app/domains/user/validator/v1/user_profile/update_user_profile_validator.go) | 校验目标、发起方、版本和完整资料；Service 使用显式事务、行锁及版本条件完成更新 |
+| `queryUserProfileByUserId` | [QueryUserProfileByUserID](../../app/domains/user/validator/v1/user_profile/query_user_profile_by_user_id_validator.go) | GET Query 绑定目标 ID；Controller 调用 `RequireMemberUserID`，直接检查目标关系，再构造 `OperatorUserID` 和 `UserID`；Service 保障用例约束并查询 |
+| `queryUserProfilePage` | [QueryUserProfilePage](../../app/domains/user/validator/v1/user_profile/query_user_profile_page_validator.go) | 绑定前填默认页码 1、每页 20；Controller 调用 `RequirePrincipal` 检查身份范围，再取得 Service 的资料列表和总数 |
+| `batchQueryUserProfiles` | [BatchQueryUserProfiles](../../app/domains/user/validator/v1/user_profile/batch_query_user_profiles_validator.go) | 绑定 ID 字符串数组；Controller 调用 `RequirePrincipal` 并转换业务输入；Service 去重后返回资料与缺失 ID |
+| `updateUserProfile` | [UpdateUserProfile](../../app/domains/user/validator/v1/user_profile/update_user_profile_validator.go) | Validator 校验目标、版本和完整资料；Controller 调用 `RequireMemberUserID` 并直接检查目标关系，以结果构造 `OperatorUserID`；Service 使用事务和版本条件更新 |
 
 补充阅读时容易混淆的细节：
 
@@ -477,6 +489,8 @@ HTTP JSON
 - 分页总数与本页数据分别读取，固定按用户 ID 降序，不承诺并发写入期间来自同一个数据库快照。
 - 批量查询的数量限制按去重前计算。部分或全部用户不存在仍是成功查询，缺失 ID 放在 Result 字段中；成功时资料列表和缺失 ID 列表均为非 nil 切片。分页无匹配记录时仍返回 Result，列表为空并保留实际总数。Service 执行失败返回 `nil, err`，不提供可继续使用的部分结果。
 - 更新版本使用 `*int64`，缺失或 `null` 不合法，版本 `0` 合法。更新头像是必填的有效 URL 字符串，这个 HTTP 接口不允许清空；创建及查询结果中的可空头像仍保留原有语义。
+- Request DTO 中已校验的目标 ID 文本允许按同一规则再次解析并忽略错误；Principal 的 `SubjectID` 未经过该 Validator，由 `RequireMemberUserID` 明确检查转换及正数要求，Controller 必须处理其错误。查询和更新 Params 的 `OperatorUserID` 来自该成功结果，不能接受请求自报值。
+- `authz` 方法不写响应或设置挑战头。它返回身份或错误后，Controller 决定错误码、业务码和 `WWW-Authenticate`，输出失败后立即 `return`；目标不是本人等规则由 Controller 直接判断，共用方法不会根据目标 ID 拒绝访问。
 - 更新 Service 先判断本人操作，再在事务中锁读用户，检查启用状态及实际版本，执行带版本条件的更新，读取更新结果，提交成功后才返回。事务内的 Repository 使用本次 `tx`，不会切回普通连接。
 
 ## 7. 请求完成与进程退出
@@ -510,7 +524,7 @@ HTTP JSON
 | 5 | [用户领域 Router](../../app/domains/user/routers/router.go) | 完整路径如何拼接、实际注册哪个 Validator 方法 |
 | 6 | [create_user_validator.go](../../app/domains/user/validator/v1/user_profile/create_user_validator.go)、[bind.go](../../internal/validator/bind.go) | 请求绑定、字段校验、失败时提前返回 |
 | 7 | [create_user.go](../../app/domains/user/dto/v1/user_profile/create_user.go)、[user_profile.go](../../app/domains/user/dto/v1/user_profile/user_profile.go) | 请求字段类型及标签、专属响应类型及同组共享字段 |
-| 8 | [user_profile_controller.go](../../app/domains/user/controller/v1/user_profile_controller.go) | `CreateUser`、`userProfileDTO`、`failUserProfileOperation` |
+| 8 | [user_profile_controller.go](../../app/domains/user/controller/v1/user_profile_controller.go)、[共用身份检查](../../app/http/authz/principal.go)、[成员 ID 转换](../../app/http/authz/member.go) | 创建流程、身份要求与目标检查的分工、Controller 的错误输出 |
 | 9 | [user_profile_service.go](../../app/domains/user/service/user_profile_service.go) | 共享仓储查找、发号、创建流程及模型转换 |
 | 10 | [user_profile_repository.go](../../app/domains/user/repository/user_profile_repository.go)、[user_profile.go](../../app/domains/user/tables/user_profile.go) | SQL 的执行入口、表映射及回填 |
 | 11 | [JWT Provider](../../internal/authn/jwt/provider.go)、[共享实例](../../internal/authn/jwt/runtime.go) | Controller 如何取得签发器，新建身份如何形成凭证和有效期 |

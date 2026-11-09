@@ -8,7 +8,7 @@
 
 3. **身份认证与业务授权分别成立。** 有效凭证证明调用方身份；本规范决定该身份能够调用哪个接口、访问哪些资料。公共类型或命名空间常量的声明本身不执行认证，也不会自动赋予全部接口权限。
 
-4. **本次实现只接入创建成功后的凭证签发。** `createUser` 仍允许匿名调用；其余四个接口尚未接入 HTTP 认证及本规范要求的身份授权。下述权限矩阵规定这些接口应当遵守的规则，不能据此认为现有路由已经受到保护。
+4. **五个接口共用全局可选认证，各 Controller 执行自己的访问检查。** `/api` 分组统一执行 `AuthenticateIfPresent`：完全没有 Authorization 头时匿名继续，有凭证时必须认证成功。随后由 Validator 完成参数绑定和校验，Controller 再按下述权限矩阵决定是否允许调用；不在各路由重复挂载强制认证中间件。
 
 ## 2. 身份与主体标识
 
@@ -22,7 +22,7 @@
 
 | 方法 | 完整路径 | 允许的调用方 | 数据范围或成功结果 |
 | --- | --- | --- | --- |
-| POST | `/api/v1/user/userProfile/createUser` | 无需身份认证，允许匿名调用 | 创建新用户，成功响应同时返回用户资料和该新用户的身份凭证 |
+| POST | `/api/v1/user/userProfile/createUser` | 无凭证时允许匿名调用；携带凭证时必须有效 | 创建新用户，成功响应同时返回用户资料和该新用户的身份凭证 |
 | GET | `/api/v1/user/userProfile/queryUserProfileByUserId` | 已认证的 `user/member` | 仅能查询本人资料，目标用户 ID 必须等于认证主体的内部用户 ID |
 | POST | `/api/v1/user/userProfile/updateUserProfile` | 已认证的 `user/member` | 仅能修改本人资料，目标用户 ID 必须等于认证主体的内部用户 ID |
 | POST | `/api/v1/user/userProfile/batchQueryUserProfiles` | 已认证的 `service/admin` | 按请求 ID 集合批量查询资料，继续遵守批量数量和查询结果契约 |
@@ -30,7 +30,7 @@
 
 ## 4. 创建用户与首次凭证签发
 
-1. **`createUser` 是公开的创建入口，不要求调用方先拥有用户或服务凭证。** 注册前没有内部用户 ID 是正常情况，也不以验证外部账户身份作为本接口的调用前提。输入合法性、账户唯一性等业务条件仍按创建用例执行。
+1. **`createUser` 是公开的创建入口，不要求调用方先拥有用户或服务凭证。** 注册前没有内部用户 ID 是正常情况，也不以验证外部账户身份作为本接口的调用前提。匿名调用应省略 Authorization 头；如果显式提供空值、错误或过期凭证，仍由全局认证中间件拒绝，不能以公开接口为由忽略错误凭证。输入合法性、账户唯一性等业务条件继续按创建用例执行。
 
 2. **Controller 在创建成功后，为新用户签发身份凭证。** 先调用 `Service.CreateUser`，只有成功取得新建资料后，才调用 `authnjwt.Current().Issue(ctx.Request.Context(), principal)`。`Kind` 固定为 `authn.PrincipalKindUser`，`Namespace` 固定为 `identity.UserNamespaceMember`，`SubjectID` 取新建资料 ID 的十进制字符串。身份类别、命名空间和主体 ID 均由服务端确定，不能由请求参数指定；本接口不能签发管理服务身份。Service 继续只负责创建用户，不接收 HTTP Context，也不签发凭证。
 
@@ -53,9 +53,9 @@
 
 ## 5. 本人查询与本人修改
 
-1. **两个接口先要求可信的普通用户身份，再确认目标就是本人。** 调用方必须通过认证并满足 `Kind=user`、`Namespace=member`；目标 `user_id` 必须与可信 `SubjectID` 对应的内部用户 ID 一致。其他用户即使提供合法、存在的目标 ID，也不能查询或修改该资料。
+1. **共用方法取得可信成员 ID，两个 Controller 各自检查目标就是本人。** Validator 通过后，Controller 调用 `authz.RequireMemberUserID(ctx)`；该方法要求已有 `user/member` 身份，再将 `SubjectID` 解析为正 int64。没有身份返回 `authz.ErrAuthenticationRequired`，身份范围不符返回 `authz.ErrPrincipalNotAllowed`，解析失败、溢出或非正数返回 `authz.ErrInvalidMemberIdentity`；Controller 分别映射为 401、403、401。取得 ID 后，查询和更新 Controller 各自在方法内直接比较目标 `user_id`，不一致时返回本 Controller 的访问拒绝错误并输出 403。共用方法不接收目标 ID，也不隐含所有成员接口都只能访问本人。
 
-2. **操作发起方来自认证结果，不来自请求自报。** Controller 根据可信用户身份构造 Service 的发起方入参；目标用户 ID 仍表达本次操作对象。不能将请求中的 `operator_user_id` 当作身份依据，也不能通过让两个请求字段相等来完成本人判断。Service 根据可信发起方与目标执行本人约束，Validator 继续负责字段合法性。
+2. **操作发起方只来自认证结果，查询和更新的 Service 都接收这一可信标识。** Controller 分别构造 `QueryUserProfileByUserIDParams`、`UpdateUserProfileParams`，将解析后的身份 ID 填入 `OperatorUserID`，目标 `UserID` 来自已校验 DTO。更新 Request DTO 不再声明 `operator_user_id`；即使客户端提交该字段，也不能参与身份确定或覆盖 Service 参数。两个 Service 用例均检查发起方与目标一致，继续保障非 HTTP 调用入口；Service 不读取 Principal、Token 或 Gin Context。
 
 3. **管理服务不享有这两个接口的额外调用资格。** `service/admin` 不能使用本人查询或本人修改接口绕过身份类别限制；管理服务的读取需求通过批量或分页查询实现。本规范不授予管理服务代替用户修改资料的能力。
 
@@ -63,7 +63,7 @@
 
 ## 6. 管理服务批量与分页查询
 
-1. **批量和分页接口只接纳可信的管理服务身份。** 普通 `user/member`、匿名调用方及其他服务身份均不能调用。认证过程必须确认具体服务主体属于 `service/admin`，不能依据请求中声明的类别、命名空间或服务名称放行。
+1. **批量和分页 Controller 只接纳可信的管理服务身份。** Validator 通过后，Controller 调用 `authz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin)`。共用方法对匿名返回 `ErrAuthenticationRequired`，对身份范围不符返回 `ErrPrincipalNotAllowed`；Controller 映射为 401 或 403 并立即返回。管理服务的主体标识保留为字符串，不调用成员 ID 转换方法；不能依据请求中声明的类别、命名空间或服务名称放行。通过检查后才调用对应查询 Service。
 
 2. **管理服务资格适用于本规范明确列出的两个查询用例。** 授予批量与分页查询资格，不表示管理服务自动拥有其他 user 领域接口或其他领域的权限，也不表示该服务能够代表某个用户执行本人操作。
 
@@ -71,8 +71,14 @@
 
 ## 7. 拒绝与错误处理
 
-1. **受保护接口缺少有效身份凭证时，按认证失败处理。** 返回通用类别 `UNAUTHENTICATED`；本规则不用于要求公开的 `createUser` 接口先登录。
+1. **已提供凭证的问题先由中间件处理，不进入字段校验。** Authorization 显式为空、重复或结构残缺返回 HTTP 400、`INVALID_ARGUMENT`；不支持的方案、无效或过期凭证返回 HTTP 401、`UNAUTHENTICATED`。中间件失败不降级匿名，这些规则同样适用于公开的 `createUser`。
 
-2. **身份有效但不满足本规范时，按权限不足处理。** 身份类别或命名空间不符、普通用户访问他人资料等情况返回 `PERMISSION_DENIED`。权限失败后立即结束对应处理，不继续执行资料查询或修改。
+2. **匿名请求先经过 Validator，再由 Controller 决定是否要求身份。** 完全没有 Authorization 头时，中间件匿名放行；绑定或字段非法先返回 400。参数有效但调用受保护接口时，Controller 返回 401、`UNAUTHENTICATED` 和 `WWW-Authenticate: Bearer realm="api"`。普通用户的 `SubjectID` 无法表示正 int64 时也返回 401，挑战头附加 `error="invalid_token"`；这两类错误都不附业务码。公开创建接口不因缺少身份拒绝请求。
 
-3. **技术故障不转换成认证失败或权限不足。** 认证依赖、数据库或签发过程发生执行故障时，按实际错误及[错误声明、传递与响应规范](../../application/api-error.md)处理，不能因为无法完成检查而默认放行。
+3. **身份有效但不满足接口访问范围时，返回权限不足。** 身份类别或命名空间不符、普通用户访问他人资料等情况返回 HTTP 403、`PERMISSION_DENIED` 和业务码 `USER_PROFILE_PERMISSION_DENIED`。Controller 输出错误后立即返回，不调用后续 Service；不能因为目标不存在而跳过本人检查或先泄露其他用户的存在性。
+
+   **身份范围错误和本人规则错误保留各自的来源与消息。** 身份范围不符使用 `authz.ErrPrincipalNotAllowed`，消息为 `authenticated principal is not allowed`；目标不是本人使用 Controller 的 `errUserProfileAccessDenied`，消息为 `user profile operation is not permitted`。两者映射到同一状态码和业务码，不要求它们使用相同文案，也不重新包装原错误。
+
+4. **技术故障不转换成认证失败或权限不足。** 认证依赖、数据库或签发过程发生执行故障时，按实际错误及[错误声明、传递与响应规范](../../application/api-error.md)处理，不能因为无法完成检查而默认放行。认证中间件的具体挑战头和错误映射见[HTTP 认证适配层](../../application/api-authentication.md#7-http-认证适配层)。
+
+5. **共用身份检查只返回错误，当前 Controller 统一映射并输出。** `app/http/authz` 不设置挑战头、不调用 `response` 或 `Abort`；Controller 的 `mapUserProfileErrorCodes` 识别公共错误，`failUserProfileOperation` 设置既有挑战头并写响应，调用方法随后立即 `return`。Controller 不重复声明缺少身份和成员标识错误，也不在自身文件复制共用身份检查；本人访问规则及其错误仍留在 Controller。Service 的本人约束和错误继续独立保留。

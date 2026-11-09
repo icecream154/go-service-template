@@ -78,12 +78,17 @@ machine_id: 1
 
 请求与响应字段见[用户资料 DTO](app/domains/user/dto/v1/user_profile/)，处理链路与错误约定见[接口处理流程](specifications/application/api-handle.md)和[接口错误规范](specifications/application/api-error.md)。`createUser` 不要求已有发起方用户 ID 或凭证；Controller 在创建成功后为新建 ID 签发 `user/member` JWT，HTTP 200 的 `data` 包含嵌套的 `user_profile`、`access_token`、`token_type` 和 `expires_at`。令牌类型为 `Bearer`，到期时间直接使用签发结果并输出 UTC RFC3339 字符串，成功响应设置 `Cache-Control: no-store`。
 
-创建失败或账户重复时不签发凭证；创建完成后签发失败返回 500，并保留已创建的用户。10 秒等待超时后内部继续，晚到凭证不再发送；不能通过重复匿名注册补发令牌，本次不提供凭证恢复。具体约定见 [user 领域接口权限规范](specifications/domains/user/api-authorization.md#4-创建用户与首次凭证签发)。其余四个接口尚未接入 HTTP 身份认证及授权；更新仍显式接收 `operator_user_id` 和目标 `user_id`，只检查二者的既有业务约束。来源、外部账户及请求自报的发起方 ID 都不代表已验证身份。
+创建失败或账户重复时不签发凭证；创建完成后签发失败返回 500，并保留已创建的用户。10 秒等待超时后内部继续，晚到凭证不再发送；不能通过重复匿名注册补发令牌，本次不提供凭证恢复。来源与外部账户字段仍是请求声明，不证明外部身份，具体契约及各接口权限见 [user 领域接口权限规范](specifications/domains/user/api-authorization.md)。
 
-`GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 替换为已有用户 ID：
+`/api` 分组统一挂载 `AuthenticateIfPresent`：完全没有 Authorization 头时匿名放行，显式空头或格式错误返回 400，无效、过期或方案不支持的凭证返回 401，认证故障返回 500；公开创建接口携带错误凭证时也会被拒绝。后续依次执行 Validator 和 Controller，Controller 决定是否要求身份以及允许的访问范围。匿名且参数非法时可以先返回 Validator 的 400，参数通过后才在受保护 Controller 返回 401。查询、更新的 Service 发起方参数来自 Principal；更新 DTO 已移除 `operator_user_id`，客户端不能自报操作人。
+
+Controller 通过 [app/http/authz](app/http/authz/) 复用身份检查：`RequirePrincipal` 要求指定类别与命名空间，`RequireMemberUserID` 按项目约定取得成员的正 int64 用户 ID。两者只读取身份并返回值或错误，不写响应、不查数据库；Controller 继续执行目标访问规则，选择错误码及挑战头，并决定是否调用 Service。具体契约见[Controller 共用的身份检查](specifications/application/api-authentication.md#8-controller-共用的身份检查)。
+
+`GET /api/v1/user/userProfile/queryUserProfileByUserId?user_id=123` 按内部用户 ID 查询基本资料。Query 参数 `user_id` 必填，须为大于 0 的 64 位有符号整数；将下面的 ID 和 `<access_token>` 替换为创建成功后返回的同一用户 ID 与凭证：
 
 ```sh
-curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?user_id=1234567890123456789"
+curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?user_id=1234567890123456789" \
+  -H "Authorization: Bearer <access_token>"
 ```
 
 查询成功返回 HTTP 200：
@@ -113,13 +118,13 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 | 用户资料查询执行失败，例如下层返回 `driver: bad connection` | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"driver: bad connection"}}` |
 | 未处理异常 | 500 | `{"data":null,"error":{"code":"INTERNAL_ERROR","message":"internal server error"}}` |
 
-五个接口均使用 Router → 对应用例 Validator → Controller 链路。领域 Validator 为每次请求创建 Request DTO，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数显式校验，可复用 `check` 和 models 的规则。已知字段问题汇总为 `details`，消息使用第一条字段错误的 `Error()`；规则错误和未知失败单独返回 500。校验全部通过后才将 DTO 传给 Controller。通用 `Bind` 只做映射：GET 使用 Gin 的 `binding.MapFormWithTag` 读取 Query，POST 使用标准库 JSON 解码器读取请求体；不执行自动校验，DTO 禁止使用 `binding` 等校验标签。解析或类型转换失败时使用绑定错误文案并终止，不继续检查部分 DTO。完整链路见[接口处理流程](specifications/application/api-handle.md)。
+五个接口均使用 Router → 全局可选认证 → 对应用例 Validator → Controller 链路。领域 Validator 为每次请求创建 Request DTO，调用 `internal/validator.Bind` 完成 HTTP 参数映射，再通过同文件内的私有函数显式校验，可复用 `check` 和 models 的规则。已知字段问题汇总为 `details`，消息使用第一条字段错误的 `Error()`；规则错误和未知失败单独返回 500。校验全部通过后才将 DTO 传给 Controller，由 Controller 执行接口访问检查。通用 `Bind` 只做映射：GET 使用 Gin 的 `binding.MapFormWithTag` 读取 Query，POST 使用标准库 JSON 解码器读取请求体；不执行自动校验，DTO 禁止使用 `binding` 等校验标签。解析或类型转换失败时使用绑定错误文案并终止，不继续检查部分 DTO。完整链路见[接口处理流程](specifications/application/api-handle.md)。
 
 业务调用链为 Controller → Service → Repository。Controller 的业务入参只有 Request DTO，由其内部构造 Service Params；Validator 已保证成功的纯类型转换可以忽略错误返回值。Service 从仓储取得表结构，再映射为领域实体；单条资料用例直接返回 `models.UserProfile`，批量和分页用例分别返回 `BatchQueryUserProfilesResult`、`QueryUserProfilePageResult`。Controller 根据模型或 Result 构造用例专属响应 DTO，通过 `response.Success` 放入 `data`。查询未命中时，Service 将仓储的 `gorm.ErrRecordNotFound` 转为用户资料不存在的业务错误；Controller 在自己的文件中选择通用码和可选业务码，直接使用收到的 `err.Error()` 输出。数据库连接、SQL 执行、发号等技术故障由 Service 记录上下文后原样返回，不包装或替换为统一失败错误。
 
 Service 自己声明的错误集中在对应 Service 文件顶部，用包级 `var` 和 `errors.New` 表达本层独立判断的失败或明确的业务语义映射；Service 和 models 不声明新的 error 类型。每个用例在同一区域依次组织 Params、可选 Result、输入常量、输入校验和处理方法，Result 紧接 Params，跨用例私有方法位于尾部 `shared`。用例专属 Result 留在 Service，领域模型直接复用，具体见[Service 输出契约](specifications/application/api-service-validator.md#74-service-的输出契约)。Controller 文件维护自己的业务码和映射；models 直接复用公共检查错误，只为自身独立判断的领域失败声明错误。内部错误与对外业务码不要求一一对应；同一个业务码的通用错误类别保持固定。公共响应组件维护八个通用类别及 HTTP 状态映射，合法错误的 `Message`、`Details` 原样输出，具体约定见[接口错误规范](specifications/application/api-error.md)及[接口返回规范](specifications/application/api-response.md)。
 
-顶层 `routers/web.go` 创建 Gin Engine、公共中间件和 `/api/v1` 分组，再调用各领域 Router 注册接口。`cmd/web` 通过 `routers.NewHTTPHandler` 在完整 Gin Engine 外装配响应等待中间件，并保存收尾入口；`routers.New` 本身仍只创建 Gin Engine。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
+顶层 `routers.New(authenticator)` 创建 Gin Engine、公共中间件和 `/api` 分组，在 `/api` 统一挂载可选认证，再建立 `/v1` 并调用领域 Router 注册接口。`cmd/web` 使用 `routers.NewHTTPHandler()`，该方法将共享 JWT 认证器传给 `New`，在完整 Gin Engine 外装配响应等待中间件，并保存收尾入口；独立调用 `New` 需显式传入认证器。未匹配的路由保持 `NoRoute` 的 404，不补做认证。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
 Controller 保留在对应领域的 `controller/v1` 中；Validator 与 DTO 先按版本、再按 Controller 分组，用户资料分别位于 `validator/v1/user_profile` 和 `dto/v1/user_profile`。每个用例独立组织文件，两个分组包均命名为 `userprofile`，导入时分别使用 `userprofilevalidator`、`userprofiledto` 别名。同一 Controller 内复用的 `UserProfile` 放在该 DTO 分组的 `user_profile.go` 中；只有跨 Controller 复用且语义一致的结构，才按需建立 `dto/v1/shared` 包。统一响应外层由 `internal/response` 提供。
 
@@ -135,7 +140,7 @@ Controller 保留在对应领域的 `controller/v1` 中；Validator 与 DTO 先�
 profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(userID)
 ```
 
-Service 不保存 Repository 字段，方法内获取默认仓储，执行查询并把表结构转为领域模型。Runtime 只管理 DB 和 Repository；`bootstrap.Init` 在 Runtime 初始化后调用 `internal/composition.Init`，统一创建并发布默认 Service。Controller 不保存 Service 字段，处理请求时通过 `composition.Current().UserProfile` 调用默认服务；领域 Router 创建并复用无状态 Controller。`main` 调用无参 `routers.New()` 完成路由注册，不再逐个装配 Service 和 Controller。停止业务访问后，仍由启动入口调用 Runtime 的 `Close()`。
+Service 不保存 Repository 字段，方法内获取默认仓储，执行查询并把表结构转为领域模型。Runtime 只管理 DB 和 Repository；`bootstrap.Init` 在 Runtime 初始化后调用 `internal/composition.Init`，统一创建并发布默认 Service。Controller 不保存 Service 字段，处理请求时通过 `composition.Current().UserProfile` 调用默认服务；领域 Router 创建并复用无状态 Controller。启动入口调用 `routers.NewHTTPHandler()`，由其传入共享认证器并完成路由及等待组件的装配，不再逐个装配 Service 和 Controller。停止业务访问后，仍由启动入口调用 Runtime 的 `Close()`。
 
 `internal/composition` 只依赖 Service，Service 依赖 `internal/runtime`，Controller 依赖 composition；Runtime 不导入 Service，composition 不导入 Controller，保持包依赖单向。默认服务通过普通指针保存，只在启动阶段由单个协程初始化一次；初始化完成后才启动业务协程，运行期间只读、不替换实例或字段。未初始化时调用 `composition.Current()` 会用英文 panic 提示顺序错误。
 
@@ -211,11 +216,13 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `internal/response` | 定义统一响应外层、通用错误枚举及固定 HTTP 状态映射、Gin 输出函数 |
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
-| `routers/web.go` | 创建 Gin Engine、公共中间件和 API 版本分组，挂载各领域路由 |
+| `routers/web.go` | 接收认证器，创建 Gin Engine，在 `/api` 挂载可选认证，再注册版本及领域路由 |
 | `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
 | `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
+| `app/http/middleware/authentication.go`、`principal.go` | 可选认证；按请求保存、读取可信身份，认证失败时统一输出 |
+| `app/http/authz/principal.go`、`member.go` | 为 Controller 复用身份要求检查和项目主体标识转换，只返回值或错误 |
 | `app/domains/*/routers` | 创建领域 Controller，在指定版本组中依次注册 domain、Controller 和业务用例 |
-| `app/domains/*/controller/v1` | V1 请求处理；Controller 内维护业务码和错误映射 |
+| `app/domains/*/controller/v1` | 检查接口身份及访问范围，构造可信业务参数，维护业务码和错误映射 |
 | `app/domains/*/validator/v1/<controller>` | 按 Controller 分组的 V1 请求绑定与校验，每个用例一个 Validator 文件 |
 | `app/domains/*/dto/v1/<controller>` | 按 Controller 分组的 V1 请求、响应定义；同组共享结构按具体业务概念组织文件 |
 | `env` | 部署环境和区域的加载、校验及只读访问 |

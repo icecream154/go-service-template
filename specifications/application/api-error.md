@@ -12,6 +12,8 @@
    | `ErrorInfo`、`FieldError`、`BusinessErrorCode` 类型 | `internal/response/error.go` | 接口层构造，公共响应组件输出；`BusinessErrorCode` 类型不包含各业务码的声明 |
    | 具体 `BusinessErrorCode` 常量 | 对应的 `controller/v<version>/<object>_controller.go` 顶部 | 由该 Controller 声明自己使用的业务码，并在本文件维护映射 |
    | `Violation`、`RuleError`、`IndexError`、`KeyError` | `internal/check/error.go` | 各公共检查方法返回，调用方识别其含义 |
+   | `ErrAuthenticationRequired`、`ErrPrincipalNotAllowed` | `app/http/authz/principal.go` | 用 `errors.New` 声明缺少身份、身份范围不符；共用方法返回错误，Controller 负责响应 |
+   | `ErrInvalidMemberIdentity` | `app/http/authz/member.go` | 用 `errors.New` 声明项目成员标识不合法；转换方法返回错误，Controller 负责响应 |
    | models 本层的命名错误值 | 所属 `models/<entity>_validation.go`，与规则放在一起 | 只用 `errors.New` 声明本层独立判断产生的错误；下层错误原样返回 |
    | 接口专属校验问题 | 对应的 `validator/v<version>/<controller>/<use_case>_validator.go` | Validator 直接构造 `FieldError`，无须额外声明一套 Validator 错误类型 |
    | Service 本层的命名错误值 | 对应的 `service/<object>_service.go` 顶部 | 只用 `errors.New` 声明本层独立失败及明确业务语义映射的错误；下层技术故障原样返回 |
@@ -307,9 +309,11 @@ func (err FieldError) Error() string {
 
    以上是通用示例，不规定任何具体领域必须提供这些业务码。常量属于所在 Go 包，文件本身不构成可见性边界。
 
-2. **同一 Controller 的全部错误分类集中在本文件的私有映射函数中。** 映射覆盖该 Controller 接收的 Service 错误、需要识别的领域错误及公共检查错误。Controller 的各个处理方法复用该函数，不分别编写同义映射，也不另建领域 `apierror` 包保存本 Controller 的业务码和映射。
+2. **同一 Controller 的全部错误分类集中在本文件的私有映射函数中。** 映射覆盖该 Controller 接收的 Service 错误、需要识别的领域错误、公共检查错误及 `app/http/authz` 返回的共用身份检查错误。Controller 的各个处理方法复用该函数，不分别编写同义映射，也不另建领域 `apierror` 包保存本 Controller 的业务码和映射。
 
 3. **业务含义由 Service 解释，Controller 将收到的错误映射为接口码。** 例如，Service 将目标资料未命中解释为 `ErrRecordNotFound`，Controller 映射为 `NOT_FOUND` 和对应业务码。公共输入错误、models 规则错误和技术故障按原有错误值或类型识别；无法确定含义时按内部错误处理，不比较错误消息猜测原因，也不把所有重复键映射为同一个对象已存在。
+
+4. **共用身份错误在产生处声明，状态、业务码和挑战头仍由 Controller 选择。** `authz.ErrAuthenticationRequired`、`authz.ErrInvalidMemberIdentity` 分别表达缺少身份和成员主体标识无效，映射为 401；`authz.ErrPrincipalNotAllowed` 表达类别或命名空间不符，映射为 403。Controller 继续选择可选业务码，并按认证约定设置 `WWW-Authenticate`；`authz` 不调用 `response`、`Abort`，也不替调用方结束方法。目标对象的访问拒绝仍由接口自己的规则产生，不为复用而移入共用身份转换方法。详细职责见[共用身份检查](api-authentication.md#8-controller-共用的身份检查)。
 
 ### 6.2 映射与响应装配
 
@@ -364,7 +368,16 @@ func (err FieldError) Error() string {
      → response 输出 HTTP 400
    ```
 
-2. **业务用例失败时，由 Controller 选择错误码并输出。** Service 对本层独立判断的失败及明确的业务语义映射返回自己的命名错误，原样传递已有输入错误、下层技术故障及无法确定含义的错误。Controller 识别收到的错误，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
+2. **共用身份检查失败时，由 Controller 映射并终止请求。** Controller 调用 `authz` 后检查错误，选择通用码、业务码及挑战头，原样使用错误消息；不在调用方重新声明或包装同义错误。取得身份后，目标对象的访问规则仍由 Controller 判断；Service 的独立业务保障保持不变。
+
+   ```text
+   Controller 调用 authz 身份检查或标识转换
+     → 返回身份 / 用户 ID，或 error
+     → Controller 识别错误并选择 Code / BusinessCode / 认证挑战头
+     → response 输出，Controller 立即 return
+   ```
+
+3. **业务用例失败时，由 Controller 选择错误码并输出。** Service 对本层独立判断的失败及明确的业务语义映射返回自己的命名错误，原样传递已有输入错误、下层技术故障及无法确定含义的错误。Controller 识别收到的错误，只选择 `Code`、`BusinessCode`，消息取 `err.Error()`，已有明细原样传递。
 
    ```text
    Service 校验 Params 或执行用例
@@ -374,8 +387,8 @@ func (err FieldError) Error() string {
      → response 按 Code 输出对应 HTTP 状态
    ```
 
-3. **规则错误和未知失败保持内部错误类别。** Validator 遇到这类错误时直接走内部错误出口；Service 返回这类错误时由 Controller 映射为 `INTERNAL_ERROR`。文案由实际返回的错误提供，不将错误改造成字段违规，也不为了映射失败主动触发 `panic`。
+4. **规则错误和未知失败保持内部错误类别。** Validator 遇到这类错误时直接走内部错误出口；Service 返回这类错误时由 Controller 映射为 `INTERNAL_ERROR`。文案由实际返回的错误提供，不将错误改造成字段违规，也不为了映射失败主动触发 `panic`。
 
-4. **框架错误由框架准备并输出。** 未匹配路由、绑定失败和异常恢复使用同一响应结构。异常恢复先准备可公开的错误说明，不直接把原始 `panic` 值作为响应内容；尚未写出响应时输出错误，已经写出响应时不追加第二份 JSON。
+5. **框架错误由框架准备并输出。** 未匹配路由、绑定失败和异常恢复使用同一响应结构。异常恢复先准备可公开的错误说明，不直接把原始 `panic` 值作为响应内容；尚未写出响应时输出错误，已经写出响应时不追加第二份 JSON。
 
-5. **响应编码和写入错误由 response 自行记录并终止。** 编码失败且尚未写出时，组件尝试输出框架默认的 HTTP 500；已经写出或写入发生错误时，不再追加错误 JSON。这些返回的错误不依赖 `panic` 恢复流程，也不表示已经提交的业务操作被撤销。调用方仍须在响应调用后结束当前处理方法，具体输出顺序与日志职责见[接口返回规范第 7 节](api-response.md#7-响应编码与写出失败)。
+6. **响应编码和写入错误由 response 自行记录并终止。** 编码失败且尚未写出时，组件尝试输出框架默认的 HTTP 500；已经写出或写入发生错误时，不再追加错误 JSON。这些返回的错误不依赖 `panic` 恢复流程，也不表示已经提交的业务操作被撤销。调用方仍须在响应调用后结束当前处理方法，具体输出顺序与日志职责见[接口返回规范第 7 节](api-response.md#7-响应编码与写出失败)。

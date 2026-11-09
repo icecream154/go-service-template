@@ -2,7 +2,7 @@
 
 ## 1. 适用范围与文件职责
 
-1. **公共契约、凭证实现、HTTP 适配和项目身份名称各自归属对应层。** `authn` 表示 authentication，即身份认证。`internal/authn` 回答“如何签发和验证凭证、认证成功得到什么身份、失败如何返回”，JWT 子包提供具体实现；`app/http/middleware` 负责从 HTTP 请求读取凭证、保存认证结果及输出认证失败；`app/identity` 集中定义项目身份体系的名称及含义，具体约定见第 2.4 节。
+1. **公共契约、凭证实现、HTTP 适配和项目身份名称各自归属对应层。** `authn` 表示 authentication，即身份认证。`internal/authn` 回答“如何签发和验证凭证、认证成功得到什么身份、失败如何返回”，JWT 子包提供具体实现；`app/http/middleware` 负责读取凭证、保存身份及输出认证失败；`app/http/authz` 为 Controller 提供共用的身份要求检查与项目主体标识转换；`app/identity` 集中定义项目身份体系的名称及含义，具体约定见第 2.4 节。
 
    | 文件 | 声明内容 | 职责 |
    | --- | --- | --- |
@@ -13,8 +13,10 @@
    | [jwt/config.go](../../internal/authn/jwt/config.go) | JWT 配置与加载方法 | 加载指定环境配置，校验字段及直接配置的签名密钥 |
    | [jwt/provider.go](../../internal/authn/jwt/provider.go) | `Provider` | 使用 HS256 签发和验证 JWT |
    | [jwt/runtime.go](../../internal/authn/jwt/runtime.go) | `Init`、`Current` | 初始化并访问进程共享的 JWT 实例 |
-   | [authentication.go](../../app/http/middleware/authentication.go) | `RequireAuthentication` 及私有凭证读取、错误处理方法 | 将 HTTP Authorization 头转换为公共凭证，调用认证器并控制后续处理 |
+   | [authentication.go](../../app/http/middleware/authentication.go) | `AuthenticateIfPresent` 及私有凭证读取、错误处理方法 | 无凭证时匿名放行，有凭证时执行认证并控制后续处理 |
    | [HTTP principal.go](../../app/http/middleware/principal.go) | `PrincipalFromContext` 及私有保存方法 | 在当前 Gin Context 中按值保存、读取可信身份 |
+   | [authz/principal.go](../../app/http/authz/principal.go) | `RequirePrincipal`、公共身份检查错误值 | 检查当前请求是否已有身份，以及类别和命名空间是否符合调用方要求 |
+   | [authz/member.go](../../app/http/authz/member.go) | `RequireMemberUserID`、成员标识错误值 | 按项目约定把 `user/member` 的主体标识转换为正 int64 |
    | [user_namespace.go](../../app/identity/user_namespace.go) | 项目用户命名空间常量 | 维护用户身份体系的名称、语义与扩展约定 |
    | [service_namespace.go](../../app/identity/service_namespace.go) | 项目服务命名空间常量 | 维护管理服务等服务身份体系的名称、语义与扩展约定 |
 
@@ -280,16 +282,16 @@ type Issuer interface {
 2. **中间件构造器只接收已经装配好的认证器。** 公开方法如下；构造时传入 `authn.Authenticator`，每次请求使用同一个可并发调用的实例。未提供认证器或接口值中包含 nil 指针等空依赖时，构造器直接 panic，作为装配错误处理。更换认证实现时，不需要修改 HTTP 凭证读取和身份保存方式。
 
    ```go
-   func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc
+   func AuthenticateIfPresent(authenticator authn.Authenticator) gin.HandlerFunc
 
    func PrincipalFromContext(ctx *gin.Context) (authn.Principal, bool)
    ```
 
-3. **组件存在不代表路由已经启用认证。** 本次只提供中间件和身份读取能力，没有在全局、路由分组或单个接口挂载 `RequireAuthentication`，也没有修改 Controller。以后需要保护某个入口时，由路由装配明确将中间件放在其 Validator 之前；身份类别、命名空间和对象访问范围继续由对应业务规则决定。
+3. **HTTP 入口统一执行可选认证，Controller 决定接口是否要求身份。** [routers/web.go](../../routers/web.go) 的 `New(authenticator)` 接收装配好的认证器，在 `/api` 分组统一挂载一次 `AuthenticateIfPresent`，各版本及领域的已注册路由继承该步骤，不逐接口挂载强制认证中间件。完全未提供 Authorization 头时匿名进入后续流程；携带凭证时必须认证成功。Validator 完成请求绑定及字段校验，Controller 随后检查本接口是否要求身份、允许哪些身份以及哪些数据范围，具体规则由领域专属规范维护。未匹配路由沿用 `NoRoute` 的 404，不补做认证。
 
 ### 7.2 Authorization 头如何映射为凭证
 
-1. **唯一凭证来源是一个 `Authorization` 请求头。** 不读取 Query、请求体或 Cookie，也不在其他来源中回退寻找 Token。头部缺失或仅含 HTTP 外层允许的空格、制表符，表示未提供凭证；重复的 Authorization 头直接拒绝，不选第一条或最后一条，逗号拼接的多份凭证也不能当作一份输入。头名称忽略大小写，大小写不同的重复头也一并计数。
+1. **仅在完全没有 `Authorization` 头时按匿名请求处理。** 不读取 Query、请求体或 Cookie，也不在其他来源中回退寻找 Token。头已经出现但没有值、值为空或仅含空格和制表符时，属于错误输入，返回 400，不降级为匿名。重复的 Authorization 头直接拒绝，不选第一条或最后一条，逗号拼接的多份凭证也不能当作一份输入。头名称忽略大小写，大小写不同的重复头也一并计数。
 
 2. **方案与 Token 之间使用 ASCII 空格，Token 正文保持原样。** HTTP 字段值外层允许的空格、制表符可以剥离；方案和正文之间至少需要一个 ASCII 空格，方案名按 HTTP `token` 字符集检查，`Bearer` 忽略大小写。正文按 HTTP `b64token` 字符集检查：至少包含一个英文字母、数字或 `-._~+/` 字符，只允许在末尾附加 `=`。内部空白、逗号、非 ASCII 字符及位于正文中间的 `=` 均拒绝；不执行 URL 解码，不修复或重新拼接 Token，也不把 `Bearer` 前缀送入 `Credential.Value`。
 
@@ -297,21 +299,24 @@ type Issuer interface {
 
 ### 7.3 一次请求的执行顺序
 
-1. **先清除旧身份并检查 HTTP 凭证格式，再调用认证器。** 中间件先清空本存储键中的已有值，避免沿用同一请求前序处理器留下的身份；随后从 Authorization 头构造 `authn.Credential`，执行 `authenticator.Authenticate(ctx.Request.Context(), credential)`。使用的是当前 Request 的标准 Context，不把 Gin Context 传入公共认证层，也不在这里创建新的等待超时。
+1. **先清除旧身份，再区分匿名请求和携带凭证的请求。** 中间件先清空本存储键中的已有值，避免沿用前序处理器留下的身份。完全没有 Authorization 头时，不调用认证器，不保存 Principal，直接继续处理；存在该头时，先检查格式，再构造 `authn.Credential` 并执行 `authenticator.Authenticate(ctx.Request.Context(), credential)`。使用当前 Request 的标准 Context，不把 Gin Context 传入公共认证层，也不在这里创建新的等待超时。
 
 2. **认证成功后检查结果完整性，再保存身份并继续处理。** 中间件确认 `Principal.Kind` 为 `user` 或 `service`，且命名空间、主体标识非空白；结果不满足公共契约时按认证器实现错误返回 500，不保存身份或继续处理。结果完整时，通过私有 `setPrincipal` 按值保存，再调用 `ctx.Next()`。这项检查不重复验签或判断业务命名空间；Token 原文不存入 Principal，不供后续 Controller 重新解析身份。
 
-3. **认证失败立即输出并终止，不进入 Validator 或 Controller。** 中间件按照第 7.4 节选择响应和挑战头，通过 `response.Fail` 输出后立即 `return`。`Fail` 中的 `Abort` 阻止后续 Gin 处理器运行，当前方法仍必须返回；不能输出失败后继续保存身份或调用后续处理。
+3. **已提供凭证却认证失败时，立即终止，不降级为匿名。** 中间件按照第 7.4 节选择响应和挑战头，通过 `response.Fail` 输出后立即 `return`，不进入 Validator 或 Controller。这同样适用于允许匿名调用的公开接口。`Fail` 中的 `Abort` 阻止后续 Gin 处理器运行，当前方法仍必须返回；不能输出失败后继续保存身份或调用后续处理。
+
+4. **匿名请求的参数校验先于 Controller 的身份要求检查。** 完整顺序为“可选认证 → Validator → Controller → Service”。匿名请求若绑定失败或字段非法，先返回 400；参数通过后，受保护 Controller 再返回缺少身份的 401。这是明确的处理顺序，不将身份检查复制进 Validator，也不额外增加路由级强制认证入口。
 
 ### 7.4 错误响应与认证挑战
 
-1. **HTTP 格式、身份认证和技术故障使用不同响应类别。** 所有失败均使用统一 `data/error` 结构，不附 `business_code` 或 `details`；消息使用对应错误的 `Error()`，适配层不将 Authorization 头、Token 或签名密钥拼入消息。具体映射如下：
+1. **HTTP 格式、身份认证和技术故障使用不同响应类别。** 本节中间件产生的失败均使用统一 `data/error` 结构，不附 `business_code` 或 `details`；消息使用对应错误的 `Error()`，适配层不将 Authorization 头、Token 或签名密钥拼入消息。具体映射如下：
 
    | 情况 | HTTP 状态与通用码 | `WWW-Authenticate` |
    | --- | --- | --- |
-   | 未提供凭证，或认证器返回 `ErrMissingCredential` | 401、`UNAUTHENTICATED` | `Bearer realm="api"` |
+   | 完全没有 Authorization 头 | 不输出错误，匿名继续后续处理 | 不设置认证挑战 |
+   | 头已提供，但认证器返回 `ErrMissingCredential` | 401、`UNAUTHENTICATED` | `Bearer realm="api"` |
    | 完整凭证的方案不支持，或认证器返回 `ErrUnsupportedScheme` | 401、`UNAUTHENTICATED` | `Bearer realm="api"` |
-   | Authorization 结构不合法 | 400、`INVALID_ARGUMENT` | `Bearer realm="api", error="invalid_request"` |
+   | Authorization 显式为空、重复或结构不合法 | 400、`INVALID_ARGUMENT` | `Bearer realm="api", error="invalid_request"` |
    | 认证器返回 `ErrInvalidCredential` 或 `ErrExpiredCredential` | 401、`UNAUTHENTICATED` | `Bearer realm="api", error="invalid_token"` |
    | 认证器成功返回了不完整身份，或返回 `ErrInvalidPrincipal` | 500、`INTERNAL_ERROR` | 不设置认证挑战 |
    | 未知技术错误或 Context 取消、截止时间错误 | 500、`INTERNAL_ERROR` | 不设置认证挑战 |
@@ -326,4 +331,42 @@ type Issuer interface {
 
 2. **读取方法返回值和存在标记，不产生响应副作用。** `PrincipalFromContext(ctx)` 返回 `authn.Principal` 的值及 `bool`，调用方先检查标记，再使用身份；取得副本后修改字段不会改变 Context 中保存的身份。身份未保存、已被中间件清空或存储类型不正确时，返回零值和 `false`；读取方法不写 HTTP 响应、不调用 `Abort`，也不临时解析 Token 补建身份。
 
-3. **缺少 Principal 由使用方根据入口契约处理。** 受保护入口应当已先经过认证中间件，Controller 此时仍取不到身份，说明路由装配或调用链有问题，应按内部错误处理，不能改用请求中的用户 ID 继续执行。公开入口本来可以没有身份，不能仅因读取返回 `false` 就返回认证失败；本次未修改任何 Controller 的读取或错误处理。
+3. **正常处理链中没有 Principal 表示匿名，由 Controller 决定是否允许。** 公开 Controller 可以继续执行；要求身份的 Controller 返回 HTTP 401、`UNAUTHENTICATED`，并设置 `WWW-Authenticate: Bearer realm="api"`，不把正常匿名情况视为 500 装配错误。已有身份但不满足接口的类别、命名空间或对象访问规则时，按领域规范返回 403；不能改用请求中的发起方 ID 继续执行。
+
+4. **Controller 使用共用身份检查，再构造业务参数。** 可复用的身份要求和主体标识转换由第 8 节的 `app/http/authz` 提供；Controller 调用后检查错误，继续执行本接口的目标访问规则，并将可信发起方标识填入 Service Params。请求 DTO 只保留调用方能够指定的业务输入，Service 不接收 Gin Context、Principal 或 Token。主体标识转换已经由共用方法明确检查，不能套用“请求字段已由 Validator 校验”的省略错误规则。
+
+## 8. Controller 共用的身份检查
+
+### 8.1 声明位置与方法职责
+
+1. **`app/http/authz` 保存 HTTP 入口共用的身份检查，不重新执行认证。** `authz` 表示 authorization，即授权；这里提供授权过程中可复用的身份要求检查和项目标识转换，不代替接口自己的数据访问规则。它读取中间件保存的 Principal，不解析 Authorization 头或 Token，也不查询数据库。公开方法为：
+
+   ```go
+   func RequirePrincipal(ctx *gin.Context, kind authn.PrincipalKind, namespace string) (authn.Principal, error)
+
+   func RequireMemberUserID(ctx *gin.Context) (int64, error)
+   ```
+
+2. **`principal.go` 负责“必须有身份，且属于指定身份范围”。** `RequirePrincipal` 调用 `middleware.PrincipalFromContext` 读取结果；没有身份返回 `ErrAuthenticationRequired`，`Kind` 或 `Namespace` 不匹配返回 `ErrPrincipalNotAllowed`，成功则返回 Principal 的值。允许的类别和命名空间由 Controller 传入，这个方法不维护各接口的权限清单。
+
+3. **`member.go` 负责本项目成员身份到内部用户 ID 的转换。** `RequireMemberUserID` 先调用 `RequirePrincipal`，要求 `authn.PrincipalKindUser` 与 `identity.UserNamespaceMember`；通过后按十进制解析 `SubjectID` 为 int64，并要求大于 0。解析失败、溢出或非正数返回 `ErrInvalidMemberIdentity`，成功返回内部用户 ID。该方法属于项目 HTTP 适配层，因为“member 使用正 int64 用户 ID”是项目约定；通用 `internal/authn` 仍允许其他身份体系使用字符串主体标识。
+
+### 8.2 Controller 与共用方法的边界
+
+1. **共用方法只返回值或错误，不直接处理响应。** 方法不调用 `response.Fail`、`Abort` 或 `Next`，不设置状态码、业务码或挑战头。Controller 必须先检查返回错误，选择响应后立即返回；不能忽略错误并继续使用零值身份或用户 ID。`RequireMemberUserID` 收到 `RequirePrincipal` 的错误时直接返回，不包装成另一种错误。
+
+2. **具体接口的目标访问规则仍由 Controller 明确执行。** 共用方法确认“当前调用方是谁、是否属于要求的身份体系”，不接收目标对象 ID，也不判断对象是否属于调用方。Controller 在取得可信标识后，直接执行本接口要求的对象关系检查，再构造 Service Params；需要由业务状态决定的规则继续交给 Service。各接口允许的具体身份和数据范围只在所属领域规范中定义。
+
+3. **包依赖从 Controller 指向 HTTP 适配，不反向进入业务层。** 依赖方向为 `Controller → app/http/authz → app/http/middleware、app/identity、internal/authn`；中间件、身份枚举和公共认证包不导入 `authz`。Service、models 不调用这些 HTTP 方法，而是接收入口已经构造好的业务参数，继续独立保障用例约束。
+
+### 8.3 错误声明与响应映射
+
+1. **共用检查声明自己的错误值，Controller 继续决定对外表现。** `ErrAuthenticationRequired`、`ErrPrincipalNotAllowed` 在 `authz/principal.go` 中以包级 `var` 和 `errors.New` 声明，`ErrInvalidMemberIdentity` 在 `authz/member.go` 中同样声明；不新增错误类型，不在各 Controller 重复声明同义错误。Controller 使用 `errors.Is` 识别它们，不比较文案。
+
+   | 共用错误 | 表达的失败 | Controller 选择的响应 |
+   | --- | --- | --- |
+   | `ErrAuthenticationRequired` | 当前请求没有可信身份 | 401、`UNAUTHENTICATED`，挑战头为 `Bearer realm="api"` |
+   | `ErrPrincipalNotAllowed` | 已有身份，但不属于要求的类别或命名空间 | 403、`PERMISSION_DENIED`，具体业务码由 Controller 选择 |
+   | `ErrInvalidMemberIdentity` | 成员身份的主体标识不符合项目用户 ID 约定 | 401、`UNAUTHENTICATED`，挑战头附加 `error="invalid_token"` |
+
+2. **共用身份错误与接口自己的访问拒绝分别声明。** 目标对象不属于调用方等接口规则，不在 `authz` 中增加目标专属错误，而由 Controller 声明或沿用自己的访问拒绝错误。不同来源的错误可以映射为同一通用码和业务码；消息仍直接使用收到的 `err.Error()`，不因提取共用方法而增加包装层。

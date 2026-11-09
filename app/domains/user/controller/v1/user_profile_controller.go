@@ -9,6 +9,7 @@ import (
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
 	"go-service-template/app/domains/user/models"
 	userservice "go-service-template/app/domains/user/service"
+	httpauthz "go-service-template/app/http/authz"
 	"go-service-template/app/identity"
 	"go-service-template/internal/authn"
 	authnjwt "go-service-template/internal/authn/jwt"
@@ -28,9 +29,13 @@ const (
 	codeUserProfileDisabled response.BusinessErrorCode = "USER_DISABLED"
 	// codeUserProfileVersionConflict 表示资料版本已过期，固定归属 CONFLICT。
 	codeUserProfileVersionConflict response.BusinessErrorCode = "USER_PROFILE_VERSION_CONFLICT"
-	// codeUserProfilePermissionDenied 表示无权修改目标资料，固定归属 PERMISSION_DENIED。
+	// codeUserProfilePermissionDenied 表示无权执行用户资料操作，固定归属 PERMISSION_DENIED。
 	codeUserProfilePermissionDenied response.BusinessErrorCode = "USER_PROFILE_PERMISSION_DENIED"
 )
+
+// errUserProfileAccessDenied 表示已确认的用户身份不满足本接口的本人访问条件。
+// 通用身份缺失、范围不符及 member 标识错误使用公共 authz 包的错误值。
+var errUserProfileAccessDenied = errors.New("user profile operation is not permitted")
 
 // UserProfileController 处理用户资料请求，并将领域模型转换为响应 DTO。
 // 结构体不保存 Service 引用或单次请求状态。
@@ -43,13 +48,24 @@ func NewUserProfileController() *UserProfileController {
 
 // QueryUserProfileByUserID 接收 Validator 已绑定和校验的请求，查询并构造用户资料响应。
 // user_id 的格式及范围已校验，本方法将其十进制文本转换为 Service 使用的内部标识。
+// 仅允许已认证的 user/member 查询本人，身份或权限不满足时不调用 Service。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userprofiledto.QueryUserProfileByUserIDRequest) {
 	// Validator 已按相同十进制规则确认格式、int64 范围和正数要求，此处允许忽略转换错误。
 	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
+	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
+	if err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	// 本用例只允许查询本人；公共身份转换不决定业务目标的访问范围。
+	if operatorUserID != userID {
+		failUserProfileOperation(ctx, errUserProfileAccessDenied)
+		return
+	}
 	// 使用默认用户资料服务，查询得到的领域模型仅保存在本次请求的局部变量中。
 	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(userservice.QueryUserProfileByUserIDParams{
-		UserID: userID,
+		OperatorUserID: operatorUserID, UserID: userID,
 	})
 	if err != nil {
 		failUserProfileOperation(ctx, err)
@@ -60,7 +76,8 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	response.Success(ctx, result)
 }
 
-// CreateUser 允许匿名注册，创建成功后为本次生成的内部用户 ID 签发 user/member 凭证。
+// CreateUser 允许匿名或已认证调用，创建成功后为本次生成的内部用户 ID 签发 user/member 凭证。
+// 无效凭证由公共认证入口拒绝；已有身份不改变首次创建语义，也不决定新用户的 ID。
 // Request DTO 由领域 Validator 绑定后传入，本方法不再读取或解析 HTTP 请求体。
 // 外部账户字段仅为调用方声明，不核验外部身份，也不据此为已有用户补发凭证。
 // 签发失败返回 500，但不会回滚已经完成的创建；仅在创建和签发均成功时输出成功响应。
@@ -102,10 +119,21 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 
 // UpdateUserProfile 使用 Validator 已校验的完整资料及版本调用 Service。
 // 更新头像必须是有效的非空地址，以非 nil 指针传入 Service，不表达清空操作。
-// 发起方权限、用户状态和实际版本冲突继续由 Service 判断。
+// 仅允许已认证的 user/member 修改本人，发起方 ID 来自 Principal，不接收请求自行声明。
+// Service 继续独立检查本人关系、用户状态和实际版本冲突。
 func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userprofiledto.UpdateUserProfileRequest) {
+	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
+	if err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	// 本用例只允许修改本人；发起方已由公共身份转换确定，目标仍由请求表达。
+	if operatorUserID != request.UserID {
+		failUserProfileOperation(ctx, errUserProfileAccessDenied)
+		return
+	}
 	profile, err := composition.Current().UserProfile.UpdateUserProfile(userservice.UpdateUserProfileParams{
-		OperatorUserID: request.OperatorUserID, UserID: request.UserID, ExpectedVersion: *request.ExpectedVersion,
+		OperatorUserID: operatorUserID, UserID: request.UserID, ExpectedVersion: *request.ExpectedVersion,
 		UserName: request.UserName, AvatarURL: &request.AvatarURL,
 	})
 	if err != nil {
@@ -117,8 +145,13 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 }
 
 // BatchQueryUserProfiles 批量读取明确的一组用户资料，返回已找到的资料和缺失 ID。
+// 仅允许已认证的 service/admin 调用，不将服务身份解释为某个用户或要求其主体为数字。
 // 数量和 ID 格式由 Validator 校验；Service 对重复 ID 去重并保留首次出现的顺序。
 func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userprofiledto.BatchQueryUserProfilesRequest) {
+	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
 	userIDs := make([]int64, 0, len(request.UserIDList))
 	for _, value := range request.UserIDList {
 		// Validator 已按相同规则确认正 int64 文本，这里构造 Service 参数，允许忽略转换错误。
@@ -143,8 +176,12 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 }
 
 // QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
-// 默认值和输入校验由 Validator 完成，本方法只映射 Service 参数。
+// 仅允许已认证的 service/admin 调用；默认值和输入校验由 Validator 完成。
 func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
+	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
 	var isEnabled *bool
 	if request.IsEnabled != nil {
 		value := *request.IsEnabled == "true"
@@ -186,6 +223,8 @@ func userProfileDTOList(profiles []*models.UserProfile) []userprofiledto.UserPro
 // Service 解释可确定的业务失败；签发失败、未知错误和技术故障由默认分支归为内部错误。
 func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessErrorCode) {
 	switch {
+	case errors.Is(err, httpauthz.ErrAuthenticationRequired), errors.Is(err, httpauthz.ErrInvalidMemberIdentity):
+		return response.CodeUnauthenticated, ""
 	case errors.Is(err, check.ErrInvalidRule):
 		return response.CodeInternalError, ""
 	case errors.Is(err, userservice.ErrUserProfileNotFound):
@@ -196,7 +235,8 @@ func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessE
 		return response.CodeConflict, codeUserProfileDisabled
 	case errors.Is(err, userservice.ErrUserProfileVersionConflict):
 		return response.CodeConflict, codeUserProfileVersionConflict
-	case errors.Is(err, userservice.ErrUserProfilePermissionDenied):
+	case errors.Is(err, httpauthz.ErrPrincipalNotAllowed), errors.Is(err, errUserProfileAccessDenied),
+		errors.Is(err, userservice.ErrUserProfilePermissionDenied):
 		return response.CodePermissionDenied, codeUserProfilePermissionDenied
 	case errors.Is(err, check.ErrInvalidValue):
 		return response.CodeInvalidArgument, ""
@@ -209,6 +249,13 @@ func mapUserProfileErrorCodes(err error) (response.ErrorCode, response.BusinessE
 // Service 故障在 Service 中记录，签发故障在 CreateUser 中记录；这里仅分类并输出响应。
 func failUserProfileOperation(ctx *gin.Context, err error) {
 	code, businessCode := mapUserProfileErrorCodes(err)
+	if code == response.CodeUnauthenticated {
+		challenge := `Bearer realm="api"`
+		if errors.Is(err, httpauthz.ErrInvalidMemberIdentity) {
+			challenge += `, error="invalid_token"`
+		}
+		ctx.Header("WWW-Authenticate", challenge)
+	}
 	response.Fail(ctx, response.ErrorInfo{
 		Code: code, BusinessCode: businessCode, Message: err.Error(),
 	})

@@ -1,13 +1,18 @@
 package routers_test
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
+	"go-service-template/internal/authn"
+	authnjwt "go-service-template/internal/authn/jwt"
 	"go-service-template/internal/response"
 	"go-service-template/routers"
 
@@ -30,7 +35,7 @@ func TestUserProfileQueryRejectsInvalidUserID(t *testing.T) {
 		{"positive overflow", "?user_id=9223372036854775808"},
 		{"negative overflow", "?user_id=-9223372036854775809"},
 	}
-	router := routers.New()
+	router := newRouter(t)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -62,7 +67,7 @@ func TestUnknownRoutesUseCommonErrorWithoutBusinessCode(t *testing.T) {
 		{"previous user route", http.MethodGet, "/api/v1/users/123"},
 		{"unsupported method", http.MethodPost, userProfileQueryPath},
 	}
-	router := routers.New()
+	router := newRouter(t)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -76,7 +81,7 @@ func TestUnknownRoutesUseCommonErrorWithoutBusinessCode(t *testing.T) {
 }
 
 func TestRecoveryUsesSafeInternalError(t *testing.T) {
-	router := routers.New()
+	router := newRouter(t)
 	router.GET("/test/panic", func(*gin.Context) {
 		panic("private panic explanation")
 	})
@@ -89,7 +94,7 @@ func TestRecoveryUsesSafeInternalError(t *testing.T) {
 }
 
 func TestRecoveryPreservesWrittenResponseAndAbortsHandlers(t *testing.T) {
-	router := routers.New()
+	router := newRouter(t)
 	nextHandlerCalled := false
 	router.GET("/test/written-panic", func(ctx *gin.Context) {
 		ctx.JSON(http.StatusAccepted, gin.H{"accepted": true})
@@ -109,7 +114,7 @@ func TestRecoveryPreservesWrittenResponseAndAbortsHandlers(t *testing.T) {
 }
 
 func TestSuccessPreservesUserProfileDTO(t *testing.T) {
-	router := routers.New()
+	router := newRouter(t)
 	router.GET("/test/profile-success", func(ctx *gin.Context) {
 		response.Success(ctx, userprofiledto.QueryUserProfileByUserIDResponse{
 			UserID:    9223372036854775807,
@@ -137,6 +142,25 @@ func TestSuccessPreservesUserProfileDTO(t *testing.T) {
 	if len(data) != 5 || string(data["user_id"]) != `"9223372036854775807"` || string(data["user_name"]) != `"example"` || string(data["avatar_url"]) != "null" || string(data["is_enabled"]) != "true" || string(data["version"]) != "3" {
 		t.Fatalf("user profile DTO changed: %s", envelope["data"])
 	}
+}
+
+// newRouter 为已有路由检查提供独立认证器，不依赖启动单例或部署密钥。
+func newRouter(t *testing.T) *gin.Engine {
+	t.Helper()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("generate authentication key: %v", err)
+	}
+	authenticator, err := authnjwt.New(authnjwt.Config{
+		Issuer: "router-test", Audience: "router-test",
+		SigningKey: base64.StdEncoding.EncodeToString(key), TokenTTL: time.Hour,
+	}, map[authn.PrincipalKind][]string{
+		authn.PrincipalKindUser: {"member"},
+	})
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+	return routers.New(authenticator)
 }
 
 func assertFailure(t *testing.T, recorder *httptest.ResponseRecorder, wantStatus int, wantCode, wantMessage string) map[string]json.RawMessage {

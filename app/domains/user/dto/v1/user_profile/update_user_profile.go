@@ -1,9 +1,8 @@
 package userprofile
 
 // UpdateUserProfileRequest 表示完整替换昵称、头像的请求，所有字段均须出现。
+// 操作发起方由已认证的 Principal 确定，不从请求中绑定 operator_user_id。
 type UpdateUserProfileRequest struct {
-	// OperatorUserID 是发起方的内部用户 ID，必填且为正数，JSON 使用十进制字符串。
-	OperatorUserID int64 `json:"operator_user_id,string"`
 	// UserID 是待修改用户的内部 ID，必填且为正数，JSON 使用十进制字符串。
 	UserID int64 `json:"user_id,string"`
 	// ExpectedVersion 是调用方读取的资料版本，必填且非负；指针区分未提供与有效的版本 0。

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go-service-template/app/http/middleware"
+	authnjwt "go-service-template/internal/authn/jwt"
 )
 
 // defaultResponseTimeout 是未单独配置接口的响应等待时间，不限制内部业务执行时间。
@@ -46,8 +47,9 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 		{http.MethodPost, "/api/v1/user/userProfile/createUser", 10 * time.Second},
 	}
 
-	// 先创建完整 Gin Engine，包含既有路由、Validator、Controller 和公共中间件。
-	engine := New()
+	// 启动阶段已初始化共享 JWT 组件；完整 Gin Engine 在 /api 分组挂一次可选认证。
+	// 各等待包装器复用这个 Engine，不会重复安装或重复执行认证。
+	engine := New(authnjwt.Current())
 	// 保存已注册的“方法 + 路径”，用于检查下面的覆盖配置是否指向真实接口。
 	registeredRoutes := make(map[string]struct{})
 	for _, route := range engine.Routes() {

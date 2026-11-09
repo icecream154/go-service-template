@@ -23,10 +23,12 @@ var (
 	errInvalidAuthenticatedPrincipal = errors.New("authenticator returned an invalid principal")
 )
 
-// RequireAuthentication 构造强制 Bearer 认证中间件；只有显式挂到路由后才会执行。
+// AuthenticateIfPresent 构造可选 Bearer 认证中间件，统一挂在业务 API 分组上。
+// 仅在没有 Authorization 头时按匿名请求继续；显式提供的凭证必须通过认证。
+// 是否允许匿名及具体身份访问，由后续 Controller 按接口契约决定。
 // authenticator 由装配层传入并须支持并发使用，本包不获取 JWT 单例或判断业务权限。
 // nil 依赖在构造时 panic，属于装配错误；每个请求的凭证和身份均保存为局部变量。
-func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc {
+func AuthenticateIfPresent(authenticator authn.Authenticator) gin.HandlerFunc {
 	if authenticator == nil {
 		panic("authentication middleware requires an authenticator")
 	}
@@ -38,8 +40,6 @@ func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc {
 		if value.IsNil() {
 			panic("authentication middleware requires an authenticator")
 		}
-	default:
-		panic("unhandled default case")
 	}
 
 	return func(ctx *gin.Context) {
@@ -47,6 +47,12 @@ func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc {
 		// nil 不是 Principal，读取助手会返回 false；正常跨请求隔离由 Gin 完成。
 		ctx.Set(principalContextKey, nil)
 		credential, err := readCredential(ctx.Request.Header)
+		if errors.Is(err, authn.ErrMissingCredential) {
+			// 只有提取阶段确认完全没有 Authorization 头，才允许匿名继续。
+			// Validator 可以先返回参数错误；需要身份的 Controller 再返回 401。
+			ctx.Next()
+			return
+		}
 		if err != nil {
 			failAuthentication(ctx, err)
 			return
@@ -55,6 +61,8 @@ func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc {
 		// 沿用 Request Context；现有外层响应等待包装器负责取消隔离，本层不另设超时。
 		principal, err := authenticator.Authenticate(ctx.Request.Context(), credential)
 		if err != nil {
+			// 已提供凭证后的任何认证错误都结束请求，包括认证器返回缺少凭证。
+			// 不清除错误后降级匿名，否则调用方会误以为仍在使用已登录身份。
 			failAuthentication(ctx, err)
 			return
 		}
@@ -71,18 +79,21 @@ func RequireAuthentication(authenticator authn.Authenticator) gin.HandlerFunc {
 }
 
 // readCredential 只读取一个 Authorization 值，不从 Query、Body 或 Cookie 查找凭证。
+// 只有头完全不存在时返回 ErrMissingCredential；显式空值、空白或重复头均为格式错误。
 // Header 外层的 HTTP 可选空白（空格、制表符）可移除；Bearer 与正文之间允许一个或多个
 // ASCII 空格。Token 本身必须完整保留，不能用 Fields 拆开后重新拼接，也不进行 URL 解码。
 func readCredential(header http.Header) (authn.Credential, error) {
 	var values []string
+	present := false
 	// HTTP 头名称忽略大小写；遍历也能发现手工构造的 Header 中大小写不同的重复键。
 	// Header.Get 只取第一个值，无法据此判断是否存在多份 Authorization。
 	for name, entries := range header {
 		if strings.EqualFold(name, "Authorization") {
+			present = true
 			values = append(values, entries...)
 		}
 	}
-	if len(values) == 0 {
+	if !present {
 		return authn.Credential{}, authn.ErrMissingCredential
 	}
 	if len(values) != 1 {
@@ -90,7 +101,7 @@ func readCredential(header http.Header) (authn.Credential, error) {
 	}
 	value := strings.Trim(values[0], " \t")
 	if value == "" {
-		return authn.Credential{}, authn.ErrMissingCredential
+		return authn.Credential{}, errInvalidAuthorizationHeader
 	}
 	scheme, token, separated := strings.Cut(value, " ")
 	token = strings.TrimLeft(token, " ")

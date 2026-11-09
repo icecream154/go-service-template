@@ -22,8 +22,12 @@ import (
 
 // errors: shared
 
-// ErrUserProfileNotFound 表示查询或更新的目标用户资料不存在。
-var ErrUserProfileNotFound = errors.New("user profile not found")
+var (
+	// ErrUserProfileNotFound 表示查询或更新的目标用户资料不存在。
+	ErrUserProfileNotFound = errors.New("user profile not found")
+	// ErrUserProfilePermissionDenied 表示发起方不允许查询或修改目标用户的资料。
+	ErrUserProfilePermissionDenied = errors.New("user profile operation is not permitted")
+)
 
 // errors: CreateUser
 
@@ -41,8 +45,6 @@ var (
 	ErrUserDisabled = errors.New("user is disabled")
 	// ErrUserProfileVersionConflict 表示提交的资料版本已经过期，或更新条件不再成立。
 	ErrUserProfileVersionConflict = errors.New("user profile version conflict")
-	// ErrUserProfilePermissionDenied 表示发起方不允许修改目标用户的资料。
-	ErrUserProfilePermissionDenied = errors.New("user profile operation is not permitted")
 )
 
 // UserProfileService 提供用户资料操作，返回领域模型或用例专属 Result。
@@ -56,26 +58,35 @@ func NewUserProfileService() *UserProfileService {
 
 // use case: QueryUserProfileByUserID
 
-// QueryUserProfileByUserIDParams 表示按内部用户 ID 查询资料的输入。
+// QueryUserProfileByUserIDParams 表示已确认身份的用户按内部 ID 查询本人资料的输入。
 type QueryUserProfileByUserIDParams struct {
+	// OperatorUserID 是调用入口根据可信身份确定的发起方，必须为正数且与目标用户相同。
+	OperatorUserID int64
 	// UserID 是需要查询的用户，必须为正数。
 	UserID int64
 }
 
-// validateQueryUserProfileByUserIDParams 检查用户 ID，保留公共检查错误的分类。
+// validateQueryUserProfileByUserIDParams 检查发起方和目标用户 ID，保留公共检查错误的分类。
 func validateQueryUserProfileByUserIDParams(params QueryUserProfileByUserIDParams) error {
+	if err := scalar.PositiveInt64(params.OperatorUserID); err != nil {
+		return err
+	}
 	if err := scalar.PositiveInt64(params.UserID); err != nil {
 		return err
 	}
 	return nil
 }
 
-// QueryUserProfileByUserID 按内部用户 ID 查询完整资料，不默认过滤停用用户。
-// 输入非法时返回公共检查错误；未命中返回 ErrUserProfileNotFound；
+// QueryUserProfileByUserID 按内部用户 ID 查询本人完整资料，不默认过滤停用用户。
+// 输入非法时返回公共检查错误；访问他人返回 ErrUserProfilePermissionDenied；未命中返回 ErrUserProfileNotFound；
 // 其他查询故障记录操作上下文后原样返回，不替换为通用查询失败错误。
 func (s *UserProfileService) QueryUserProfileByUserID(params QueryUserProfileByUserIDParams) (*models.UserProfile, error) {
 	if err := validateQueryUserProfileByUserIDParams(params); err != nil {
 		return nil, err
+	}
+	// 各调用入口负责确认身份真实性，Service 独立保障用例的本人访问约束，再访问仓储。
+	if params.OperatorUserID != params.UserID {
+		return nil, ErrUserProfilePermissionDenied
 	}
 
 	// 从已初始化的 Runtime 取得普通连接仓储，本方法不创建或加入事务。
@@ -93,7 +104,7 @@ func (s *UserProfileService) QueryUserProfileByUserID(params QueryUserProfileByU
 // use case: CreateUser
 
 // CreateUserParams 表示首次注册所需的外部账户身份与初始资料。
-// 注册时尚无内部用户 ID，身份凭证的真实性由后续认证接入负责。
+// 注册时尚无内部用户 ID；账户字段是调用方声明，本用例不验证外部身份凭证。
 type CreateUserParams struct {
 	// AccountSource 是外部账户所属的完整身份命名空间，原文保留。
 	AccountSource string
@@ -177,7 +188,7 @@ func createUser(params CreateUserParams, profiles *repository.UserProfileReposit
 
 // UpdateUserProfileParams 表示本人对昵称、头像的完整替换及并发控制条件。
 type UpdateUserProfileParams struct {
-	// OperatorUserID 是声明的操作发起方，当前必须与目标用户相同。
+	// OperatorUserID 是调用入口根据可信身份确定的发起方，必须与目标用户相同。
 	OperatorUserID int64
 	// UserID 是本次修改的目标用户。
 	UserID int64

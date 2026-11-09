@@ -30,7 +30,7 @@ func NewUpdateUserProfileValidator(controller *userv1controller.UserProfileContr
 }
 
 // UpdateUserProfile 为本次请求创建 DTO，绑定和字段校验通过后才调用 Controller。
-// 本人权限、启用状态和实际资料版本继续由 Service 判断。
+// Controller 使用可信身份检查本人权限，Service 继续保障本人关系、启用状态和实际资料版本。
 func (v *UpdateUserProfileValidator) UpdateUserProfile(ctx *gin.Context) {
 	var request userprofiledto.UpdateUserProfileRequest
 	if err := commonvalidator.Bind(ctx, &request); err != nil {
@@ -58,12 +58,6 @@ func (v *UpdateUserProfileValidator) UpdateUserProfile(ctx *gin.Context) {
 // 已知输入问题返回字段明细；无效规则或未知错误立即返回，丢弃已有明细。
 func validateUpdateUserProfileRequest(request *userprofiledto.UpdateUserProfileRequest) ([]response.FieldError, error) {
 	var details []response.FieldError
-	if err := scalar.PositiveInt64(request.OperatorUserID); err != nil {
-		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
-			return nil, err
-		}
-		details = append(details, response.FieldError{Field: "operator_user_id", Reason: "must be a positive 64-bit integer"})
-	}
 	if err := scalar.PositiveInt64(request.UserID); err != nil {
 		if errors.Is(err, check.ErrInvalidRule) || !errors.Is(err, check.ErrInvalidValue) {
 			return nil, err

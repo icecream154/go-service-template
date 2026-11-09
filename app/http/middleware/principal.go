@@ -17,7 +17,9 @@ func setPrincipal(ctx *gin.Context, principal authn.Principal) {
 }
 
 // PrincipalFromContext 返回本次请求已通过认证的身份副本，不执行认证或写出响应。
-// 身份未保存或存储类型不正确时返回零值和 false，不能把该结果当作匿名认证成功。
+// 身份未保存或存储类型不正确时返回零值和 false，零值本身不是一种可信身份。
+// 在已执行可选认证的正常链路中，false 表示没有提供凭证，Controller 按匿名请求处理；
+// 是否允许匿名由接口决定，需要身份时返回 401。凭证验证失败已经被中间件终止。
 // 调用方必须先检查 bool；修改返回值不会改变 Context 中的身份。
 // 身份只在当前请求中使用，不据此修改共享对象，也不自动传入 Service。
 func PrincipalFromContext(ctx *gin.Context) (authn.Principal, bool) {

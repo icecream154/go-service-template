@@ -17,6 +17,8 @@
 | 领域对象的共同规则 | 所属领域的 models | 一个业务字段或对象本身需要满足什么规则 | 合法用户昵称、合法头像地址、实体字段之间的关系 |
 | 依赖业务状态的规则 | Service、领域操作及数据库事务 | 基于实际业务状态，这次操作是否允许执行 | 用户是否存在、账户是否重复、是否有权限、用户状态及实际版本 |
 
+**身份认证与接口访问检查独立于请求字段校验。** HTTP 中间件负责验证已经提供的凭证，Controller 负责接口是否允许匿名、接受哪些身份及访问范围；Validator 不承担这些判断。Service 接收入口根据可信身份构造的业务参数，继续保障用例自身的操作约束。具体认证链路见[身份认证规范](api-authentication.md#7-http-认证适配层)，本节的四个维度用于组织数据及业务规则，不将身份认证当作字段有效性检查。
+
 ### 2.1 根据语义确定归属
 
 不能仅根据字段类型或校验语句的形式判断规则属于哪一层：
@@ -142,10 +144,12 @@
 
 ```text
 Router 匹配接口
+  → 全局可选认证：无 Authorization 头匿名继续，存在凭证时必须验证成功
   → 用例 Validator 创建独立的 Request DTO
   → Bind 将 HTTP 参数映射到 DTO
   → validateXxxRequest 组合接口规则、通用检查和领域规则
-  → Controller 将已校验 DTO 映射为 Service Params
+  → Controller 根据接口规则检查身份及访问范围
+  → Controller 将已校验 DTO 和可信发起方标识映射为 Service Params
   → Service 检查用例输入，并复用领域规则
   → Service 加载业务状态、判断操作条件并组织事务
   → Repository 执行数据库操作
@@ -154,7 +158,7 @@ Router 匹配接口
   → response.Success / response.Fail 写出响应
 ```
 
-绑定或请求字段校验失败时，Validator 输出参数错误并立即返回，不调用 Controller；规则错误或未知校验失败走内部错误出口。Service 失败时返回 `error`，由 Controller 在本文件维护的映射中选择通用码和业务码，消息直接取 `err.Error()`，已有字段明细原样传递。
+已提供的凭证格式错误或认证失败，由中间件先行终止，不进入 Validator；完全没有 Authorization 头时匿名继续。绑定或请求字段校验失败时，Validator 输出参数错误并立即返回，不调用 Controller；因此匿名请求参数非法时可以先收到 400，参数通过后才由受保护 Controller 返回缺少身份的 401。规则错误或未知校验失败走内部错误出口。Service 失败时返回 `error`，由 Controller 在本文件维护的映射中选择通用码和业务码，消息直接取 `err.Error()`，已有字段明细原样传递。
 
 HTTP 入口按统一默认值和接口覆盖配置选择响应等待时间，上述内部调用链仍按原有规则执行。HTTP 外层统一决定发送完整业务响应还是超时响应；等待期限到达不主动取消已经开始的业务，后到响应由外层丢弃。具体配置、输出及停机收尾见[接口处理流程第 5.4、7 节](api-handle.md#54-响应等待超时不取消内部业务)，业务层边界见第 7.5 节。
 
@@ -162,9 +166,11 @@ Controller 的输入映射遵守以下约定：
 
 1. **Controller 的业务入参只使用对应用例的 Request DTO。** HTTP 上下文可以作为独立参数传入；Validator 完成绑定和校验后传入 DTO，不提前构造 Service Params，也不把业务字段拆成多个参数。
 
-2. **Service Params 由 Controller 在方法内部构造。** Controller 根据 Service 的输入类型完成字段赋值和必要的类型转换；Service 接收自己的 Params，不直接接收 Request DTO。
+2. **Service Params 由 Controller 在方法内部构造，发起方标识来自可信身份。** Controller 根据 Service 的输入类型完成字段赋值和必要的类型转换；需要身份的接口复用 `app/http/authz` 的身份要求与项目标识转换方法，再执行本接口的目标访问检查，将可信发起方标识填入 Params。共用方法只返回值或错误，Controller 仍负责错误响应和立即返回，不能从请求自报字段取得身份。Service 接收自己的 Params，不接收 Request DTO、Gin Context、Token 或 HTTP 层保存的认证对象。
 
 3. **已经由 Validator 保证成功的纯类型转换，Controller 可以忽略其错误返回值。** 例如，Validator 已确认某个未修改的 ID 文本能够按十进制解析为正 int64，Controller 构造 Params 时可以再次按相同语义解析并使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。该约定只覆盖已被前置校验保证成功的转换，不适用于未经校验的转换、不同解析规则或数据库等执行操作。
+
+4. **认证身份中的标识转换必须单独检查，不适用 DTO 的前置校验保证。** 公共 Principal 使用字符串表达主体；认证器确认该凭证可信，不代表其标识一定满足具体业务的整数范围等要求。项目共用转换放在 `app/http/authz`，在内部完整检查解析结果和业务标识范围；Controller 必须处理其错误，不能绕过检查或重新复制同一段解析逻辑。Validator 只校验 Request DTO，不隐式校验 Principal；具体目标的访问关系仍由 Controller 判断，不放入通用标识转换方法。
 
 ### 3.2 规则的复用关系
 
@@ -196,6 +202,10 @@ flowchart TD
     V["validator/v1/&lt;controller&gt;"] --> C["controller/v1"]
     V --> D["dto/v1/&lt;controller&gt;"]
     C --> D
+    C --> H["app/http/authz"]
+    H --> HM["app/http/middleware"]
+    H --> I["app/identity"]
+    H --> N["internal/authn"]
     V -->|"引用校验相关常量"| S["service"]
     C --> S
     C --> A["internal/composition"]
@@ -211,10 +221,11 @@ Validator 通过 Controller 已经可以间接依赖 Service，直接引用其�
 
 为保持这一方向，各包遵守以下边界：
 
-1. Service 不依赖 Validator、Controller、HTTP Request DTO 或对外错误映射组件；Service Params 使用业务输入类型。
+1. Service 不依赖 Validator、Controller、`app/http/authz`、HTTP Request DTO 或对外错误映射组件；Service Params 使用业务输入类型。
 2. models 不依赖 Service、Validator 或 Controller。领域字段规则所需的常量和策略类型放在 models，不从 Service 反向取得。
 3. `internal/check` 不依赖任何具体 domain、Service 或 HTTP 组件。
 4. `internal/composition` 依赖 Service 完成装配，Service 不反向调用 composition 获取自身或其他默认服务；需要的策略通过参数或构造依赖传入。
+5. `app/http/authz` 只向下读取认证中间件保存的身份，并引用项目身份名称和公共身份类型；不依赖 Controller、Service 或 models。中间件、`app/identity` 和 `internal/authn` 不反向导入 `authz`。
 
 以下反向引用会形成循环：
 
@@ -366,7 +377,7 @@ func RuneCountAtMost(value string, maximum int) error
 
 ## 6. 接口 Validator 的组织与执行方式
 
-**Validator 负责把 HTTP 输入转换成完成请求校验的 DTO，再交给 Controller。** 本部分规定文件结构、入口执行顺序和规则组合方式；依赖业务状态的判断交给 Service，不在请求校验中执行。
+**Validator 负责把 HTTP 输入转换成完成请求校验的 DTO，再交给 Controller。** 本部分规定文件结构、入口执行顺序和规则组合方式；不在 Validator 中读取 Principal 或决定匿名调用资格，接口访问检查由 Controller 执行，依赖业务状态的判断交给 Service。
 
 ### 6.1 Validator 的结构与入口顺序
 
@@ -456,7 +467,7 @@ func RuneCountAtMost(value string, maximum int) error
 
 1. **存在性、状态和实际版本从业务数据源取得。** 例如，查询目标是否存在、是否启用、账户身份是否已被使用，再判断本次操作是否允许。提交的期望版本用于与实际版本比较，不能直接当作数据库中的当前版本。
 
-2. **权限判断使用可信的发起方身份及业务关系。** 请求中的发起方 ID 即使格式合法，也只是一个身份声明；比较发起方与目标 ID 相等，不能代替身份认证。Service 根据可信身份和相应业务规则判断权限，不能把输入校验成功理解为已有操作权限。
+2. **业务操作权限根据可信的发起方标识及业务关系判断。** Controller 已完成 HTTP 身份读取、接口调用资格及访问范围检查，并把所需发起方标识填入 Params；后台任务等其他入口同样负责确定可信调用方。Service 不重新解析凭证，而是使用这些业务参数继续保障用例约束，例如发起方与操作对象的关系。请求自报 ID 即使格式合法，也不能代替可信身份；Controller 已检查过某个业务条件，也不代表非 HTTP 入口可以绕过该条件。
 
 3. **Service 加载状态，领域操作判断实体自身约束。** 基于已加载实体即可判断的字段关系或状态变化，可以封装进 models 的领域操作。需要其他业务对象或外部依赖的条件，由 Service 组织获取和判断，不让公共检查或单字段函数访问外部资源。
 

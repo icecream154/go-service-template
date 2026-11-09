@@ -3,14 +3,17 @@ package routers
 
 import (
 	userrouter "go-service-template/app/domains/user/routers"
+	httpmiddleware "go-service-template/app/http/middleware"
+	"go-service-template/internal/authn"
 	"go-service-template/internal/response"
 
 	"github.com/gin-gonic/gin"
 )
 
-// New 创建带请求日志和异常恢复中间件的 Gin 路由，并注册各版本的领域接口。
+// New 创建带请求日志、异常恢复及业务 API 可选认证的 Gin 路由。
 // 用户领域的控制器在注册前创建，后续请求复用已绑定的处理方法。
-func New() *gin.Engine {
+// authenticator 必须已完成装配且可并发使用；构造本身不查询数据库或签发凭证。
+func New(authenticator authn.Authenticator) *gin.Engine {
 	router := gin.New()
 	// Logger 记录每次请求的方法、路径、HTTP 状态码和耗时等信息。
 	// CustomRecovery 捕获当前请求处理链中的 panic，记录异常后执行恢复回调。
@@ -38,6 +41,9 @@ func New() *gin.Engine {
 
 	// 顶层统一管理 API 前缀和版本，各领域按 Controller 分组注册业务用例。
 	api := router.Group("/api")
+	// 所有版本和领域继承这一次认证：无头按匿名继续，有凭证必须验证通过。
+	// 这里不要求必须登录；Validator 先检查参数，Controller 再判断身份和业务权限。
+	api.Use(httpmiddleware.AuthenticateIfPresent(authenticator))
 	v1 := api.Group("/v1")
 	userrouter.NewRouter().RegisterV1Routes(v1)
 
