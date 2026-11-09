@@ -23,21 +23,36 @@
 | `client` | `{集成命名空间}.{Client 类型名}.{方法名}` | 集成命名空间取 `app/integrations/` 下 Client 所在的相对目录路径，将目录分隔符替换为 `.`；保留目录名原有拼写；类型和方法取本项目封装的 Client 声明 | `company.example-service.resource.ResourceClient.QueryResource`、`thirdparty.ai.llm.ProviderClient.GenerateText` |
 | `repository` | `{领域名}.{Repository 类型名}.{方法名}` | 领域名取所属领域目录名，类型名和方法名取本项目 Repository 的实际声明名称；不使用 SQL 正文或查询条件作为操作标识 | `example.ResourceRepository.GetByID` |
 
-## operation 自动识别预期（待实现）
+## operation 自动识别与 Context 作用域
 
 每个操作入口接入一次公共封装，日志调用点只传 Context、消息和额外字段，不手动填写 `component`、`operation`，也不手写操作名称字符串。
 
 | component | 自动识别方式 | 接入位置 |
 | --- | --- | --- |
-| `http_entry` | 根据请求方法和匹配后的 `Gin.FullPath()` 生成；真正未匹配时使用固定占位标识 | HTTP 日志中间件 |
-| `controller`、`service`、`repository` | 入口公共封装通过 `runtime.CallersFrames` 取得函数符号，再解析包路径、接收者类型和方法名，按约定目录及上述格式生成 | 对应组件的方法入口 |
-| `client` | 按具体 Client 公开方法的包路径、接收者类型和方法名生成 | 具体 Client 的公开方法入口，不在共享 HTTP 或 SDK 底座中推断具体接口 |
+| `http_entry` | 待 HTTP 中间件根据请求方法和匹配后的 `Gin.FullPath()` 生成；真正未匹配时使用固定占位标识 | 尚未接入 |
+| `controller`、`service`、`repository` | `WithCurrentOperation` 通过 `runtime.CallersFrames` 取得直接调用入口的函数符号，解析包路径、接收者类型和方法名，按目录及类型后缀生成 | 对应组件的普通导出方法入口 |
+| `client` | 按具体 Client 公开方法的包路径、接收者类型和方法名生成 | 具体 Client 的公开方法入口；共享底座的排除范围见下文 |
 
-拟定入口用法为 `ctx = logger.WithCurrentOperation(ctx)`，该方法尚未实现。当前路由绑定的是 Validator，HTTP Handler 名称不能直接视为 Controller 名称；Controller 应从自己的操作入口识别。
+入口用法为 `ctx = logger.WithCurrentOperation(ctx)`。例如，在 `app/domains/example/service` 中的具名方法入口建立操作作用域：
 
-入口识别结果可按方法信息缓存，后续日志从 Context 读取，避免每条日志重新扫描调用栈。首期识别范围为项目约定目录下的普通具名方法；识别失败时省略无法确定的字段，不猜测名称，也不将上层操作身份当作新操作身份。
+```go
+func (s *ResourceService) QueryResource(ctx context.Context) {
+    ctx = logger.WithCurrentOperation(ctx)
+    // 后续日志及下游调用使用这个 ctx。
+}
+```
 
-辅助函数沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId。下游方法返回后，上层 Context 的操作信息保持原值。请求级 Context 不存入共享实例字段。
+此入口生成 `component=service`、`operation=example.ResourceService.QueryResource`，四级日志方法自动从 Context 读取。`caller` 仍表示实际打印日志的代码位置，不用于每条日志重新推断操作。当前路由绑定的是 Validator，HTTP Handler 名称不能直接视为 Controller 名称；Controller 从自己的操作入口识别。
+
+识别范围限于本模块约定目录下的普通导出具名方法，支持指针和值接收者。领域组件按 `app/domains/{领域名}/controller`、`service`、`repository` 的目录及对应类型后缀识别，Controller 版本子目录不进入操作标识；Client 按 `app/integrations/` 下的目录生成命名空间。普通函数、闭包、方法值包装、泛型符号和未知目录不作为操作入口识别，也不向上搜索其他调用帧来猜测名称。
+
+现有 HTTP 公共底座 `company.base.Client` 已显式排除，SDK 公共底座因类型未导出而不符合入口识别条件。新增共享底座时须同步维护识别规则，不能仅凭目录或类型后缀保证自动区分所有底座与具体 Client。
+
+入口识别结果按函数符号缓存，缓存仅保存组件和操作标识，不保存 Context、实参或请求数据。识别失败时建立空操作作用域，遮蔽父 Context 中的操作身份，避免把上层操作误认为新操作；日志省略 `component`、`operation`，原有 TraceId 继续保留。
+
+辅助函数不重复调用入口封装，沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId、取消和截止时间。下游方法返回后，上层 Context 的操作信息保持原值。传入 nil Context 时以 `context.Background()` 为基础，不生成 TraceId。请求级 Context 不存入共享实例字段。
+
+入口封装只识别并携带操作信息，不自动记录 `started`、`finished` 或计算耗时；需要生命周期日志时由操作边界调用日志方法。
 
 如需连入口封装调用也自动生成，后续须通过调用代理或生成包装代码，并将实际调用接入包装；只生成元数据不会拦截现有的直接方法调用。本阶段先采用入口公共封装的预期。
 
@@ -85,4 +100,4 @@ if err := log.Info(ctx, "HTTP call completed", logger.Fields{
 }
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入。`component`、`operation` 仍按上文预期等待入口作用域实现，当前输出中省略，不根据 `caller` 猜测。尚未创建全局 Logger、加载配置文件、接入启动流程或替换业务日志，也未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。HTTP 操作识别仍待中间件提供；尚未在业务入口调用封装，也未创建全局 Logger、加载配置文件、接入启动流程或替换业务日志，未新增测试用例。

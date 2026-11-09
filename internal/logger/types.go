@@ -1,5 +1,5 @@
-// Package logger 提供统一日志结构和同步 JSON 写入能力。
-// Logger 通过参数构造，不维护全局实例；操作上下文识别和启动接入尚未实现。
+// Package logger 提供统一日志结构、操作上下文识别和同步 JSON 写入能力。
+// Logger 通过参数构造，不维护全局实例；HTTP 操作识别和启动接入尚未实现。
 package logger
 
 import "time"
@@ -62,7 +62,7 @@ type Record struct {
 	Level Level `json:"level"`
 	// Message 是本条日志的英文说明。
 	Message string `json:"message"`
-	// Component 是当前操作的代码职责类别；不适用或无法识别时省略。
+	// Component 从当前操作 Context 读取代码职责类别；不适用或无法识别时省略。
 	Component Component `json:"component,omitempty"`
 	// Event 是当前操作的生命周期节点；普通说明性日志可以省略。
 	Event Event `json:"event,omitempty"`
