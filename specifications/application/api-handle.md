@@ -12,9 +12,10 @@
 客户端
   → net/http.Server 接收请求
   → TraceId 中间件：沿用或生成标识，保存到 Request.Context，并设置响应头
+  → HTTP 日志外层：保存开始时间和本次请求状态，等待 Gin 提供路由模板
   → HTTPHandler 按方法和路径选择响应等待配置
   → 响应等待超时中间件：控制客户端等待，不取消内部业务
-  → Gin 匹配路由，执行公共中间件
+  → Gin 匹配路由：绑定 HTTP 操作模板、记录 started，再执行后续公共中间件
   → /api 全局可选认证：无 Authorization 头匿名继续，有凭证则验证并保存 Principal
   → 对应用例的 Validator
       → Bind：HTTP 参数映射为 Request DTO
@@ -34,10 +35,13 @@ Repository 返回表结构或 error
   → Controller 转换为 Response DTO 或接口错误
   → response.Success / response.Fail 编码并写入 JSON
   → 外层决定发送正常响应或超时响应；超时后丢弃晚到结果
+  → HTTP 日志外层记录 finished：选定的状态及外层耗时，业务可能仍继续
   → 内部处理结束，释放本次执行资源
 ```
 
 需要先区分两件事：**启动时注册处理链，请求到来后执行处理链。** `NewRouter`、`RegisterV1Routes` 等方法在启动时执行；每次请求不会重新注册路由、创建数据库连接池或创建默认 Service。
+
+HTTP 响应与内部处理的结束时间分别观察：正常请求的内部处理通常先完成，响应等待到期时则可能先记录 HTTP `finished`，内部业务随后才结束。
 
 ## 2. 请求到来前，系统已经准备了什么
 
@@ -62,10 +66,11 @@ main → run
       → composition.Init：创建默认 Service
   → routers.NewHTTPHandler
       → routers.New(authnjwt.Current())：传入共享认证器
+          → 安装 HTTPRouteLogging，绑定匹配后的路由模板
           → /api 分组挂载一次 AuthenticateIfPresent
           → 创建 Controller、Validator 并注册各版本的领域路由
       → 为同一个 Gin Engine 装配默认及接口覆盖的响应等待包装器
-      → 在请求分发外层装配一次 TraceId 中间件
+      → 在请求分发外层装配 HTTPLogging，再在最外层装配 TraceId 中间件
   → net.Listen
   → http.Server.Serve：开始接收 HTTP 请求
 ```
@@ -76,13 +81,13 @@ Logger 的启动装配中，`bootstrap.Init` 只调用 `logger.Init`，传入 `l
 
 第三方 Client 的启动装配中，`bootstrap.Init` 只调用根 `thirdparty.Init(configDir, environment)` 并处理资源清理，其 `configDir` 为 `integrations/thirdparty` 叶子目录，环境仅支持 `dev/test/prod`。根层选择 `<environment>/ai` 后交给 `ai.NewClients`，AI 层将 `llm` 目录交给 `llm.NewClients`，由 LLM 层读取 `qwen.yml`、`minimax.yml` 并调用各自的 Loader、构造方法。根层不维护具体供应商文件名，子层不设置全局 `Init` 或 `Current`。注册配置缺失或非法时停止启动，不回退其他环境，也不在启动时调用模型；其他尚未注册的 SDK 占位文件不要求提前提供配置。
 
-`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器及请求分发外层的 TraceId 中间件；每次请求先确定 TraceId，再选择一个等待包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层 TraceId 和响应等待控制，需要 TraceId 时由调用方用 `middleware.TraceID(engine)` 包装。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过 TraceId 和等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
+`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器，以及 TraceId、HTTP 日志外层；每次请求依次经过 TraceId、HTTP 日志外层、选定的等待包装器，再进入 Gin，不重新创建路由或中间件。HTTP 日志外层使用已经初始化的共享 Logger，Gin 在匹配路由后提供模板；元数据通过每请求的受锁状态传递，不跨 goroutine 读取 Gin Context。`routers.New(authenticator)` 接收已装配的认证器，只返回 Gin Engine；其模板绑定中间件在没有外层日志状态时直接透传，不隐式依赖 Logger 初始化。独立使用时，调用方按需要在初始化 Logger 后包装 `middleware.TraceID(middleware.HTTPLogging(engine))`；响应等待与收尾则另行装配。生产入口由 `NewHTTPHandler` 完成全部装配。配置和执行边界见第 5.4 节，日志细节见[HTTP 请求与响应日志](application-log.md#http-请求与响应日志)。
 
 ### 2.2 共享对象分别由谁持有
 
 | 位置 | 启动时准备的对象 | 请求中如何使用 |
 | --- | --- | --- |
-| [internal/logger](../../internal/logger/runtime.go) | 已加载日志配置并生成实例标识的共享 Logger | `logger.Current()` 获取；日志方法接收标准 Context，现有业务日志尚未统一切换 |
+| [internal/logger](../../internal/logger/runtime.go) | 已加载日志配置并生成实例标识的共享 Logger | HTTP 请求与响应日志已使用共享实例；日志方法接收标准 Context，其他业务日志尚未统一切换 |
 | [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 作为 `authn.Authenticator` 传给 Router 的全局可选认证中间件；创建成功后 Controller 取得组件签发凭证 |
 | [HTTP 认证中间件](../../app/http/middleware/authentication.go) | 捕获已装配认证器的 Gin Handler | 认证已提供的凭证并保存 Principal；Controller 调用 authz，共用方法通过 `PrincipalFromContext` 读取 |
 | [TraceId 中间件](../../app/http/middleware/trace_id.go)、[公共读写方法](../../internal/traceid/trace_id.go) | 包装请求分发的 `net/http` Handler；公共方法不保存全局请求状态 | 入站确定 TraceId，保存到标准 Request Context，并通过响应头和 company 请求头传递 |
@@ -91,7 +96,7 @@ Logger 的启动装配中，`bootstrap.Init` 只调用 `logger.Init`，传入 `l
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
 | [company Client 集合](../../app/integrations/company/clients.go) | 已完成装配的公司内部 HTTP Client | Service 通过 `company.Current()` 按服务、domain、controller 获取 |
 | [thirdparty Client 集合](../../app/integrations/thirdparty/clients.go) | 经 AI、LLM 分组构造的 Qwen、MiniMax SDK Client | Service 通过 `thirdparty.Current().AI.LLM.Qwen` 或 `.MiniMax` 获取共享实例，传入标准 Context |
-| [routers/http_handler.go](../../routers/http_handler.go) | 同一个 Gin Engine、默认与覆盖配置的等待包装器及收尾组件 | 按请求方法和路径选择一个包装器；停机时统一等待内部处理 |
+| [routers/http_handler.go](../../routers/http_handler.go) | 同一个 Gin Engine、HTTP 日志外层、默认与覆盖配置的等待包装器及收尾组件 | 按请求方法和路径选择一个等待包装器；对外响应日志由 HTTP 日志外层记录，停机时统一等待内部处理 |
 | [用户领域 Router](../../app/domains/user/routers/router.go) | Controller 和各用例的 Validator | Gin 保存其处理方法，收到请求后调用 |
 
 MySQL 组件为每个启用的命名连接创建独立连接池，完成连通性及会话检查后交给 GORM。用户资料 Repository 复用用户数据库入口；Repository 的构造函数不会另建连接池。
@@ -135,7 +140,7 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
-现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。公共 Logger 已能从标准 Context 自动读取 TraceId，并已完成启动初始化；现有请求日志尚未统一切换到该 Logger，也未创建或导出 Span。日志字段及操作作用域见[请求日志规范](application-log.md)。
+现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。HTTP 模板绑定以 Gin 当前的 Request Context 建立操作作用域，保留这层取消隔离；不能拿外层可取消 Context 替换内部 Context。公共 Logger 已完成启动初始化，HTTP 请求与响应日志自动读取 TraceId；其他业务日志尚未统一迁移，也未创建或导出 Span。日志字段及操作作用域见[请求日志规范](application-log.md)。
 
 ## 3. 跟随一次 createUser 请求
 
@@ -163,7 +168,7 @@ Content-Type: application/json
 
 ### 3.2 Gin 匹配路由并执行全局可选认证
 
-[routers/web.go](../../routers/web.go) 的 `New(authenticator)` 创建 Gin Engine，安装请求日志、异常恢复中间件；在 `/api` 分组挂载一次 `AuthenticateIfPresent(authenticator)`，再建立 `/v1` 等版本分组。版本及领域路由继承该中间件，不逐接口重复注册认证步骤。
+[routers/web.go](../../routers/web.go) 的 `New(authenticator)` 创建 Gin Engine，安装 HTTP 日志模板绑定和异常恢复中间件；在 `/api` 分组挂载一次 `AuthenticateIfPresent(authenticator)`，再建立 `/v1` 等版本分组。版本及领域路由继承该中间件，不逐接口重复注册认证步骤。
 
 随后，[用户领域 Router](../../app/domains/user/routers/router.go) 注册领域和 Controller 分组：
 
@@ -177,9 +182,11 @@ userProfile.POST("/createUser", r.createUserValidator.CreateUser)
 
 一次请求到来后，Gin 按 HTTP 方法和路径选择已注册的处理链。公共中间件围绕后续处理执行：
 
-- `gin.Logger` 记录方法、路径以及内部处理链的状态码和耗时；外层另行记录选定的 HTTP 状态和等待耗时，不能把晚到的内部成功日志当作客户端收到了成功响应，也不能仅凭 503 判断发生了超时。
+- `HTTPRouteLogging` 读取匹配后的 `FullPath()`，通过 `logger.WithHTTPOperation` 建立 `http_entry` 作用域，并让请求专属状态输出一次 `started`。外层 `HTTPLogging` 在对外响应结束时输出一次 `finished`，附实际选定的状态和外层耗时；原有 `gin.Logger()` 及响应等待层旧摘要已移除，避免重复记录或把内部缓冲状态当作对外状态。
 - `gin.CustomRecovery` 捕获当前请求处理链中的未处理 `panic`，框架错误的返回方式见第 5 节。
 - `AuthenticateIfPresent` 只在完全没有 Authorization 头时匿名放行；头显式为空、重复或格式错误时返回 400，凭证无效、过期或方案不支持时返回 401，技术故障返回 500。携带有效凭证时先保存 Principal，再进入 Validator；失败时不降级匿名，公开接口也遵守这一规则。
+
+HTTP 操作标识使用注册模板，保留路径参数占位符，不包含 Query 或实际资源 ID。真正的 NoRoute 使用 `{METHOD} <unmatched>`；若响应已结束但 Gin 尚未提供模板，或自动重定向绕过模板绑定，则使用 `{METHOD} <unresolved>`。本次 HTTP 的开始、结束日志复用同一个确定后的标识，晚到处理不会修改已经记录的操作身份。
 
 可选认证只确认身份，不决定接口访问资格。Validator 仍先检查请求参数，Controller 随后按接口规则读取身份并执行访问检查；匿名且参数非法的请求因此可以先返回 400，参数通过后才在受保护 Controller 返回缺少身份的 401。不存在的路由沿用 `NoRoute` 的 404，不通过 `/api` 分组补做认证。完整头部规则和身份读取方式见[HTTP 认证适配层](api-authentication.md#7-http-认证适配层)。
 
@@ -495,7 +502,7 @@ HTTP JSON
 
    **异常恢复仍由完整 Gin Handler 中的既有 Recovery 负责。** 适配层记录逃逸的 panic 后交回标准库处理，确保晚到异常仍有日志；它不提供任意原始 Handler 已输出部分正文后重新生成完整 500 的额外保证。
 
-   **日志分别表达选定的 HTTP 响应和内部处理结果。** Gin 日志中的状态来自内部缓冲 Writer，可能在外层选择 503 后仍记录内部的 200；外层的 503 也可能来自业务本身，不能一概归为超时。丢弃响应不触发重跑业务、不反向撤销已经提交的数据，也不保证客户端能够得知最终状态。
+   **HTTP 日志表达选定的对外响应，内部处理结果仍需由其所属层记录。** `HTTPLogging` 包装响应等待层，观察外层 Writer；即使内部稍后准备了 200，也不会覆盖已经记录的对外 503，外层的 503 也可能来自业务或停机，不能一概归为超时。`finished` 表示外层响应处理结束，不代表业务结束或客户端必然收到正文。丢弃响应不触发重跑业务、不反向撤销已经提交的数据，也不保证客户端能够得知最终状态。
 
 6. **内部执行的生命周期由框架跟踪，HTTP 响应结束不代表工作已经结束。** 中间件登记每次内部 Handler 的开始与退出，即使超时响应已经发送，也要保留仍在执行的工作记录，供停机收尾等待。处理器自行启动的额外后台任务不自动纳入这份记录，需要由对应任务生命周期另外管理；停机顺序见第 7 节。
 

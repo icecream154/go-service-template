@@ -17,7 +17,7 @@
 
 | component | operation 格式 | 取值规则 | 示例 |
 | --- | --- | --- | --- |
-| `http_entry` | `{HTTP 方法} {注册路由模板}` | 方法大写，中间一个空格；使用注册的完整路由模板，保留路径参数占位符，不包含 Query。在路由匹配后确定该操作的生命周期标识并复用；真正未匹配的请求使用 `{HTTP 方法} <unmatched>`，不能将尚未匹配视为未匹配 | `GET /api/v1/example/resources/:resource_id` |
+| `http_entry` | `{HTTP 方法} {注册路由模板}` | 方法取请求值，中间一个空格；使用注册的完整路由模板，保留路径参数占位符，不包含 Query 或实际资源 ID。真正未匹配的请求使用 `{HTTP 方法} <unmatched>`；响应结束前仍未取得模板时使用 `{HTTP 方法} <unresolved>`。同一请求的开始、结束记录复用已确定的标识 | `GET /api/v1/example/resources/:resource_id` |
 | `controller` | `{领域名}.{Controller 类型名}.{方法名}` | 领域名取所属领域目录名，类型名和方法名取项目实际声明的名称；不包含接收者指针符号或调用实参 | `example.ResourceController.QueryResource` |
 | `service` | `{领域名}.{Service 类型名}.{方法名}` | 领域名取所属领域目录名，类型名和方法名取本项目业务 Service 的实际声明名称 | `example.ResourceService.QueryResource` |
 | `client` | `{集成命名空间}.{Client 类型名}.{方法名}` | 集成命名空间取 `app/integrations/` 下 Client 所在的相对目录路径，将目录分隔符替换为 `.`；保留目录名原有拼写；类型和方法取本项目封装的 Client 声明 | `company.example-service.resource.ResourceClient.QueryResource`、`thirdparty.ai.llm.ProviderClient.GenerateText` |
@@ -29,7 +29,7 @@
 
 | component | 自动识别方式 | 接入位置 |
 | --- | --- | --- |
-| `http_entry` | 待 HTTP 中间件根据请求方法和匹配后的 `Gin.FullPath()` 生成；真正未匹配时使用固定占位标识 | 尚未接入 |
+| `http_entry` | HTTP 外层与 Gin 模板绑定中间件协作，根据请求方法和匹配后的 `Gin.FullPath()` 生成，使用 `WithHTTPOperation` 建立作用域 | 生产 `NewHTTPHandler` 已接入；无法取得模板时按下文保留明确的占位标识 |
 | `controller`、`service`、`repository` | `WithCurrentOperation` 通过 `runtime.CallersFrames` 取得直接调用入口的函数符号，解析包路径、接收者类型和方法名，按目录及类型后缀生成 | 对应组件的普通导出方法入口 |
 | `client` | 按具体 Client 公开方法的包路径、接收者类型和方法名生成 | 具体 Client 的公开方法入口；共享底座的排除范围见下文 |
 
@@ -52,7 +52,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 辅助函数不重复调用入口封装，沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId、取消和截止时间。下游方法返回后，上层 Context 的操作信息保持原值。传入 nil Context 时以 `context.Background()` 为基础，不生成 TraceId。请求级 Context 不存入共享实例字段。
 
-入口封装只识别并携带操作信息，不自动记录 `started`、`finished` 或计算耗时；需要生命周期日志时由操作边界调用日志方法。
+方法入口封装只识别并携带操作信息，不自动记录 `started`、`finished` 或计算耗时；需要生命周期日志时由操作边界调用日志方法。HTTP 的请求与响应边界由下文的中间件统一记录。
 
 如需连入口封装调用也自动生成，后续须通过调用代理或生成包装代码，并将实际调用接入包装；只生成元数据不会拦截现有的直接方法调用。本阶段先采用入口公共封装的预期。
 
@@ -100,7 +100,28 @@ if err := log.Info(ctx, "HTTP call completed", logger.Fields{
 }
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程；HTTP 操作识别仍待中间件提供，现有业务入口和日志尚未统一迁移，未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求和响应日志已统一使用共享 Logger；业务步骤、外部调用、数据库与异常日志尚未全部迁移，未新增测试用例。
+
+## HTTP 请求与响应日志
+
+生产入口按 `TraceID → HTTPLogging → 响应等待包装器 → Gin` 装配。`HTTPLogging` 使用已初始化的共享 Logger，为每个请求保存独立的开始时间和路由元数据，观察外层实际选定的响应；Gin 的 `HTTPRouteLogging` 在路由匹配后读取 `FullPath()`，向本次请求的状态提供注册模板。
+
+| 日志边界 | event | operation 来源 | 结果字段 |
+| --- | --- | --- | --- |
+| 请求开始 | `started` | 模板首次可知时确定 `{HTTP 方法} {注册路由模板}`；在认证、Validator 和 Controller 执行前记录 | 不预填 HTTP 状态或最终耗时 |
+| 对外响应结束 | `finished` | 复用本次请求已确定的 HTTP 操作标识 | 记录从 HTTP 外层接管请求起计算的 `duration_ms`、实际已选定的 `status_code`，以及可确认的写入、取消或异常终止信息 |
+
+两条日志均使用 `component=http_entry`，自动携带同一 TraceId 和进程公共信息。`started` 的写出时刻是模板首次可知时，计时起点仍由外层在请求进入时保存。HTTP 入口不默认记录原始 URL、Query、请求正文、响应正文或认证头。
+
+真正执行 `NoRoute` 时，Gin 已确认没有匹配模板，使用 `<unmatched>`。若外层先结束、停机拒绝请求，或者 Gin 自动重定向绕过全局中间件，则尚未取得模板，使用 `<unresolved>`；此时按顺序补出 `started` 和 `finished`，冻结同一个标识，晚到的内部处理不能改写已记录的 HTTP 操作身份。未知与尚未解析分别表达，不把所有缺少模板的情况都称为 404。
+
+路由元数据只通过本次请求的受锁状态共享，跨 goroutine 不读取或保存 Gin Context。Gin 为下游建立 HTTP 操作作用域时，以其当前 `Request.Context()` 为基础，保留响应等待层已经应用的取消隔离、TraceId 和其他值；后续方法作用域可以在自己的派生 Context 中覆盖操作身份，外层响应日志仍使用自己的 HTTP 作用域。
+
+`finished` 只表示外层响应处理结束。等待超时返回 503 后，内部业务可以继续执行，不能用晚到内部的 200 覆盖本次 HTTP 日志；503 也可能由业务或停机产生，不仅凭状态码判定为等待超时。正常处理未显式写状态时遵循 HTTP 的隐式 200；若请求已取消或处理异常终止且没有选定状态，则不伪造状态码。本地写入成功也不保证客户端已收到完整正文。
+
+原有 `gin.Logger()` 和响应等待层的对外摘要、重复写入故障输出已移除，请求与响应由统一入口各记录一次。现有 Recovery、内部逃逸 panic 及其他业务日志继续按其原有边界处理，本阶段不宣称全部日志来源已经完成关联。日志输出失败使用标准错误输出兜底，不递归写同一个 Logger，也不替换业务响应。
+
+独立调用 `routers.New(authenticator)` 只会安装 Gin 的模板绑定中间件；没有外层 HTTP 日志状态时直接透传，不隐式取得共享 Logger。生产 `NewHTTPHandler` 负责外层装配，要求先完成启动初始化；独立使用完整 HTTP 日志时，也应在初始化 Logger 后按上述顺序包装。
 
 ## 启动初始化与共享实例
 

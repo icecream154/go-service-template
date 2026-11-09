@@ -39,6 +39,30 @@ func WithCurrentOperation(ctx context.Context) context.Context {
 	return context.WithValue(ctx, operationContextKey{}, operation)
 }
 
+// WithHTTPOperation 根据 HTTP 框架已确定的方法和路由模板建立 http_entry 操作作用域。
+// 本方法由 HTTP 日志基础设施调用，业务日志只需沿用返回的 Context，不手写操作标识。
+// method 和 routeTemplate 按框架提供的原值拼接，不读取原始 URL，也不通过调用栈猜测路由。
+// 缺少任一项时建立空作用域以遮蔽父操作；未匹配或尚未解析的路由占位值由 HTTP 中间件决定。
+// 返回值保留父 Context 的 TraceId、取消和其他数据；不生成标识、不记录事件或计算耗时。
+func WithHTTPOperation(ctx context.Context, method, routeTemplate string) context.Context {
+	// 1. 为没有传入 Context 的基础设施调用准备可派生的根，保持与方法入口作用域的 nil 处理一致。
+	// 已有 Context 则直接作为父节点，保留其取消、截止时间和其他 key 对应的数据。
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// 2. 默认使用空操作信息；缺失方法或模板时不借用父操作，也不猜测真实请求路径。
+	// 这里不判断空模板究竟表示未匹配还是尚未匹配，该状态只能由掌握路由过程的中间件确认。
+	var operation operationInfo
+	if method != "" && routeTemplate != "" {
+		// 2.1. 只有两项都已提供时，使用固定组件类别及“方法 + 一个空格 + 路由模板”的操作格式。
+		// 不修剪、转换大小写或替换占位符，确保开始、结束及内部沿用的 HTTP 作用域保持同一标识。
+		operation = operationInfo{component: ComponentHTTPEntry, name: method + " " + routeTemplate}
+	}
+	// 3. 将本次 HTTP 元数据写入派生 Context；零值也明确遮蔽父层相同 key，父节点本身保持不变。
+	// TraceId 使用独立的 key，因此本次覆盖操作身份不会更改链路标识或原有执行控制。
+	return context.WithValue(ctx, operationContextKey{}, operation)
+}
+
 // operationFromContext 只读取最近一层操作信息，不在日志写入时重新解析调用栈。
 func operationFromContext(ctx context.Context) operationInfo {
 	// 1. nil 表示调用方没有提供上下文，直接返回空元数据，交给日志编码层省略字段。

@@ -17,7 +17,7 @@ const defaultResponseTimeout = 3 * time.Second
 // HTTPHandler 为完整路由选择响应等待时间，并统一管理超时后仍在运行的请求。
 // 通过 NewHTTPHandler 创建；停机时除关闭 HTTP Server 外，还必须调用 Shutdown。
 type HTTPHandler struct {
-	// entryHandler 在响应等待及路由分发之前，为每个请求建立 TraceId 上下文。
+	// entryHandler 在响应等待及路由分发之前建立 TraceId，并观察请求与对外响应的日志生命周期。
 	entryHandler http.Handler
 	// defaultHandler 是默认 3 秒中间件包装后的完整 Gin 入口。
 	// 请求没有命中方法和路径的覆盖配置时，进入此 Handler。
@@ -32,14 +32,14 @@ type HTTPHandler struct {
 	timeouts []*middleware.ResponseTimeout
 }
 
-// NewHTTPHandler 创建生产 HTTP 入口，在响应等待层之前统一装配 TraceId 中间件。
+// NewHTTPHandler 创建生产 HTTP 入口，在响应等待层之前依次装配 TraceId 和 HTTP 日志中间件。
 // 所有接口默认等待 3 秒，指定接口使用独立配置。
 // 每个超时 Handler 包装同一个完整 Gin Engine；请求只进入其中一个，不叠加计时。
 // 本方法在启动时调用一次，预先准备各个入口；构造和 Wrap 不会开始某次请求的计时。
 // 每次请求进入选定入口后，才由中间件中的 http.TimeoutHandler 启动该请求的等待。
 // 多个请求可以复用同一个中间件实例，但各自独立计时，不共享一个倒计时。
 func NewHTTPHandler() (*HTTPHandler, error) {
-	// 覆盖配置按 HTTP 方法和完整路径匹配；新增特殊配置时统一在这里声明。
+	// 1. 集中声明需要覆盖默认响应等待时间的接口，按 HTTP 方法和完整路径精确匹配。
 	// 未列出的请求使用 defaultResponseTimeout；修改配置后重新启动服务生效。
 	overrides := []struct {
 		method  string
@@ -48,69 +48,87 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 	}{
 		{http.MethodGet, "/api/v1/user/userProfile/queryUserProfilePage", 5 * time.Second},
 		{http.MethodPost, "/api/v1/user/userProfile/createUser", 10 * time.Second},
-		// Qwen 优化和图片生成串行调用，当前各有 60 秒预算，另留 5 秒用于认证、校验与响应。
+		// 1.1. Qwen 优化和图片生成串行调用，当前各有 60 秒预算，另留 5 秒用于认证、校验与响应。
 		{http.MethodPost, "/api/v1/user/userProfile/generateUserAvatar", 125 * time.Second},
 	}
 
-	// 启动阶段已初始化共享 JWT 组件；完整 Gin Engine 在 /api 分组挂一次可选认证。
+	// 2. 使用启动阶段已初始化的共享 JWT 组件构造完整 Gin Engine，在 /api 分组挂一次可选认证。
 	// 各等待包装器复用这个 Engine，不会重复安装或重复执行认证。
 	engine := New(authnjwt.Current())
-	// 保存已注册的“方法 + 路径”，用于检查下面的覆盖配置是否指向真实接口。
+	// 2.1. 保存所有注册路由的“方法 + 路径”，在启动时检查覆盖配置是否仍指向真实接口。
+	// 此集合用于等待时间配置校验；请求日志的 operation 由 Gin 匹配后的模板提供，不在这里猜测。
 	registeredRoutes := make(map[string]struct{})
 	for _, route := range engine.Routes() {
+		// 2.2. 每个注册项只保存存在标记，方法相同但路径不同、路径相同但方法不同都分别检查。
 		registeredRoutes[route.Method+" "+route.Path] = struct{}{}
 	}
 
-	// 创建默认中间件，Wrap(engine) 返回带等待控制的 HTTP 入口，随后保存其收尾实例。
+	// 3. 创建默认响应等待组件。构造只校验配置并准备状态，不开始某个请求的倒计时。
 	defaultTimeout, err := middleware.NewResponseTimeout(defaultResponseTimeout)
 	if err != nil {
+		// 3.1. 默认等待配置非法时无法创建完整入口，保留原因并停止装配，不发布部分 Handler。
 		return nil, fmt.Errorf("configure default response timeout: %w", err)
 	}
+	// 4. 保存默认包装入口、覆盖项索引和收尾实例集合；请求分发与停机管理使用同一组组件。
+	// Wrap(engine) 包装完整 Gin 处理链；这里只创建可复用入口，不执行任何业务请求。
 	handler := &HTTPHandler{
 		defaultHandler: defaultTimeout.Wrap(engine),
 		routeHandlers:  make(map[string]http.Handler, len(overrides)),
 		timeouts:       []*middleware.ResponseTimeout{defaultTimeout},
 	}
+	// 5. 逐项构造覆盖入口，每个入口直接包装原始 Engine，与默认入口并列，不互相嵌套。
 	for _, override := range overrides {
+		// 5.1. 使用与请求分发一致的组合键，避免某个方法的覆盖项意外影响同路径的其他方法。
 		key := override.method + " " + override.path
-		// 路由变更后不能让旧覆盖配置静默失效；启动阶段直接报告未注册的路由。
+		// 5.2. 校验接口仍已注册，防止路由重命名后旧覆盖配置静默失效。
 		if _, exists := registeredRoutes[key]; !exists {
+			// 5.2.1. 配置引用未知路由时直接返回装配错误，让部署阶段发现配置与代码不一致。
 			return nil, fmt.Errorf("response timeout route is not registered: %s", key)
 		}
+		// 5.3. 为本项独立创建等待组件，各组件及其接收的各次请求都不会共享一个倒计时。
 		timeout, err := middleware.NewResponseTimeout(override.timeout)
 		if err != nil {
+			// 5.3.1. 保留失败项的组合键和底层原因，尚未开始处理业务，无须执行请求级收尾。
 			return nil, fmt.Errorf("configure response timeout for %s: %w", key, err)
 		}
-		// 覆盖入口直接包装原始 Engine，不包装 defaultHandler。
+		// 5.4. 覆盖入口直接包装原始 Engine，不包装 defaultHandler。
 		// 例如创建接口只受 10 秒等待控制，不会再被默认 3 秒提前结束等待。
 		handler.routeHandlers[key] = timeout.Wrap(engine)
-		// 每个覆盖项也可能留下已返回超时响应、但仍在执行的业务，必须纳入停机等待。
+		// 5.5. 每个覆盖项也可能留下已返回超时响应、但仍在执行的业务，必须纳入停机等待。
 		handler.timeouts = append(handler.timeouts, timeout)
 	}
-	// TraceId 在响应等待之前确定，超时、停机拒绝及正常业务均使用同一个请求标识。
-	handler.entryHandler = middleware.TraceID(http.HandlerFunc(handler.serveHTTP))
+	// 6. 按请求执行顺序装配最外层入口：先确定 TraceId，再创建 HTTP 日志状态，最后选择响应等待入口。
+	// HTTPLogging 在构造时取得共享 Logger；因此生产入口必须在应用 Logger 初始化完成后装配。
+	// Gin 只回传路由模板，日志结束状态由外层 Writer 提供，超时后晚到的业务结果不会覆盖它。
+	handler.entryHandler = middleware.TraceID(middleware.HTTPLogging(http.HandlerFunc(handler.serveHTTP)))
+	// 7. 全部默认及覆盖入口均创建成功后返回完整对象，由进程入口同时持有处理与 Shutdown 能力。
 	return handler, nil
 }
 
 // ServeHTTP 先建立 TraceId 上下文，再按方法和路径选择响应等待入口并进入 Gin。
 // cmd/web 将本对象设置为 http.Server.Handler，Shutdown 继续管理同一对象的内部工作。
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 1. 只执行预先装配的完整入口，保证 TraceId、HTTP 日志及响应等待始终按同一顺序执行。
+	// 本方法不重新创建中间件或读取配置，实例可以处理不同请求各自的生命周期。
 	h.entryHandler.ServeHTTP(w, r)
 }
 
 // serveHTTP 只负责路由分发，查询参数不参与匹配；未配置的路径使用默认等待时间。
 func (h *HTTPHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	// 1. 根据本次 HTTP 方法和 URL.Path 查找覆盖入口，Query 不属于等待配置的匹配条件。
 	// 例如 GET .../queryUserProfilePage?page_number=2 的键不包含 ? 后面的内容，命中 5 秒入口；
 	// POST .../createUser 命中 10 秒入口；GET .../queryUserProfileByUserId 未命中，采用默认 3 秒。
 	// 方法也是匹配条件：GET .../createUser 不会使用 POST 的覆盖项，最终由 Gin 判断路由。
 	handler, exists := h.routeHandlers[r.Method+" "+r.URL.Path]
+	// 2. 未列入覆盖配置的请求统一使用默认入口，仍由同一个 Gin Engine 决定路由或 NoRoute 结果。
 	if !exists {
 		handler = h.defaultHandler
 	}
-	// 只调用选中的一个入口。中间件先登记内部执行，再开始等待并调用完整 Gin 处理链。
+	// 3. 只调用选中的一个入口。中间件先登记内部执行，再开始等待并调用完整 Gin 处理链。
 	// 期限内完成就发送业务响应，不必等满配置时间；期限到达仍未完成则选择统一的 503 响应。
 	// 中间件隔离内部请求的 Context 取消信号，业务继续执行，晚到响应被丢弃。
 	// 返回超时 503 不减少内部执行计数，只有内部处理真正结束后，中间件才解除本次登记。
+	// 此处返回后由外层 HTTPLogging 记录对外响应，不把它当作内部业务最终完成或成功的证明。
 	handler.ServeHTTP(w, r)
 }
 
@@ -128,14 +146,18 @@ func (h *HTTPHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 // 返回错误表示未确认内部处理全部结束，不能据此认为业务成功、事务回滚或依赖可安全关闭。
 // 进程入口只有确认 HTTP 和内部处理均已结束，才正常关闭数据库等共享资源。
 func (h *HTTPHandler) Shutdown(ctx context.Context) error {
+	// 1. 准备收尾错误集合，既允许全部成功，也保留多个等待组件分别返回的失败原因。
 	var shutdownErrors []error
-	// 依次处理默认和各覆盖实例；轮到某个实例时，才由它停止接纳新工作并等待。
+	// 2. 依次处理默认和各覆盖实例；轮到某个实例时，才由它停止接纳新工作并等待。
 	// 即使前一个等待失败，也继续调用后面的 Shutdown，使其同样进入停止状态。
 	for _, timeout := range h.timeouts {
+		// 2.1. 所有组件复用同一个剩余收尾预算，不因切换到下一个组件而重新获得完整时长。
 		if err := timeout.Shutdown(ctx); err != nil {
+			// 2.2. 等待失败表示未确认该组件的内部工作结束，记录原因但不取消业务或关闭依赖资源。
 			shutdownErrors = append(shutdownErrors, err)
 		}
 	}
-	// 全部成功时返回 nil；否则保留各实例的收尾错误，交给进程入口处理。
+	// 3. 全部成功时 errors.Join 返回 nil；否则保留各实例的收尾错误，交给进程入口决定清理及退出。
+	// HTTP 响应日志已结束不影响这里的内部工作跟踪，也不能替代这些组件的排空确认。
 	return errors.Join(shutdownErrors...)
 }
