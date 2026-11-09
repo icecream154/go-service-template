@@ -1,0 +1,9 @@
+python-service-template:
+  base_url: http://127.0.0.1:8000
+  connect_timeout: 3s
+
+  image:
+    image_edit:
+      request_timeout: 30s
+    image_gen:
+      request_timeout: 60s

@@ -1,0 +1,10 @@
+# Inject the target service address for the test environment before startup.
+python-service-template:
+  base_url: "${TEST_PYTHON_SERVICE_TEMPLATE_BASE_URL}"
+  connect_timeout: 3s
+
+  image:
+    image_edit:
+      request_timeout: 30s
+    image_gen:
+      request_timeout: 60s
