@@ -2,7 +2,7 @@
 
 公司内部服务的 HTTP Client 统一放在 `app/integrations/company/` 下，按目标服务、domain、controller 划分。
 
-本文约定目录组织、初始化、获取及配置方式。目前已提供公共构造方法、多环境配置读取、进程启动时的统一初始化和共享实例获取；两个 Image Client 尚未提供实际接口调用方法。
+本文约定目录组织、初始化、获取、配置及 TraceId 透传方式。目前已提供公共构造方法、多环境配置读取、进程启动时的统一初始化和共享实例获取；两个 Image Client 已分别提供图片生成和图片编辑任务查询的 HTTP 调用示例，路径和字段仍待真实服务契约确认。
 
 ## 目录结构
 
@@ -15,6 +15,7 @@ app/integrations/company/
 ├── python_service_template.go    # python-service-template 的具体 Client 装配
 ├── base/
 │   ├── client.go                 # 公共 Client 结构及构造方法
+│   ├── request.go                # 公共 GET/POST JSON 请求及 TraceId 透传
 │   └── transport.go              # 服务共享 Transport 的构造方法
 └── python-service-template/       # 目标服务
     └── image/                    # 目标服务中的 domain
@@ -106,3 +107,13 @@ python-service-template:
 上述超时值为示例，具体取值按目标接口确定。连接超时包含在请求总超时内，例如 `image_edit` 的总上限为 30 秒，连接阶段最多占用其中的 3 秒。[Go HTTP Client 说明](https://pkg.go.dev/net/http@go1.25.0#Client)
 
 同一目标服务的多个 Client 共用服务地址和底层 HTTP 连接池，各自使用自己的请求超时。连接池参数由公共实现统一设置默认值；目标服务要求鉴权时，再补充服务级认证配置。
+
+## TraceId 透传
+
+公司内部 HTTP 请求统一使用 `TraceId` 请求头。入站中间件确定本次请求的 TraceId 并保存到标准 `context.Context` 后，Controller 通过 `ctx.Request.Context()` 传给 Service，Service 再将同一 Context 传给具体 Client。已有头像生成用例沿用这条传递链；不向 DTO、Params 或共享 Client 字段增加请求级 TraceId。
+
+`base.Client.requestJSON` 从传入的 Context 调用 `traceid.FromContext(ctx)` 读取值，非空时设置出站 `TraceId` 请求头。`GetJSON`、`PostJSON` 及复用这两个方法的所有 company Client 统一生效，具体业务 Client 无须重复设置请求头。
+
+Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后台任务需要链路关联时，由任务入口通过 `traceid.New()` 生成一次，再用 `traceid.WithContext(ctx, id)` 保存并贯穿一次任务的所有调用。不得在调用过程中用 `context.Background()` 替换已有的执行 Context。
+
+公共方法位于 [internal/traceid/trace_id.go](../../internal/traceid/trace_id.go)，入站与响应头规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。当前阶段只透传自定义 `TraceId`，完整 Span、日志关联和标准链路上下文的后续规划见[日志与可观测性设计](application-log.md#4-统一标识与链路上下文)。

@@ -1,8 +1,10 @@
 # Go 后端工程规范与框架示例
 
-提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。接口、数据库及服务性能的日志、指标和链路追踪方案见[日志与可观测性体系设计](specifications/application/application-log.md)，当前处于设计阶段。
+提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。已实现 TraceId 的入站生成、Context 保存、响应头回传和 company 请求透传；完整日志、指标、Span 和性能诊断仍处于设计阶段，见[日志与可观测性体系设计](specifications/application/application-log.md)。
 
-公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[公司内部 HTTP Client 规范](specifications/application/api-outbound.md)。两个 Image Client 当前只完成构造和装配，尚无实际接口调用方法。
+公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[公司内部 HTTP Client 规范](specifications/application/api-outbound.md)。两个 Image Client 已提供图片生成和图片编辑任务查询的 HTTP 调用示例，真实服务契约仍待确认。
+
+生产 HTTP 入口在响应等待中间件之前处理 `TraceId`：请求头不存在或为空时生成 16 字节随机数编码的 32 位十六进制值；已有非空值时原样沿用。该值保存到 `Request.Context()` 并通过同名响应头返回。Controller、Service 和 company Client 传递标准 Context，公共 `GetJSON`、`PostJSON` 自动设置出站 `TraceId`；无值的独立调用不由 Client 补生成。直接使用 `routers.New(authenticator)` 时，需自行用 `middleware.TraceID(engine)` 包装 Gin 入口。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)。
 
 ## 启动
 
@@ -128,7 +130,7 @@ curl -i "http://localhost:8080/api/v1/user/userProfile/queryUserProfileByUserId?
 
 Service 自己声明的错误集中在对应 Service 文件顶部，用包级 `var` 和 `errors.New` 表达本层独立判断的失败或明确的业务语义映射；Service 和 models 不声明新的 error 类型。每个用例在同一区域依次组织 Params、可选 Result、输入常量、输入校验和处理方法，Result 紧接 Params，跨用例私有方法位于尾部 `shared`。用例专属 Result 留在 Service，领域模型直接复用，具体见[Service 输出契约](specifications/application/api-service-validator.md#74-service-的输出契约)。Controller 文件维护自己的业务码和映射；models 直接复用公共检查错误，只为自身独立判断的领域失败声明错误。内部错误与对外业务码不要求一一对应；同一个业务码的通用错误类别保持固定。公共响应组件维护八个通用类别及 HTTP 状态映射，合法错误的 `Message`、`Details` 原样输出，具体约定见[接口错误规范](specifications/application/api-error.md)及[接口返回规范](specifications/application/api-response.md)。
 
-顶层 `routers.New(authenticator)` 创建 Gin Engine、公共中间件和 `/api` 分组，在 `/api` 统一挂载可选认证，再建立 `/v1` 并调用领域 Router 注册接口。`cmd/web` 使用 `routers.NewHTTPHandler()`，该方法将共享 JWT 认证器传给 `New`，在完整 Gin Engine 外装配响应等待中间件，并保存收尾入口；独立调用 `New` 需显式传入认证器。未匹配的路由保持 `NoRoute` 的 404，不补做认证。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述五个用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
+顶层 `routers.New(authenticator)` 创建 Gin Engine、公共中间件和 `/api` 分组，在 `/api` 统一挂载可选认证，再建立 `/v1` 并调用领域 Router 注册接口。`cmd/web` 使用 `routers.NewHTTPHandler()`，该方法将共享 JWT 认证器传给 `New`，在完整 Gin Engine 外装配响应等待中间件，在请求分发外层装配一次 TraceId 中间件，并保存收尾入口；独立调用 `New` 需显式传入认证器。未匹配的路由保持 `NoRoute` 的 404，不补做认证。接口路径统一为 `/api/v1/{domain}/{controller}/{业务用例}`：domain 严格沿用 `app/domains/<domain>` 的目录名，controller 由具体 Controller 类型名去除 `Controller` 后缀后转换为 lowerCamelCase。`app/domains/user/routers/router.go` 创建并持有 `UserProfileController`，在 `/user/userProfile` 分组下注册上述用例。完整约定见[接口路由与命名规范](specifications/application/api-routing.md)及[接口返回规范](specifications/application/api-response.md)。
 
 Controller 保留在对应领域的 `controller/v1` 中；Validator 与 DTO 先按版本、再按 Controller 分组，用户资料分别位于 `validator/v1/user_profile` 和 `dto/v1/user_profile`。每个用例独立组织文件，两个分组包均命名为 `userprofile`，导入时分别使用 `userprofilevalidator`、`userprofiledto` 别名。同一 Controller 内复用的 `UserProfile` 放在该 DTO 分组的 `user_profile.go` 中；只有跨 Controller 复用且语义一致的结构，才按需建立 `dto/v1/shared` 包。统一响应外层由 `internal/response` 提供。
 
@@ -223,6 +225,8 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 接收认证器，创建 Gin Engine，在 `/api` 挂载可选认证，再注册版本及领域路由 |
 | `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
+| `internal/traceid` | 生成 TraceId，通过标准 Context 保存和读取，集中声明 HTTP 头名称 |
+| `app/http/middleware/trace_id.go` | 在响应等待前确定 TraceId，保存到请求 Context，并写入同名响应头 |
 | `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
 | `app/http/middleware/authentication.go`、`principal.go` | 可选认证；按请求保存、读取可信身份，认证失败时统一输出 |
 | `app/http/authz/principal.go`、`member.go` | 为 Controller 复用身份要求检查和项目主体标识转换，只返回值或错误 |

@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"go-service-template/internal/traceid"
 )
 
 // GetJSON 向目标服务发送 GET 请求，将 HTTP 200 的 JSON 正文解码到 result。
@@ -60,6 +62,10 @@ func (c *Client) requestJSON(ctx context.Context, method, path string, query url
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
+	// 统一透传调用方的链路标识；没有请求上下文的调用不在这里另行生成。
+	if id := traceid.FromContext(ctx); id != "" {
+		request.Header.Set(traceid.HeaderName, id)
+	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("send HTTP request: %w", err)

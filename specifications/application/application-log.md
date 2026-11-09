@@ -1,10 +1,10 @@
 # 日志与可观测性体系设计
 
-状态：设计方案，尚未实施。更新日期：2026 年 11 月 9 日。
+状态：TraceId 生成与透传已实现；其余观测能力仍为设计方案。更新日期：2026 年 11 月 9 日。
 
 本方案覆盖接口、数据库和服务性能三个维度，统一统计口径、日志字段、链路上下文、采集存储及排障方式。采用结构化日志、指标、分布式追踪和性能剖析共同支撑观测：指标回答发生了多少次、整体是否变慢，日志解释具体事件，Trace 展示一次调用的执行路径，Profile 定位 CPU、内存及阻塞热点。
 
-项目现有的英文日志、错误原样传递、统一响应和响应等待超时约定继续作为设计边界。本文中的组件、配置、指标和方法签名属于后续实施目标；现有运行行为仍以代码及对应接口规范为准。
+项目现有的英文日志、错误原样传递、统一响应和响应等待超时约定继续作为设计边界。当前阶段使用自定义 `TraceId` 头完成入站标识、标准 Context 保存、响应头回传和 company 请求透传，规则见第 4.2 节；日志自动关联、Span、指标和采集组件仍为后续实施目标。现有运行行为以代码及对应接口规范为准。
 
 ## 1 目标与主要决策
 
@@ -18,7 +18,7 @@
 
 1. **统计直接来自执行事件。** 使用 Counter、Gauge、Histogram，不通过扫描日志或抽样 Trace 计算正式接口统计。
 2. **日志统一使用结构化 JSON。** 采用 Go 标准库 `log/slog`，由公共 Handler 注入上下文、执行脱敏和输出；不在各业务层创建独立 Logger。`go.mod` 已包含 zap，但当前主调用链使用 `log.Printf`，本方案不再增加第二套业务日志 API。
-3. **链路统一使用 OpenTelemetry 和 W3C Trace Context。** 通过标准 `context.Context` 贯穿 HTTP、Service、Repository、事务和下游调用。
+3. **链路上下文通过标准 `context.Context` 传递。** 当前使用自定义 `TraceId` 关联 HTTP 与 company 调用；OpenTelemetry 和 W3C Trace Context、Repository 和事务 Span 属于后续迁移目标。
 4. **首期保留全量关键记录及 Trace。** 先满足任意请求可查的需求，再依据实际数据量决定是否引入采样。采样后的详细链路覆盖范围必须明确。
 5. **采集与业务解耦。** 应用向标准输出写日志，向采集器发送 OTLP Trace，并提供指标端点；集中存储不可用时，业务继续运行，观测数据可能丢失且必须可监测。
 6. **单独定义响应与执行两个结果。** 当前等待超时会返回 503，但内部工作继续；两者分别计数、计时和记录，不用一次状态码推断业务是否提交。
@@ -29,9 +29,9 @@
 | --- | --- | --- |
 | [启动入口](../../cmd/web/main.go)、[bootstrap](../../bootstrap/init.go) | 管理初始化、HTTP 监听、收尾和资源关闭；主要输出文本日志 | 初始化观测资源、记录生命周期事件，并纳入退出清理 |
 | [Gin 路由](../../routers/web.go) | 使用 `gin.Logger`、`gin.CustomRecovery` | 替换为统一观测中间件和结构化 Recovery，避免并行输出两套访问日志 |
-| [HTTP 装配](../../routers/http_handler.go)、[响应等待组件](../../app/http/middleware/response_timeout.go) | 默认等待 3 秒，分页 5 秒，创建用户 10 秒；超时后内部继续 | HTTP 外层观察真正选中的响应；内部独立观察工作结束 |
+| [HTTP 装配](../../routers/http_handler.go)、[响应等待组件](../../app/http/middleware/response_timeout.go) | 已在等待前确定 TraceId；默认等待 3 秒，分页 5 秒，创建用户 10 秒，头像生成 65 秒；超时后内部继续 | HTTP 外层观察真正选中的响应；内部独立观察工作结束 |
 | [公共响应组件](../../internal/response/response.go) | 输出统一错误、记录编码和写出失败 | 在写出时登记结构化结果，日志使用同一请求上下文 |
-| [Service](../../app/domains/user/service/user_profile_service.go)、[Repository](../../app/domains/user/repository/user_profile_repository.go) | 方法尚未接收标准 Context，部分 Service 记录技术故障 | 显式增加 Context，保持 Params、领域模型和错误语义 |
+| [Service](../../app/domains/user/service/user_profile_service.go)、[Repository](../../app/domains/user/repository/user_profile_repository.go) | 头像生成已接收并向 company Client 传递标准 Context；其他用例和仓储尚未统一接入，部分 Service 记录技术故障 | 按需显式增加 Context，保持 Params、领域模型和错误语义 |
 | [MySQL Manager](../../internal/database/mysql/client.go) | 管理 `user/post/order/transaction` 独立连接池，配置 GORM 参数化日志 | 安装统一 ORM 观测插件和日志适配器，提供只读池统计 |
 
 目前尚无统一的 OpenTelemetry、Prometheus 指标端点、集中日志平台和性能诊断入口。实施 Context 改造时，须同步更新 README 及[接口处理流程](api-handle.md)、[Service 调用规范](api-service-validator.md)中有关签名和仓储不接收 Context 的描述。标准 Context 用于执行控制及观测，不引入 Gin、认证对象或 HTTP DTO 到 Service 和 Repository。
@@ -72,9 +72,12 @@ flowchart LR
 
 ### 4.1 标识和资源属性
 
+当前阶段只实现自定义 `TraceId` 的生成、Context 保存和 HTTP 透传；表中其余标识及资源属性均为后续完整观测体系的目标，不表示现有日志已包含这些字段。
+
 | 标识 | 规则 |
 | --- | --- |
-| `trace_id` | OpenTelemetry 生成的非零 128 位标识，以 32 位小写十六进制输出；全链路共用，不使用雪花业务 ID 替代 |
+| `TraceId`（当前 HTTP 头） | 非空入站值原样沿用；缺失或为空时用 16 字节随机数生成 32 位小写十六进制值，同一 Context 内复用 |
+| `trace_id`（后续标准 Trace） | 迁移 OpenTelemetry 后由其维护的非零 128 位标识，以 32 位小写十六进制输出；不直接把任意自定义头值视为标准 Trace Context |
 | `span_id` | 非零 64 位标识，以 16 位小写十六进制输出；每段操作独立，形成父子关系 |
 | `request_id` | 本服务每次入站请求独立生成，用于区分一个 Trace 中多次进入同一接口的调用；不依赖上游提供的值 |
 | `service_instance_id` | 每次进程启动分配，区分副本和重启；进入日志和 Trace，不作为业务指标维度 |
@@ -84,16 +87,27 @@ Trace 资源属性分别映射为 `service.name`、`service.version`、`service.
 
 ### 4.2 入站与出站规则
 
+**当前阶段已实现的规则：**
+
+1. [TraceId 中间件](../../app/http/middleware/trace_id.go) 使用 `net/http`，由 `routers.NewHTTPHandler()` 在请求分发外层装配一次，先于响应等待中间件执行。入站 `TraceId` 缺失或为空时生成，非空时原样沿用。
+2. 值通过 [internal/traceid](../../internal/traceid/trace_id.go) 保存到标准 `Request.Context()`，并写入同名响应头。正常响应、校验或认证失败、404、等待超时和停机拒绝均沿用已确定的值，JSON 响应结构保持不变。生成失败按内部错误返回，不进入业务处理。
+3. Controller 通过 `ctx.Request.Context()` 将值传给 Service，再传给 company Client。公共 `base.Client.requestJSON` 统一读取并设置出站 `TraceId`，覆盖 `GetJSON`、`PostJSON`；具体业务 Client 不重复处理。
+4. company Client 不生成 TraceId；无值时不附加该头。后台任务需要关联时由入口调用 `traceid.New()`、`traceid.WithContext(ctx, id)` 创建一次任务上下文。该值不放入 DTO、Params 或共享实例，不参与身份认证或授权。
+
+上述规则尚未创建 Span、向日志自动注入链路字段或启用标准 `traceparent/tracestate`。详细调用约定见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)及[company 请求透传](api-outbound.md#traceid-透传)。
+
+**以下为后续 W3C/OTel 迁移目标，尚未实施。** 迁移前须明确自定义 `TraceId` 与标准上下文的兼容及响应头规则，同步调整上下游服务；不能同时启用两套互相独立的标识来源。
+
 1. 在响应等待包装器之前提取 `traceparent` 和 `tracestate`，并创建 HTTP SERVER Span。没有有效上下文时创建新 Trace，无效头不导致业务请求失败。
 2. 来自受信任网关和服务的有效上下文延续同一 Trace；公网边界由网关清理、校验并建立可信链路。服务直接暴露公网时，默认新建 Trace，合法外部上下文可作为 Span Link，不能仅凭自报头认定来源可信。
 3. 响应头统一返回 `X-Trace-Id` 和 `X-Request-Id`，包括校验失败、认证失败、404、超时及停机拒绝；浏览器需要读取时配置 CORS 暴露头。保持现有 JSON 响应结构。
-4. `X-Trace-Id` 仅供查询，不作为入站链路上下文来源。公司内出站 HTTP 使用带观测能力的 Transport，注入标准 `traceparent/tracestate` 并为可观测尝试创建 CLIENT Span；第三方调用默认仅保留本地 Span，对方明确支持且允许后才传播相关头。HTTP 与 SDK 的接入和观测边界见[外部接口调用规范](api-outbound.md#11-链路日志与统计)。
+4. 迁移后的 `X-Trace-Id` 仅供查询，不作为标准链路上下文来源。公司内出站 HTTP 计划通过观测组件注入标准 `traceparent/tracestate` 并创建 CLIENT Span；第三方调用默认仅保留本地 Span，对方明确支持且允许后才传播相关头。当前 company HTTP 的实现边界见[外部接口调用规范](api-outbound.md)。
 5. 后续接入 gRPC 时使用对应拦截器；消息发送与消费在消息属性中传递标准上下文，重试、扇出和延迟任务按实际因果关系使用子 Span 或 Span Link。
 6. `baggage` 默认不透传；确需使用时仅接收白名单中的短小、非敏感字段。Trace 标识不承担认证或授权职责。
 
 头格式与传播由标准实现处理，不手写 ID 解析及校验。协议依据见 [W3C Trace Context](https://www.w3.org/TR/trace-context/)和 [OpenTelemetry 上下文传播](https://opentelemetry.io/docs/concepts/context-propagation/)。
 
-### 4.3 进程内传递和 Span 组织
+### 4.3 后续进程内传递和 Span 组织
 
 目标调用方式如下，代码仅说明签名及传递关系。
 
@@ -121,11 +135,11 @@ Span 名称使用方法与路由模板、领域与用例等稳定名称，参数
 
 Context 不放入 DTO、Params、领域模型或长期存活的 Service/Repository 字段；不通过全局变量、goroutine ID 或字符串拼接恢复链路。并发任务显式传入标准 Context，不跨 goroutine 使用 Gin Context。真正独立的后台任务创建自己的根 Span，并保留触发请求的 Link。
 
-### 4.4 响应等待超时后的链路
+### 4.4 响应等待超时后的链路与后续 Span 组织
 
-沿用当前 `context.WithoutCancel` 隔离客户端取消和响应等待截止时间的语义，同时保留 Trace、请求标识等 Context 值；不在传递 Context 的过程中意外恢复“超时即取消业务”。业务需要执行上限时另设明确的执行 Context，与响应等待时间分开配置。
+当前 `context.WithoutCancel` 隔离客户端取消和响应等待截止时间，并保留已保存的 TraceId；内部处理及其 company 调用继续使用同一个值。后续 Span 接入也沿用这一边界，不在传递 Context 的过程中意外恢复“超时即取消业务”。业务需要执行上限时另设明确的执行 Context，与响应等待时间分开配置。
 
-HTTP SERVER Span 在外部响应处理结束时结束；`http.work` Span 在内部 Handler 真正退出时结束，允许子 Span 晚于父 Span 结束。晚到业务、事务和 SQL 继续使用相同 `trace_id`，日志关联当前工作 Span，不向已结束的 HTTP Span 补写事件。
+后续实施 Span 时，HTTP SERVER Span 在外部响应处理结束时结束；`http.work` Span 在内部 Handler 真正退出时结束，允许子 Span 晚于父 Span 结束。晚到业务、事务和 SQL 继续使用相同 `trace_id`，日志关联当前工作 Span，不向已结束的 HTTP Span 补写事件。
 
 例如创建请求 10 秒返回 503、12 秒业务完成：访问日志记录等待超时和 10 秒响应耗时，内部日志记录实际完成结果和 12 秒执行耗时；如果事务已成功提交，明确记录 `committed`。对外失败次数增加一次，内部成功次数也可增加一次，分别出现在对应看板中。
 

@@ -17,6 +17,8 @@ const defaultResponseTimeout = 3 * time.Second
 // HTTPHandler 为完整路由选择响应等待时间，并统一管理超时后仍在运行的请求。
 // 通过 NewHTTPHandler 创建；停机时除关闭 HTTP Server 外，还必须调用 Shutdown。
 type HTTPHandler struct {
+	// entryHandler 在响应等待及路由分发之前，为每个请求建立 TraceId 上下文。
+	entryHandler http.Handler
 	// defaultHandler 是默认 3 秒中间件包装后的完整 Gin 入口。
 	// 请求没有命中方法和路径的覆盖配置时，进入此 Handler。
 	defaultHandler http.Handler
@@ -30,7 +32,8 @@ type HTTPHandler struct {
 	timeouts []*middleware.ResponseTimeout
 }
 
-// NewHTTPHandler 创建生产 HTTP 入口，所有接口默认等待 3 秒，指定接口使用独立配置。
+// NewHTTPHandler 创建生产 HTTP 入口，在响应等待层之前统一装配 TraceId 中间件。
+// 所有接口默认等待 3 秒，指定接口使用独立配置。
 // 每个超时 Handler 包装同一个完整 Gin Engine；请求只进入其中一个，不叠加计时。
 // 本方法在启动时调用一次，预先准备各个入口；构造和 Wrap 不会开始某次请求的计时。
 // 每次请求进入选定入口后，才由中间件中的 http.TimeoutHandler 启动该请求的等待。
@@ -84,13 +87,19 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 		// 每个覆盖项也可能留下已返回超时响应、但仍在执行的业务，必须纳入停机等待。
 		handler.timeouts = append(handler.timeouts, timeout)
 	}
+	// TraceId 在响应等待之前确定，超时、停机拒绝及正常业务均使用同一个请求标识。
+	handler.entryHandler = middleware.TraceID(http.HandlerFunc(handler.serveHTTP))
 	return handler, nil
 }
 
-// ServeHTTP 按方法和路径选择唯一的超时 Handler，查询参数不参与匹配。
-// 未配置的路径统一采用默认等待时间，包括由 Gin 返回 404 的请求。
-// cmd/web 将本对象设置为 http.Server.Handler，因此请求先经过这里，再进入选定的中间件和 Gin。
+// ServeHTTP 先建立 TraceId 上下文，再按方法和路径选择响应等待入口并进入 Gin。
+// cmd/web 将本对象设置为 http.Server.Handler，Shutdown 继续管理同一对象的内部工作。
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.entryHandler.ServeHTTP(w, r)
+}
+
+// serveHTTP 只负责路由分发，查询参数不参与匹配；未配置的路径使用默认等待时间。
+func (h *HTTPHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// 例如 GET .../queryUserProfilePage?page_number=2 的键不包含 ? 后面的内容，命中 5 秒入口；
 	// POST .../createUser 命中 10 秒入口；GET .../queryUserProfileByUserId 未命中，采用默认 3 秒。
 	// 方法也是匹配条件：GET .../createUser 不会使用 POST 的覆盖项，最终由 Gin 判断路由。

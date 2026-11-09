@@ -2,7 +2,7 @@
 
 本文面向第一次阅读本项目的开发者，说明一个 HTTP 请求如何进入系统、经过各层处理、访问数据库，再转换成最终响应。以 `createUser` 为主线，最后补充查询、分页、批量和更新接口的差异。
 
-本文描述各层的调用关系，以及 HTTP 入口统一启用响应等待超时后的处理约定。所有接口默认等待 3 秒，分页查询和创建用户分别覆盖为 5 秒、10 秒；超时只结束响应等待，不取消内部业务。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
+本文描述各层的调用关系，以及 HTTP 入口统一启用 TraceId 和响应等待超时后的处理约定。所有接口默认等待 3 秒，分页查询、创建用户和头像生成分别覆盖为 5 秒、10 秒、65 秒；超时只结束响应等待，不取消内部业务。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
 
 ## 1. 先看整体链路
 
@@ -11,6 +11,7 @@
 ```text
 客户端
   → net/http.Server 接收请求
+  → TraceId 中间件：沿用或生成标识，保存到 Request.Context，并设置响应头
   → HTTPHandler 按方法和路径选择响应等待配置
   → 响应等待超时中间件：控制客户端等待，不取消内部业务
   → Gin 匹配路由，执行公共中间件
@@ -61,13 +62,14 @@ main → run
           → /api 分组挂载一次 AuthenticateIfPresent
           → 创建 Controller、Validator 并注册各版本的领域路由
       → 为同一个 Gin Engine 装配默认及接口覆盖的响应等待包装器
+      → 在请求分发外层装配一次 TraceId 中间件
   → net.Listen
   → http.Server.Serve：开始接收 HTTP 请求
 ```
 
 环境、配置和数据库连接初始化成功后，程序才开始监听端口。默认地址为 `:8080`；启动方式和配置准备见 [README](../../README.md)。数据库及表结构需要提前准备，启动流程不自动建表，也不创建示例用户。
 
-`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine 和各个等待包装器，请求到来时只选择一个包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层响应等待控制。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
+`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器及请求分发外层的 TraceId 中间件；每次请求先确定 TraceId，再选择一个等待包装器执行，不重新创建路由或中间件。`routers.New(authenticator)` 接收已装配的 `authn.Authenticator`，只返回 Gin Engine；直接使用它会包含可选认证，但不会启用外层 TraceId 和响应等待控制，需要 TraceId 时由调用方用 `middleware.TraceID(engine)` 包装。生产入口由 `NewHTTPHandler` 传入共享 JWT 组件，独立构造 Router 时由调用方显式提供认证器。因此，监听和 HTTP 协议处理由 `net/http` 承担，请求经过 TraceId 和等待包装器后进入 Gin 的 `ServeHTTP`。配置和执行边界见第 5.4 节。
 
 ### 2.2 共享对象分别由谁持有
 
@@ -75,6 +77,7 @@ main → run
 | --- | --- | --- |
 | [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 作为 `authn.Authenticator` 传给 Router 的全局可选认证中间件；创建成功后 Controller 取得组件签发凭证 |
 | [HTTP 认证中间件](../../app/http/middleware/authentication.go) | 捕获已装配认证器的 Gin Handler | 认证已提供的凭证并保存 Principal；Controller 调用 authz，共用方法通过 `PrincipalFromContext` 读取 |
+| [TraceId 中间件](../../app/http/middleware/trace_id.go)、[公共读写方法](../../internal/traceid/trace_id.go) | 包装请求分发的 `net/http` Handler；公共方法不保存全局请求状态 | 入站确定 TraceId，保存到标准 Request Context，并通过响应头和 company 请求头传递 |
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
@@ -109,6 +112,16 @@ app/domains/user/
 目前这些 DTO 只在用户资料 Controller 内复用，因此不建立 `dto/v1/shared` 包。将来真正存在跨 Controller 且语义一致的 DTO 时，再按需建立版本内的共享包；具体约定见[接口路由与命名规范](api-routing.md)。
 
 Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../../app/http/authz/)：`principal.go` 检查是否已有指定身份，`member.go` 按项目成员约定转换用户 ID。这些是读取请求身份的普通函数，不在启动时创建新对象，也不作为额外中间件挂载；各接口的目标访问规则仍留在 Controller。
+
+### 2.4 TraceId 的生成、保存与透传
+
+1. **入站统一使用 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行。头不存在或值为空时，通过 `traceid.New()` 生成 16 字节随机数并编码为 32 位小写十六进制字符串；非空时原样沿用，不要求上游值也符合本服务的生成格式。生成失败返回统一 HTTP 500，不继续业务处理。
+2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
+3. **成功确定 TraceId 后，通过同名响应头返回。** 该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
+4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 已按这条链路传递，无须为本次机制批量改造未调用外部服务的方法或 Repository。
+5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
+
+现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。当前机制完成标识生成和传递，尚未自动为日志注入 TraceId，也未创建或导出 Span；后续规划见[日志与可观测性体系设计](application-log.md#4-统一标识与链路上下文)。
 
 ## 3. 跟随一次 createUser 请求
 
