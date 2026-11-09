@@ -166,7 +166,7 @@ Controller 的输入映射遵守以下约定：
 
 1. **Controller 的业务入参只使用对应用例的 Request DTO。** HTTP 上下文可以作为独立参数传入；Validator 完成绑定和校验后传入 DTO，不提前构造 Service Params，也不把业务字段拆成多个参数。
 
-2. **Service Params 由 Controller 在方法内部构造，发起方标识来自可信身份。** Controller 根据 Service 的输入类型完成字段赋值和必要的类型转换；需要身份的接口复用 `app/http/authz` 的身份要求与项目标识转换方法，再执行本接口的目标访问检查，将可信发起方标识填入 Params。共用方法只返回值或错误，Controller 仍负责错误响应和立即返回，不能从请求自报字段取得身份。Service 接收自己的 Params，不接收 Request DTO、Gin Context、Token 或 HTTP 层保存的认证对象。
+2. **Service Params 由 Controller 在方法内部构造，发起方标识来自可信身份。** Controller 根据 Service 的输入类型完成字段赋值和必要的类型转换；需要身份的接口复用 `app/http/authz` 的身份要求与项目标识转换方法，再执行本接口的目标访问检查，将可信发起方标识填入 Params。共用方法只返回值或错误，Controller 仍负责错误响应和立即返回，不能从请求自报字段取得身份。Service 公开业务方法统一以标准 `ctx context.Context` 为首参，Controller 传入当前 `ctx.Request.Context()`，业务输入仍使用显式 Params；不接收 Request DTO、Gin Context、Token 或 HTTP 层保存的认证对象。
 
 3. **已经由 Validator 保证成功的纯类型转换，Controller 可以忽略其错误返回值。** 例如，Validator 已确认某个未修改的 ID 文本能够按十进制解析为正 int64，Controller 构造 Params 时可以再次按相同语义解析并使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。该约定只覆盖已被前置校验保证成功的转换，不适用于未经校验的转换、不同解析规则或数据库等执行操作。
 
@@ -451,7 +451,7 @@ func RuneCountAtMost(value string, maximum int) error
 
 **Service 根据自己的业务输入契约检查参数，不依赖调用方已经完成 HTTP 校验。** 输入保障复用公共和领域规则，HTTP 文本的解析工作留在对应适配层。
 
-1. **Service 接收业务 Params，不接收 HTTP 对象或响应等待状态。** Controller 将 Request DTO 映射为 Params，其他入口也按同一契约构造输入。在 Service 文件中，每个用例依次组织 Params、需要时紧接声明的 Result、输入常量、`validate<UseCase>Params` 和用例处理方法；本 Service 的错误声明放在文件顶部，多用例共用的私有逻辑放在文件尾部 `shared` 区域。不将 Gin Context、HTTP 请求体、Request DTO 或“是否已返回超时响应”传入业务逻辑；HTTP 等待期限也不作为 Service、Repository 的取消信号。独立业务执行控制的边界见第 7.5 节。
+1. **Service 公开业务方法统一接收标准 Context 和业务 Params，不接收 HTTP 对象或响应等待状态。** 首个参数固定为 `ctx context.Context`，查询、创建、修改和批量等用例均遵守，不以是否调用外部依赖为条件。Controller 将 Request DTO 映射为 Params，并传入内部 `ctx.Request.Context()`；其他入口也按同一契约构造输入。在 Service 文件中，每个用例依次组织 Params、需要时紧接声明的 Result、输入常量、`validate<UseCase>Params` 和用例处理方法；本 Service 的错误声明放在文件顶部，多用例共用的私有逻辑放在文件尾部 `shared` 区域。不将 Gin Context、HTTP 请求体、Request DTO 或“是否已返回超时响应”传入业务逻辑；HTTP 等待期限也不作为 Service、Repository 的取消信号。独立业务执行控制的边界见第 7.5 节。
 
 2. **业务入口继续保证参数取值满足用例约束。** 例如，已经是整数的内部标识仍需符合正数要求，批量数量和版本值仍需位于允许范围。布尔文本已经映射为 `bool` 时，不重新判断原文本是否为 `true`；整数也不转回字符串再检查格式。
 
@@ -460,6 +460,16 @@ func RuneCountAtMost(value string, maximum int) error
 4. **Service 明确自己的可空与默认值语义。** 某个 HTTP 接口不传 `nil`，不代表其他入口也不会传；Service 仍按用例契约处理缺失和可空值。默认值由入口准备 Params 时显式采用，不把非法的零值或空值无条件替换成默认值，具体约定见第 2.5、8 节。
 
 5. **纯输入检查失败时尽早原样返回错误。** 调用公共检查或 models 得到非 `nil` 错误后，Service 直接返回该错误，不继续执行依赖这些值的查询或写入，也不使用本层错误替换它。Service 自身独立判断出的输入条件失败，才可以返回本层通过 `errors.New` 预先声明的错误值。Service 不声明新的 error 类型；最终对外映射遵守第 9 节，不能因为错误来自 Service 就一律归为 HTTP 500。
+
+#### Service Context 约定
+
+所有 Service 公开业务方法的签名采用 `Method(ctx context.Context, params XxxParams)`。Context 承载本次执行的 TraceId、操作作用域及适用的执行控制，Params 继续显式承载业务输入；不将 Params、DTO 或业务必填字段藏入 Context，也不把请求 Context 存入共享 Service、Client 或 Repository。
+
+1. **调用入口负责提供非 nil Context。** HTTP Controller 使用响应等待层已经隔离取消后的 `ctx.Request.Context()`；后台任务、脚本和其他入口使用本次执行的生命周期 Context，独立执行确实没有上层上下文时才由入口创建根 Context。Service 不用 `context.Background()` 替换已传入的上下文，也不在内部补造 TraceId。
+2. **每个 Service 公开业务方法建立自己的操作作用域。** 方法入口对非 nil Context 调用 `ctx = logger.WithCurrentOperation(ctx)`，自动生成 `component=service` 和对应方法的 `operation`，保留 TraceId、截止时间及取消语义。进入另一个 Service 或 Client 时继续传入该派生 Context，由新的操作入口建立其作用域；返回后上层 Context 不变。
+3. **需要关联本次执行的私有流程辅助函数继续显式接收 Context。** 此类函数沿用所属业务操作，不重新识别辅助函数名；纯参数校验、数据转换及对象构造无需为统一签名机械添加 Context。
+4. **Context 不是打印日志的前提，而是请求关联的载体。** 没有它仍可输出进程日志，但无法自动取得当前请求的 TraceId；业务流程日志通过共享 Logger 接收当前 Context 后才能关联到请求及 Service 操作。仅增加参数与作用域不自动输出日志，现有 `log.Printf` 仍需按后续日志接入范围迁移。
+5. **接收 Context 不自动改变数据库和事务行为。** 当前 Repository 签名保持不接收 Context；本次统一 Service 入参不隐式调用 GORM `WithContext`、增加执行期限或改变 SQL 取消。HTTP 等待隔离及独立业务执行控制继续遵守第 7.5 节。
 
 ### 7.2 实际业务状态与操作权限
 
@@ -546,9 +556,9 @@ func RuneCountAtMost(value string, maximum int) error
 
 2. **返回结果按业务事实组织，不根据 HTTP 等待状态改写。** 事务提交成功后仍返回成功结果，业务失败仍返回原有错误。Controller 保持正常的 DTO 转换、错误映射和 `response.Success`、`response.Fail` 调用；HTTP 外层复用 `http.TimeoutHandler` 选择响应，适配层处理晚到写入的丢弃。Service 不返回 HTTP 超时业务码，不将成功结果替换为等待超时错误，也不自行实现计时或响应缓冲。
 
-3. **标准 Context 如用于业务执行，必须表达独立的执行契约。** Service 可以为后台任务停止、业务执行预算等明确需求接收标准 `context.Context`，但不能直接继承 HTTP 响应等待期限或客户端断开的取消。需要数据库感知此类独立控制时，在本次调用的局部会话上传入；不能把某次执行的 Context 或会话写回共享 Repository、共享 Service 或全局数据库入口。
+3. **Service 统一接收标准 Context，业务取消仍须表达独立的执行契约。** Context 首参按第 7.1 节贯穿业务调用；不能因补齐参数就直接继承 HTTP 响应等待期限或客户端断开的取消。HTTP Controller 继续传入等待层隔离后的内部 Request Context；后台任务停止、业务执行预算等独立需求由各入口明确控制。需要数据库感知此类独立控制时，在本次调用的局部会话上传入；不能把某次执行的 Context 或会话写回共享 Repository、共享 Service 或全局数据库入口。
 
-   外部依赖调用同样使用内部执行 Context，由 Client 设置自己的有限操作预算。公司服务 HTTP 和第三方 HTTP/SDK 均通过独立 Client 使用，Service 不直接组装请求或导入供应商 SDK；具体边界见[外部接口与第三方依赖调用规范](api-outbound.md)。首次接入时同步补齐相关 Service 的标准 Context 参数。
+   外部依赖调用同样使用内部执行 Context，由 Client 设置自己的有限操作预算。公司服务 HTTP 和第三方 HTTP/SDK 均通过独立 Client 使用，Service 不直接组装请求或导入供应商 SDK；具体边界见[外部接口与第三方依赖调用规范](api-outbound.md)。Context 是全部公开业务方法的统一契约，不等到首次接入外部依赖时才补充。
 
 4. **写操作按结果未知的情况设计重试与确认方式。** 客户端等待超时可能发生在提交之前，也可能发生在提交之后，不能当作业务失败或回滚证明。接口按用例提供幂等、唯一约束或结果查询等适用机制，避免盲目重试产生重复效果；Service 不因为客户端可能重试就绕过事务或原有业务约束。
 

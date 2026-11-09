@@ -137,7 +137,7 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 1. **入站统一使用 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行。头不存在或值为空时，通过 `traceid.New()` 生成 16 字节随机数并编码为 32 位小写十六进制字符串；非空时原样沿用，不要求上游值也符合本服务的生成格式。生成失败返回统一 HTTP 500，不继续业务处理。
 2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
 3. **成功确定 TraceId 后，通过同名响应头返回。** 该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
-4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
+4. **Controller、Service 和 Client 显式传递执行 Context。** 所有 Service 公开业务方法统一以 `ctx context.Context` 为首参，Controller 使用内部 `ctx.Request.Context()`，Service 入口建立自己的日志操作作用域，再将派生 Context 继续传给其他 Service、具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个执行 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
 现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。HTTP 模板绑定以 Gin 当前的 Request Context 建立操作作用域，保留这层取消隔离；不能拿外层可取消 Context 替换内部 Context。公共 Logger 已完成启动初始化，HTTP 请求与响应日志自动读取 TraceId；其他业务日志尚未统一迁移，也未创建或导出 Span。日志字段及操作作用域见[请求日志规范](application-log.md)。
@@ -265,7 +265,7 @@ v.controller.CreateUser(ctx, &request)
 
 ```go
 ctx.Header("Cache-Control", "no-store")
-profile, err := composition.Current().UserProfile.CreateUser(userservice.CreateUserParams{
+profile, err := composition.Current().UserProfile.CreateUser(ctx.Request.Context(), userservice.CreateUserParams{
     AccountSource:     request.AccountSource,
     ExternalAccountID: request.ExternalAccountID,
     UserName:          request.UserName,
@@ -279,13 +279,15 @@ if err != nil {
 
 Controller 先设置 `Cache-Control: no-store`，避免后续含令牌的响应被缓存；设置 Header 本身还没有写出正文。随后将请求字段组织为 [CreateUserParams](../../app/domains/user/service/user_profile_service.go)，调用启动时已经创建的 Service。创建失败时，通过本文件的 `mapUserProfileErrorCodes` 选择通用码和业务码，由 `failUserProfileOperation` 使用错误的 `Error()` 输出响应，立即返回，不签发凭证。创建成功后的签发及输出继续见第 3.8 节。
 
-这一步把 HTTP 契约与业务调用分开。Service 接收自己的参数类型，不接收 Gin Context 或 Request DTO；Controller 负责接口访问检查、输入映射和后续响应转换。创建接口允许匿名，因此可以直接构造创建 Params；要求身份的其他入口调用 `authz.RequirePrincipal` 或 `authz.RequireMemberUserID`，处理其返回错误，再执行接口自己的目标访问检查并构造业务 Params，具体见第 6 节。
+这一步把 HTTP 契约与业务调用分开。Service 统一接收标准 `context.Context` 首参和自己的 Params，不接收 Gin Context 或 Request DTO；Controller 负责接口访问检查、输入映射和后续响应转换，并始终传入当前内部 Request Context。创建接口允许匿名，因此可以直接构造创建 Params；要求身份的其他入口调用 `authz.RequirePrincipal` 或 `authz.RequireMemberUserID`，处理其返回错误，再执行接口自己的目标访问检查并构造业务 Params，具体见第 6 节。
 
 Controller 的业务入参只有 Request DTO，`ctx` 是独立的 HTTP 上下文。Validator 不构造 Service Params；需要将 ID 文本转换为整数等操作时，由 Controller 在构造 Params 时完成。Validator 已按相同解析语义验证成功、且 DTO 值未被修改的纯类型转换，允许忽略错误返回值。例如，按 ID 查询接口在 Controller 中使用 `userID, _ := strconv.ParseInt(request.UserID, 10, 64)`。
 
 ### 3.6 Service 决定如何创建用户
 
-[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 首先调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、可选 Result、输入常量、参数校验和处理方法；Result 紧接 Params，跨用例复用的实现放在文件尾部的 `shared` 区域。创建结果就是 `models.UserProfile`，因此这个用例直接返回模型，不声明 `CreateUserResult`。
+[UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 在入口对非 nil Context 调用 `logger.WithCurrentOperation` 建立 Service 操作作用域，再调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、可选 Result、输入常量、参数校验和处理方法；Result 紧接 Params，跨用例复用的实现放在文件尾部的 `shared` 区域。创建结果就是 `models.UserProfile`，因此这个用例直接返回模型，不声明 `CreateUserResult`。
+
+当前六个用户资料 Service 公开业务方法均已统一标准 Context 首参，Controller 调用同步传递内部 `ctx.Request.Context()`；查询和写入也遵守这一约定。非 HTTP 入口负责提供本次执行的非 nil Context，纯参数校验、映射和构造函数无需机械添加。接收 Context 与建立作用域并不自动输出流程日志，现有标准库业务日志仍待迁移；也不自动将 Context 绑定到 Repository 或 GORM，既有 SQL 和事务执行方式保持不变。完整约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
 Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值声明在 [Service 文件](../../app/domains/user/service/user_profile_service.go) 各用例的 Params 旁，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
 

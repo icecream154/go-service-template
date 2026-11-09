@@ -119,13 +119,13 @@ python-service-template:
 
 ### TraceId 透传
 
-公司内部 HTTP 请求统一使用 `TraceId` 请求头。入站中间件确定本次请求的 TraceId 并保存到标准 `context.Context` 后，Controller 通过 `ctx.Request.Context()` 传给 Service，Service 再将同一 Context 传给具体 Client。已有头像生成用例沿用这条传递链；不向 DTO、Params 或共享 Client 字段增加请求级 TraceId。
+公司内部 HTTP 请求统一使用 `TraceId` 请求头。入站中间件确定本次请求的 TraceId 并保存到标准 `context.Context` 后，Controller 通过 `ctx.Request.Context()` 传给 Service；所有 Service 公开业务方法均以标准 Context 为首参，入口建立 Service 操作作用域后，将派生 Context 继续传给具体 Client，不在内部用 `context.Background()` 替换。已有头像生成用例沿用这条传递链；不向 DTO、Params 或共享 Client 字段增加请求级 TraceId。该签名约定同样适用于暂未调用外部依赖的查询及写入用例，详见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
 `base.Client.requestJSON` 从传入的 Context 调用 `traceid.FromContext(ctx)` 读取值，非空时设置出站 `TraceId` 请求头。`GetJSON`、`PostJSON` 及复用这两个方法的所有 company Client 统一生效，具体业务 Client 无须重复设置请求头。
 
 Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后台任务需要链路关联时，由任务入口通过 `traceid.New()` 生成一次，再用 `traceid.WithContext(ctx, id)` 保存并贯穿一次任务的所有调用。不得在调用过程中用 `context.Background()` 替换已有的执行 Context。
 
-公共方法位于 [internal/traceid/trace_id.go](../../internal/traceid/trace_id.go)，入站与响应头规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。当前阶段只透传自定义 `TraceId`，完整 Span、日志关联和标准链路上下文的后续规划见[日志与可观测性设计](application-log.md#4-统一标识与链路上下文)。
+公共方法位于 [internal/traceid/trace_id.go](../../internal/traceid/trace_id.go)，入站与响应头规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。当前阶段只透传自定义 `TraceId`，HTTP 及公司 Client 日志已使用共享 Logger；操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)，尚未创建或导出 Span。
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 

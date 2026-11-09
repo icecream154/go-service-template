@@ -37,8 +37,11 @@
 
 ```go
 func (s *ResourceService) QueryResource(ctx context.Context) {
-    ctx = logger.WithCurrentOperation(ctx)
-    // 后续日志及下游调用使用这个 ctx。
+    // 1. 调用入口负责提供非 nil Context；公共封装不用于补造业务执行上下文。
+    if ctx != nil {
+        // 1.1. 建立当前 Service 方法作用域，后续日志及下游调用沿用派生 Context。
+        ctx = logger.WithCurrentOperation(ctx)
+    }
 }
 ```
 
@@ -50,11 +53,21 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 入口识别结果按函数符号缓存，缓存仅保存组件和操作标识，不保存 Context、实参或请求数据。识别失败时建立空操作作用域，遮蔽父 Context 中的操作身份，避免把上层操作误认为新操作；日志省略 `component`、`operation`，原有 TraceId 继续保留。
 
-辅助函数不重复调用入口封装，沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId、取消和截止时间。下游方法返回后，上层 Context 的操作信息保持原值。传入 nil Context 时以 `context.Background()` 为基础，不生成 TraceId。请求级 Context 不存入共享实例字段。
+辅助函数不重复调用入口封装，沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId、取消和截止时间。下游方法返回后，上层 Context 的操作信息保持原值。`WithCurrentOperation` 本身对 nil 使用 `context.Background()` 的兼容处理不代表业务方法可以补造执行上下文；Service 调用入口负责提供非 nil Context，当前 Service 方法仅对非 nil 参数建立作用域。请求级 Context 不存入共享实例字段。
 
 方法入口封装只识别并携带操作信息，不自动记录 `started`、`finished` 或计算耗时；需要生命周期日志时由操作边界调用日志方法。HTTP 的请求与响应边界由下文的中间件统一记录。
 
 如需连入口封装调用也自动生成，后续须通过调用代理或生成包装代码，并将实际调用接入包装；只生成元数据不会拦截现有的直接方法调用。本阶段先采用入口公共封装的预期。
+
+## Service 上下文与业务流程日志
+
+所有 Service 公开业务方法统一使用 `ctx context.Context` 首参，业务输入通过显式 Params 传入。Context 不决定能否打印日志：没有请求上下文仍可记录进程日志，但无法自动携带本次请求的 TraceId；请求相关的业务流程日志必须使用从调用入口传下来的 Context。
+
+HTTP Controller 将响应等待层隔离取消后的 `ctx.Request.Context()` 传给 Service；后台任务或其他入口提供本次执行的非 nil 生命周期 Context，独立执行的根 Context 由入口创建。Service 不用 `context.Background()` 替换已有上下文、不自行生成 TraceId，也不将 DTO、Params 或请求 Context 放进共享实例字段。
+
+Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用域，后续共享 Logger 从中自动取得 `component=service` 和 `{领域名}.{Service 类型名}.{方法名}`。同一方法内部的流程日志保持同一 operation，使用 message 说明具体步骤，普通步骤可省略 event；方法生命周期才使用 started、finished。调用其他 Service 或 Client 时继续传入当前 Context，由新入口建立自己的作用域，上层 Context 不变。需要流程日志的私有辅助函数显式接收并沿用该 Context，纯校验、转换和构造函数无需机械添加参数。
+
+当前用户资料 Service 的六个公开业务方法及 Controller 调用方已统一 Context 首参，Service 方法入口已建立作用域。本次没有自动增加 Controller 或 Service 生命周期日志，也没有将现有 `log.Printf` 统一改为共享 Logger；只有传入该 Context 的共享 Logger 日志才会带上对应请求和操作信息。Repository 签名、SQL 取消及事务行为保持不变。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
 ## 当前数据结构与基础写入范围
 
