@@ -2,7 +2,7 @@
 
 提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。已实现 TraceId 的入站生成、Context 保存、响应头回传和 company 请求透传；完整日志、指标、Span 和性能诊断仍处于设计阶段，见[日志与可观测性体系设计](specifications/application/application-log.md)。
 
-公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[公司内部 HTTP Client 规范](specifications/application/api-outbound.md)。两个 Image Client 已提供图片生成和图片编辑任务查询的 HTTP 调用示例，真实服务契约仍待确认。
+公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[外部接口调用与 Client 规范](specifications/application/api-outbound.md)。两个 Image Client 已提供图片生成和图片编辑任务查询的 HTTP 调用示例，真实服务契约仍待确认。
 
 生产 HTTP 入口在响应等待中间件之前处理 `TraceId`：请求头不存在或为空时生成 16 字节随机数编码的 32 位十六进制值；已有非空值时原样沿用。该值保存到 `Request.Context()` 并通过同名响应头返回。Controller、Service 和 company Client 传递标准 Context，公共 `GetJSON`、`PostJSON` 自动设置出站 `TraceId`；无值的独立调用不由 Client 补生成。直接使用 `routers.New(authenticator)` 时，需自行用 `middleware.TraceID(engine)` 包装 Gin 入口。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)。
 
