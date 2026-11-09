@@ -1,5 +1,5 @@
-// Package logger 定义统一日志的数据结构。
-// 当前仅声明字段和枚举，日志输出、字段填充及操作上下文识别尚未实现。
+// Package logger 提供统一日志结构和同步 JSON 写入能力。
+// Logger 通过参数构造，不维护全局实例；操作上下文识别和启动接入尚未实现。
 package logger
 
 import "time"
@@ -44,10 +44,19 @@ const (
 	EventFinished Event = "finished"
 )
 
+// Fields 表示调用方可选提供的单条日志信息，不允许覆盖公共自动字段。
+// 错误文本由调用方预先受控处理；调用期间保持只读，Logger 不保存本结构或其中的指针。
+type Fields struct {
+	Event      Event
+	DurationMS *float64
+	StatusCode *int
+	Error      string
+}
+
 // Record 表示一条单行 JSON 日志的字段结构，不保存 Context、DTO 或原始错误对象。
 // 本结构声明本身不生成字段、不识别操作、不脱敏或输出日志，也不自动校验枚举值。
 type Record struct {
-	// Timestamp 是日志发生时间，由后续公共 Logger 填充。
+	// Timestamp 是日志发生时间，由公共 Logger 以 UTC 填充。
 	Timestamp time.Time `json:"timestamp"`
 	// Level 是调用方选择的日志级别。
 	Level Level `json:"level"`
@@ -59,11 +68,11 @@ type Record struct {
 	Event Event `json:"event,omitempty"`
 	// TraceID 来自当前 Context；无请求链路标识的进程日志省略。
 	TraceID string `json:"trace_id,omitempty"`
-	// ServiceName 来自应用配置，由后续 Logger 初始化流程注入。
+	// ServiceName 来自应用配置，通过 Logger 构造参数注入。
 	ServiceName string `json:"service_name"`
-	// Environment 来自进程的部署环境，由后续 Logger 初始化流程注入。
+	// Environment 复用构造时传入的 env.Config.Environment，日志配置不重复声明。
 	Environment string `json:"environment"`
-	// InstanceID 在进程启动时生成一次，由后续 Logger 初始化流程注入。
+	// InstanceID 由调用方在进程启动时生成一次，通过 Logger 构造参数注入。
 	InstanceID string `json:"instance_id"`
 	// Caller 是实际打印日志的代码位置；无法取得时省略。
 	Caller string `json:"caller,omitempty"`

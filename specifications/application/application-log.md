@@ -1,13 +1,13 @@
 | 字段 | 含义 | 定义方 | 示例 |
 | --- | --- | --- | --- |
-| `timestamp` | 本条日志发生的时间，包含时区和毫秒等精度 | 公共 Logger 在写日志时自动生成 | `2026-11-09T06:05:06.123Z` |
+| `timestamp` | 本条日志发生的时间，使用 UTC，保留高精度时间信息 | 公共 Logger 在写日志时自动生成 | `2026-11-09T06:05:06.123Z` |
 | `level` | 日志级别，取值为 `DEBUG`、`INFO`、`WARN`、`ERROR` | 调用方选择对应级别的日志方法，公共 Logger 写入 | `INFO` |
 | `message` | 本条日志的英文说明，便于阅读具体发生了什么 | 写日志的组件或业务代码指定 | `Avatar prompt optimized` |
 | `component` | 日志来源的代码职责类别，统一取值为 `http_entry`、`controller`、`service`、`client`、`repository`；外部依赖调用组件统一归为 `client`；不适用或无法识别时省略 | 公共日志规范统一约定分类，框架在操作入口识别并写入派生 Context，Logger 自动读取 | `client` |
 | `event` | 操作的生命周期节点，首期统一为 `started`、`finished`；`finished` 只表示操作结束，结果通过 `error`、`status_code` 等字段表达；普通说明性日志可省略 | 公共日志规范统一定义，各组件和业务代码复用相同取值 | `finished` |
 | `trace_id` | 当前请求所属链路的标识；没有请求上下文的进程日志省略 | HTTP 中间件沿用请求头或生成并存入 Context，公共 Logger 自动读取；后台任务由任务入口提供 | `4bf92f3577b34da6a3ce929d0e0e4736` |
 | `service_name` | 产生日志的服务名称 | 应用配置显式提供，初始化 Logger 时统一注入 | `go-service-template` |
-| `environment` | 当前进程所在的部署环境 | 启动流程读取部署环境，初始化 Logger 时统一注入 | `dev` |
+| `environment` | 当前进程所在的部署环境 | 复用已有 `env.Config.Environment`，由装配方传入 Logger；日志 Config 不单独声明 | `dev` |
 | `instance_id` | 当前服务进程的标识，用于区分副本和重启；同一进程内保持一致 | 启动流程生成一次随机标识，初始化 Logger 时统一注入 | `2f7b6d598dbd4d61a4d4ab8652e22d74` |
 | `caller` | 实际调用日志方法的代码位置；无法取得时省略 | 公共 Logger 自动提取，并处理日志封装带来的调用层级 | `service/user_profile_service.go:324` |
 | `operation` | 本条日志对应的稳定操作标识，格式按下表随 `component` 确定；同一操作的 `started`、`finished` 及正常、错误路径使用相同值；不含实参、资源 ID、结果或生命周期后缀，不适用或无法识别时省略 | 框架在操作入口根据路由或方法信息生成并写入派生 Context，Logger 自动读取；命名空间沿用项目声明的领域或目录名称，层级统一以 `.` 分隔 | `example.ResourceService.QueryResource` |
@@ -41,10 +41,48 @@
 
 如需连入口封装调用也自动生成，后续须通过调用代理或生成包装代码，并将实际调用接入包装；只生成元数据不会拦截现有的直接方法调用。本阶段先采用入口公共封装的预期。
 
-## 当前数据结构范围
+## 当前数据结构与基础写入范围
 
-日志数据结构统一放在 `internal/logger/types.go`：`Level` 声明四种日志级别，`Component` 声明五种职责类别，`Event` 声明 `started`、`finished`，`Record` 对应字段表中的 14 个字段及 JSON 名称。
+日志数据结构统一放在 `internal/logger/types.go`：`Level` 声明四种日志级别，`Component` 声明五种职责类别，`Event` 声明 `started`、`finished`，`Record` 对应字段表中的 14 个字段及 JSON 名称。`Fields` 只包含调用方可按需补充的 `Event`、`DurationMS`、`StatusCode`、`Error`，自动字段由 Logger 维护。
 
 `Timestamp` 使用 `time.Time`。`DurationMS` 使用 `*float64`，`StatusCode` 使用 `*int`：`nil` 表示未记录，非 nil 的零值仍保留，避免将零耗时与未采集混淆。`Error` 保存已处理的错误文本，不直接序列化 Go `error` 对象。`Component`、`Event`、`TraceID`、`Caller`、`Operation`、`Error` 无值时省略；服务名称、部署环境、进程标识作为公共元信息保留。
 
-当前仅声明类型、枚举和 JSON 标签，尚未实现 Logger 输出、字段自动填充、方法入口识别、配置加载或启动接入，也未新增测试用例。
+基础 Logger 通过 `New(config Config, deployment env.Config, output io.Writer)` 构造。日志专属 `Config` 仅声明 `ServiceName`、`InstanceID` 和 `MinLevel`；部署环境复用现有 `env.Config`，装配方可在 `env.Init()` 成功后传入 `env.Current()`。Logger 按值保存部署配置，不重复读取环境变量或依赖全局初始化调用。服务名称、实例标识及传入的环境名称必须非空白，最低级别必须使用已声明的合法值；部署环境的允许值仍由 `env` 包管理。构造过程不读取配置文件、不推断服务名称，也不生成实例标识。
+
+`Debug`、`Info`、`Warn`、`Error` 接收标准 Context、消息及可选的一个 `Fields`，返回 `error`；不需要额外字段时直接省略 `Fields`。每条日志自动补充 UTC 时间、对应级别、Context 中的 TraceId、实际调用位置和三项公共元信息。Context 为 nil 或未保存 TraceId 时省略 `trace_id`，Logger 不补生成标识。
+
+最低级别以下的日志被过滤；其余日志同步输出为单行 JSON，不抽样、不建立异步队列。编码、写入及短写故障通过返回值交给调用方处理。`Fields` 不接受原始 Go `error` 或 SDK 对象，错误文本须由调用方先做受控处理；耗时必须为有限的非负数，HTTP 状态码来自实际交互。
+
+输出 Writer 由调用方提供并管理。`Sync()` 在输出器支持 `Sync() error` 时转交同步，不关闭 Writer；普通 `io.Writer` 的文件、连接或额外缓冲生命周期仍由调用方管理。
+
+以下为基础用法，示例中的公共信息由应用装配方提供：
+
+```go
+log, err := logger.New(logger.Config{
+    ServiceName: "example-service",
+    InstanceID:  "example-instance",
+    MinLevel:    logger.LevelInfo,
+}, env.Current(), os.Stdout) // 调用方已完成 env.Init()。
+if err != nil {
+    return err
+}
+if err := log.Info(ctx, "Operation completed"); err != nil {
+    return err
+}
+```
+
+需要补充事件、耗时或状态时，传入一份 `Fields`；以下数值用于说明字段形式，实际调用应使用采集结果：
+
+```go
+durationMS := 123.45
+statusCode := 200
+if err := log.Info(ctx, "HTTP call completed", logger.Fields{
+    Event:      logger.EventFinished,
+    DurationMS: &durationMS,
+    StatusCode: &statusCode,
+}); err != nil {
+    return err
+}
+```
+
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入。`component`、`operation` 仍按上文预期等待入口作用域实现，当前输出中省略，不根据 `caller` 猜测。尚未创建全局 Logger、加载配置文件、接入启动流程或替换业务日志，也未新增测试用例。
