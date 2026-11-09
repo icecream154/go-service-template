@@ -1,6 +1,6 @@
 # Go 后端工程规范与框架示例
 
-提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。
+提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。接口、数据库及服务性能的日志、指标和链路追踪方案见[日志与可观测性体系设计](specifications/application/application-log.md)，当前处于设计阶段。
 
 ## 启动
 
