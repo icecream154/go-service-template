@@ -87,7 +87,7 @@ Trace 资源属性分别映射为 `service.name`、`service.version`、`service.
 1. 在响应等待包装器之前提取 `traceparent` 和 `tracestate`，并创建 HTTP SERVER Span。没有有效上下文时创建新 Trace，无效头不导致业务请求失败。
 2. 来自受信任网关和服务的有效上下文延续同一 Trace；公网边界由网关清理、校验并建立可信链路。服务直接暴露公网时，默认新建 Trace，合法外部上下文可作为 Span Link，不能仅凭自报头认定来源可信。
 3. 响应头统一返回 `X-Trace-Id` 和 `X-Request-Id`，包括校验失败、认证失败、404、超时及停机拒绝；浏览器需要读取时配置 CORS 暴露头。保持现有 JSON 响应结构。
-4. `X-Trace-Id` 仅供查询，不作为入站链路上下文来源。出站 HTTP 使用带观测能力的 Transport，在发起请求时注入标准 `traceparent/tracestate`，每次尝试创建 CLIENT Span。
+4. `X-Trace-Id` 仅供查询，不作为入站链路上下文来源。公司内出站 HTTP 使用带观测能力的 Transport，注入标准 `traceparent/tracestate` 并为可观测尝试创建 CLIENT Span；第三方调用默认仅保留本地 Span，对方明确支持且允许后才传播相关头。HTTP 与 SDK 的接入和观测边界见[外部接口调用规范](api-outbound.md#11-链路日志与统计)。
 5. 后续接入 gRPC 时使用对应拦截器；消息发送与消费在消息属性中传递标准上下文，重试、扇出和延迟任务按实际因果关系使用子 Span 或 Span Link。
 6. `baggage` 默认不透传；确需使用时仅接收白名单中的短小、非敏感字段。Trace 标识不承担认证或授权职责。
 

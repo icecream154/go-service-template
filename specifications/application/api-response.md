@@ -148,6 +148,8 @@ func (err FieldError) Error() string {
 
 Service 和 models 自己声明的错误在 `errors.New` 中确定文案。Service 可以将明确未命中等结果解释为对象不存在等业务错误；公共检查、models 已表达清楚的输入错误，以及数据库连接、SQL 执行、发号等技术故障均原样返回，不能为了响应文案进行包装、重建或替换。日志可以补充上下文。框架需要默认内部错误时使用 `InternalError()`，其消息为 `internal server error`。
 
+后续新增外部服务依赖时，HTTP/SDK 的协议错误先由项目 Client 转为其自身的 Go 错误契约；Service 仍原样返回收到的 Client 错误，Controller 仍直接使用其 `Error()`，不向响应追加远端正文或 SDK 对象。Client 边界文案及依赖故障映射见[外部接口调用规范](api-outbound.md#9-错误适配与业务解释)。
+
 ## 4. 内部错误与对外错误的职责
 
 Service 返回的 Go `error` 用于传递失败原因：本层独立判断的失败及明确的业务语义映射使用本层以 `errors.New` 声明的错误值，例如状态不允许操作、发号成功却得到非正 ID、结合当前查询解释出的对象不存在；已有输入错误、下层技术故障及无法确定含义的错误原样返回。models 只声明自身独立判断的领域错误，原样返回其调用的公共检查错误。Service 和 models 都不声明新的 error 类型。对外 `business_code` 是接口调用方依赖的稳定字符串，二者不要求一一对应：多个错误可以映射为同一个业务码；未预期的执行错误映射为 `INTERNAL_ERROR`，不附带业务码。

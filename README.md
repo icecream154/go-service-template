@@ -2,6 +2,8 @@
 
 提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。接口、数据库及服务性能的日志、指标和链路追踪方案见[日志与可观测性体系设计](specifications/application/application-log.md)，当前处于设计阶段。
 
+公司内部 HTTP 服务、第三方 Go SDK 和第三方 HTTP 接口统一通过项目自己的 Client 接入，调用边界、执行预算、重试、错误及观测要求见[外部接口与第三方依赖调用规范](specifications/application/api-outbound.md)。该规范为后续接入目标，统一客户端组件尚未实施。
+
 ## 启动
 
 使用 Go 1.25 或更高版本和 MySQL 8.4。启动前需要通过受控 SQL 创建业务库和表；程序不自动建库或迁移表结构。核对 `config/database/mysql/dev.yml` 的本地连接配置、`config/snowflake/dev.yml` 中为本进程分配的机器号，以及 `config/authn/jwt/dev.yml` 的 JWT 配置后，在项目根目录执行：
