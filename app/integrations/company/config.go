@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	"go-service-template/app/integrations/company/base"
 
@@ -19,17 +18,7 @@ import (
 )
 
 // configuration 按目标服务名读取配置，新增服务不需要修改 YAML 加载结构。
-type configuration map[string]serviceConfig
-
-type serviceConfig struct {
-	BaseURL        string                             `yaml:"base_url"`
-	ConnectTimeout time.Duration                      `yaml:"connect_timeout"`
-	Domains        map[string]map[string]clientConfig `yaml:",inline"`
-}
-
-type clientConfig struct {
-	RequestTimeout time.Duration `yaml:"request_timeout"`
-}
+type configuration map[string]base.ServiceConfig
 
 // loadConfig 接收直接包含 dev/test/prod.yml 的叶子目录，不回退其他环境文件。
 func loadConfig(configDir, environment string) (configuration, error) {

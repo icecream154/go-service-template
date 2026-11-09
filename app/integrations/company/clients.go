@@ -8,7 +8,11 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+
+	pythonservicetemplate "go-service-template/app/integrations/company/python-service-template"
 )
+
+const pythonServiceTemplateName = "python-service-template"
 
 var shared struct {
 	sync.RWMutex
@@ -17,7 +21,7 @@ var shared struct {
 
 // Clients 保存共享实例，调用方通过服务、domain、controller 层级获取具体 Client。
 type Clients struct {
-	PythonServiceTemplate PythonServiceTemplateClients
+	PythonServiceTemplate pythonservicetemplate.Clients
 	transports            []*http.Transport
 }
 
@@ -49,7 +53,7 @@ func newClients(config configuration) (*Clients, error) {
 	for _, serviceName := range slices.Sorted(maps.Keys(config)) {
 		switch serviceName {
 		case pythonServiceTemplateName:
-			python, transport, err := newPythonServiceTemplateClients(config[serviceName])
+			python, transport, err := pythonservicetemplate.New(config[serviceName])
 			if err != nil {
 				clients.CloseIdleConnections()
 				return nil, err

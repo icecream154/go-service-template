@@ -16,12 +16,13 @@
 app/integrations/company/
 ├── clients.go                    # 统一初始化、发布、获取及资源清理
 ├── config.go                     # 多环境配置读取与校验
-├── python_service_template.go    # python-service-template 的具体 Client 装配
 ├── base/
 │   ├── client.go                 # 公共 Client 结构及构造方法
+│   ├── config.go                 # 服务及 controller 的共享配置类型
 │   ├── request.go                # 公共 GET/POST JSON 请求及 TraceId 透传
 │   └── transport.go              # 服务共享 Transport 的构造方法
-└── python-service-template/       # 目标服务
+└── python-service-template/      # 目标服务包 pythonservicetemplate
+    ├── clients.go                # 本服务的分组、注册校验和 Client 装配
     └── image/                    # 目标服务中的 domain
         ├── image_edit_client.go  # 图片编辑 controller 对应的 Client
         └── image_gen_client.go   # 图片生成 controller 对应的 Client
@@ -48,7 +49,7 @@ func NewTransport(connectTimeout time.Duration) (*http.Transport, error)
 
 `connectTimeout` 对应服务级的 `connect_timeout`，必须大于零，限制 DNS 解析及 TCP 建立连接的时间。构造方法克隆 Go 默认 Transport，保留默认连接池、代理及 TLS 设置，并注入连接超时；构造过程不建立网络连接，不修改全局 `http.DefaultTransport`。
 
-该方法每次返回独立的 Transport，共享由 `company` 的初始化流程组织：每个目标服务调用一次，再把同一个返回值传入该服务所有 `base.New(config, transport)` 调用。各 `base.Client` 分别持有自己的 `http.Client`，按 Client 级 `request_timeout` 设置总请求超时。
+该方法每次返回独立的 Transport，共享由目标服务包的装配方法组织：每个目标服务调用一次，再把同一个返回值传入该服务所有 `base.New(config, transport)` 调用。各 `base.Client` 分别持有自己的 `http.Client`，按 Client 级 `request_timeout` 设置总请求超时。
 
 例如，`python-service-template` 的 `ImageEditClient` 和 `ImageGenClient` 共用一个连接超时为 3 秒的 Transport，各自的请求总超时分别为 30 秒、60 秒。Transport 的共享粒度是目标服务，Client 的组织粒度仍是服务、domain、controller。
 
@@ -58,7 +59,11 @@ Transport 由 `company.Clients` 持有，`base.Client` 构造时只使用传入�
 
 Client 在进程启动阶段统一、同步初始化。`bootstrap.Init` 在部署环境初始化后，仅调用 `company.Init(configDir, environment)`，传入 `integrations/company` 配置叶子目录和当前环境，并处理初始化错误。
 
-配置文件读取、地址占位符解析和参数校验放在 `company/config.go`；实例创建、一次性发布及获取放在 `company/clients.go`；具体目标服务的 Transport 与 Client 装配放在对应装配文件中。`bootstrap/init.go` 负责调用顺序和失败资源清理，保持这一入口不包含具体 Client 的构造逻辑。
+配置文件读取、地址占位符解析和基础参数校验放在 `company/config.go`；`company/clients.go` 按已注册服务分发装配，统一完成初始化、一次性发布、获取及 Transport 集合的最终清理。`bootstrap/init.go` 负责调用顺序和失败资源清理，保持这一入口不包含具体 Client 的构造逻辑。
+
+每个目标服务在自己的包内维护分组和装配入口。例如 `company/python-service-template/clients.go` 属于 `pythonservicetemplate` 包，定义 `Clients`、`ImageClients`，并提供 `New(config base.ServiceConfig) (Clients, *http.Transport, error)`。该方法严格校验本服务已注册的 domain、controller，创建共享 Transport 和具体 Image Client，构造失败时清理本次资源，成功后将实例及 Transport 交给 `company`。
+
+服务配置通过参数注入。共用的 `base.ServiceConfig`、`base.ControllerConfig` 定义在 `base/config.go`，保留配置字段的 YAML 映射；现有 `base.Config` 继续表示单个 Client 的构造配置。依赖方向保持 `company → 目标服务包 → 具体 Client`，目标服务包不反向导入 `company`；这只是调用装配分组，不增加业务 Service 层。
 
 初始化遵循以下约定：
 
@@ -84,7 +89,7 @@ genClient := company.Current().PythonServiceTemplate.Image.ImageGen
 
 测试和生产的 `base_url` 分别引用 `${TEST_PYTHON_SERVICE_TEMPLATE_BASE_URL}`、`${PROD_PYTHON_SERVICE_TEMPLATE_BASE_URL}`。启动前注入相应环境变量，或在配置中填写实际地址；变量引用必须占据整个字段，缺失或为空时停止启动。
 
-配置加载按服务名读取多个并列节点，具体 Client 按已注册服务装配。当前注册 `python-service-template` 的两个 Image Client；新增服务或 controller 时，同步增加构造和装配逻辑，未注册的配置明确报错。
+配置加载按服务名读取多个并列节点，由 `company` 将配置分发给已注册的目标服务包。当前 `pythonservicetemplate.New` 装配两个 Image Client；新增服务时在 `company` 注册，新增 domain 或 controller 时更新对应目标服务包的构造和装配逻辑，未注册的配置明确报错。
 
 配置分为服务共享配置和 Client 独立配置：
 
