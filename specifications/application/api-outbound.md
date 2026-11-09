@@ -129,7 +129,7 @@ Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 
-**当前仅创建目录和 Go 包骨架，尚未实现配置读取、Client 构造、初始化或实际调用，也未引入 SDK 依赖。以下内容是后续接入约定。**
+**当前 Qwen 已实现独立配置读取、Client 构造、单轮非流式文本生成和空闲连接清理，已有 dev、test、prod 三套 YAML 配置，并引入 OpenAI Go SDK 3.96、声明 Go 1.26。尚未接入 `thirdparty.Init`、`thirdparty.Current` 和 `bootstrap` 的统一装配；启动流程尚不读取这些配置。其他供应商仍为包占位，以下统一装配和获取方式是后续接入约定。**
 
 ### 按功能组织目录
 
@@ -137,7 +137,6 @@ Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后
 
 ```text
 app/integrations/thirdparty/
-├── config.go
 ├── clients.go
 ├── ai/
 │   ├── llm/
@@ -152,36 +151,50 @@ app/integrations/thirdparty/
     └── tencent_cos.go
 ```
 
-以 Qwen 为例，`ai/llm/qwen.go` 属于 `llm` 包，后续在该文件内组织 `QwenClient`、`QwenConfig`、构造方法以及用例专属的参数、结果和 SDK 适配。参数与结果可使用 `QwenGenerateTextParams`、`QwenGenerateTextResult` 等带产品限定的名称。
+以 Qwen 为例，`ai/llm/qwen.go` 属于 `llm` 包，在该文件内组织 `QwenClient`、`QwenConfig`、`LoadQwenConfig(path)`、`NewQwenClient(config)`、`CloseIdleConnections`，以及用例专属的 `QwenGenerateTextParams`、`QwenGenerateTextResult` 和 SDK 适配。
 
 ### SDK 封装边界
 
-Qwen Client 私有持有 OpenAI Go SDK Client，通过阿里云的 OpenAI 兼容接口调用 Qwen。首期覆盖单轮、非流式文本生成，将项目参数转换为 SDK 请求，并将 SDK 响应转换为项目结果；读取候选结果前处理空候选情况，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其参数、结果，不导入 SDK 类型。SDK 版本在实际接入时核对项目 Go 版本并锁定。
+Qwen Client 私有持有 OpenAI Go SDK 的 `ChatCompletionService`，通过阿里云的 OpenAI 兼容接口调用 Qwen。当前覆盖单轮、非流式文本生成，将项目参数转换为 SDK 请求，并将 SDK 响应转换为项目结果；读取候选结果前处理空候选情况，避免直接访问 `Choices[0]` 导致越界。Service 只使用项目 Client 及其参数、结果，不导入 SDK 类型。
+
+`QwenGenerateTextParams` 包含 `Model string` 和 `Prompt string`。每次调用 `GenerateText` 都必须提供 Model；模型为空或全空白时在发送请求前报错，非空值原样传给 SDK，不裁剪空白、不设置默认模型。Qwen Client 不保存模型，不同模型复用同一服务地址、认证配置及 Transport：
+
+```go
+params := llm.QwenGenerateTextParams{
+    Model:  "qwen3.8-max",
+    Prompt: "你是谁",
+}
+```
 
 ### 配置注入
 
-配置计划保存在 `config/integrations/thirdparty/{dev,test,prod}.yml`，按当前环境选择唯一文件；配置层解析环境变量并校验后，通过构造参数注入 Client，调用方法不临时读取环境变量。本次不创建这些配置文件。
+每个 SDK 独立声明配置类型和 Loader，`thirdparty` 顶层不维护全局 Config 或统一配置文件。配置目录按“环境 → 功能 → 子功能 → SDK 文件”组织，Qwen 的三套文件为：
 
-配置层级与功能目录、产品文件对应，例如 `ai.llm.qwen`：
-
-```yaml
-ai:
-  llm:
-    qwen:
-      base_url: https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
-      api_key: ${DASHSCOPE_API_KEY}
-      connect_timeout: 3s
-      request_timeout: 60s
-      model: qwen3.8-max
+```text
+config/integrations/thirdparty/
+├── dev/ai/llm/qwen.yml
+├── test/ai/llm/qwen.yml
+└── prod/ai/llm/qwen.yml
 ```
 
-`{WorkspaceId}` 须替换为实际工作空间 ID；API Key 由部署环境提供，不写入日志。超时值是示例，按具体业务调整。`connect_timeout` 限制连接建立阶段，`request_timeout` 限制一次完整 SDK 调用。兼容接口及地址格式见[阿里云官方文档](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)。
+`QwenConfig` 和每份 `qwen.yml` 只保存 Qwen 的四个连接及认证字段，不包含模型，也不添加 `ai.llm.qwen` 包裹层：
+
+```yaml
+base_url: https://llm-5kpwzn91x0zicspu.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+api_key: "<实际 API Key>"
+connect_timeout: 3s
+request_timeout: 60s
+```
+
+三个环境使用相同字段结构；当前服务地址和超时值相同，API Key 直接明文写入各环境的 `qwen.yml`，不写入日志。文档示例使用占位值，实际配置填写真实密钥。`LoadQwenConfig` 按字段原值读取和校验，不展开 API Key 环境变量；读取成功后通过构造参数注入 Client，调用方法不临时读取环境变量。`connect_timeout` 限制连接建立阶段，`request_timeout` 限制一次完整 SDK 调用，可按业务情况调整。兼容接口及地址格式见[阿里云官方文档](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)。
 
 ### 初始化、获取与资源清理
 
-接入时由 `thirdparty/config.go` 负责配置读取、解析与校验，`thirdparty/clients.go` 负责统一初始化、发布和获取实例。`bootstrap.Init` 只调用 `thirdparty.Init` 并管理顺序与失败清理；各 Client 在启动阶段同步构造，启动不发起模型调用。
+Qwen 目前可由调用方通过 Loader 读取配置并调用构造方法创建 Client，使用结束后调用 `CloseIdleConnections` 清理空闲连接。
 
-沿用一次性初始化约定：全部 Client 创建成功后才发布共享集合，配置缺失或非法时停止启动；发布后的实例及配置保持只读并发复用，配置修改后重启生效。获取层级与功能目录保持一致：
+后续接入统一装配时，`thirdparty/clients.go` 只负责决定已注册 Client 的配置路径，分别调用各 SDK 的 Loader 和构造方法，全部成功后发布共享集合，并统一管理资源清理。`bootstrap.Init` 只调用 `thirdparty.Init` 并管理顺序与失败清理；各 Client 在启动阶段同步构造，启动不发起模型调用。
+
+沿用一次性初始化约定：只加载已注册 Client 的配置，其配置缺失或非法时停止启动；仍为占位文件的其他 SDK 无须提前提供配置。发布后的实例及配置保持只读并发复用，配置修改后重启生效。获取层级与功能目录保持一致：
 
 ```go
 client := thirdparty.Current().AI.LLM.Qwen

@@ -1,0 +1,4 @@
+base_url: https://llm-5kpwzn91x0zicspu.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+api_key: "sk-ws-H.PDXHELM.vSsY.MEUCIQCXCZDdfus3D0dTOU3uJExXayObJwrUZL4R64jKIVjnEwIgZz4HSE35LiQYgHc1NEfmXesNCwaxD_GlKLWBhjSRG3s"
+connect_timeout: 3s
+request_timeout: 60s
