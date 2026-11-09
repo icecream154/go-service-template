@@ -2,7 +2,7 @@
 
 提供部署环境读取、JWT 签发与认证组件初始化、雪花发号器初始化、MySQL 命名连接初始化、HTTP 服务启动和退出清理的基础链路。数据库要求见 [MySQL 基线](specifications/databases/mysql/baseline.md)、[库表设计规范](specifications/databases/mysql/schema-design.md)和 [变更与数据维护规范](specifications/databases/mysql/change-and-maintenance.md)。所有运行时日志使用英文。接口、数据库及服务性能的日志、指标和链路追踪方案见[日志与可观测性体系设计](specifications/application/application-log.md)，当前处于设计阶段。
 
-公司内部 HTTP 服务、第三方 Go SDK 和第三方 HTTP 接口统一通过项目自己的 Client 接入，调用边界、执行预算、重试、错误及观测要求见[外部接口与第三方依赖调用规范](specifications/application/api-outbound.md)。该规范为后续接入目标，统一客户端组件尚未实施。
+公司内部 HTTP Client 按服务、domain、controller 组织，已支持多环境配置读取、共享 Transport、启动初始化和统一获取，详见[公司内部 HTTP Client 规范](specifications/application/api-outbound.md)。两个 Image Client 当前只完成构造和装配，尚无实际接口调用方法。
 
 ## 启动
 
@@ -24,7 +24,9 @@ JWT 签名密钥直接填写在 `config/authn/jwt/<environment>.yml` 的 `signin
 go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeout 30s -shutdown-timeout 10s
 ```
 
-`-config-dir` 是包含 `authn/jwt`、`snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
+`-config-dir` 是包含 `integrations/company`、`authn/jwt`、`snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
+
+公司 Client 配置读取 `config/integrations/company/<environment>.yml`。开发环境使用本地地址；测试和生产分别设置 `TEST_PYTHON_SERVICE_TEMPLATE_BASE_URL`、`PROD_PYTHON_SERVICE_TEMPLATE_BASE_URL`，或直接填写配置中的 `base_url`。地址缺失、超时无效或 Client 未注册时停止启动，初始化不调用远端 HTTP 接口。
 
 测试或生产部署先注入 MySQL YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。MySQL 配置中的 `${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
 
@@ -32,7 +34,7 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败释放本次已创建的连接池并以非零状态退出。
+启动顺序为：部署环境初始化 → company 包读取并校验环境配置、创建共享 Transport 和两个 Image Client → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败清理本次已创建的 HTTP 空闲连接和数据库连接池，并以非零状态退出。
 
 SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才正常关闭数据库。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享连接池，并以失败状态退出，由进程退出释放连接；这不代表业务完成或事务已回滚。
 
@@ -213,7 +215,8 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 加载环境、雪花和数据库配置，依次初始化发号器、Runtime、默认 Service，并返回资源清理入口 |
+| `bootstrap` | 管理依赖初始化顺序，调用 company 包加载和装配 Client，处理启动失败时的资源清理 |
+| `app/integrations/company` | 加载公司服务配置、创建共享 Transport 和具体 Client、发布默认实例并提供获取入口 |
 | `internal/runtime` | 创建并持有 DB、Repository，提供默认实例访问和连接池关闭 |
 | `internal/composition` | 创建并持有默认 Service，提供 Current 访问入口 |
 | `internal/response` | 定义统一响应外层、通用错误枚举及固定 HTTP 状态映射、Gin 输出函数 |

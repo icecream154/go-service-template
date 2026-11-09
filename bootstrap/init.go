@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"go-service-template/app/identity"
+	"go-service-template/app/integrations/company"
 	"go-service-template/env"
 	"go-service-template/internal/authn"
 	authnjwt "go-service-template/internal/authn/jwt"
@@ -19,14 +20,14 @@ import (
 	"go-service-template/internal/snowflake"
 )
 
-// Init 按部署环境、JWT、雪花发号器、数据库和业务服务的顺序初始化应用依赖。
+// Init 按部署环境、公司 Client、JWT、雪花、数据库和业务服务的顺序初始化应用依赖。
 //
 // ctx 必须非 nil，启动入口负责为它设置初始化时限，并在初始化结束后释放计时器。
 // 此 context 会传递给数据库连接建立与连接检查，用于取消启动或限制等待时间；
 // 它不作为服务运行期间每次数据库操作的 context，业务请求应另行传入自身的 context。
 //
 // configDir 是配置根目录，例如 config 或 /opt/service/config，而不是 MySQL 叶子目录。
-// 本函数分别在其下追加 authn/jwt、snowflake、database/mysql，按已校验的部署环境选择
+// 本函数分别在其下追加 integrations/company、authn/jwt、snowflake、database/mysql，按已校验的部署环境选择
 // dev.yml、test.yml 或 prod.yml。部署区域由 env 映射为雪花数据中心号。
 //
 // 必须先完成 env.Init 才能调用 env.Current。环境配置成功后即保存在环境单例中；
@@ -34,9 +35,10 @@ import (
 // 但不会返回部分可用的 Runtime。启动失败由 main 退出进程，不在原进程重新初始化。
 // Runtime 的创建、失败清理及默认实例发布由 appruntime.Init 完成。
 // 随后由 composition.Init 创建默认服务；该步骤失败时关闭已经创建的连接池。
-// 成功返回后，调用方负责最终 Close。
+// company.Init 自行加载配置并装配 Client，本入口只管理调用顺序和失败清理。
+// 成功返回后，调用方负责数据库及公司 Client 空闲连接的最终清理。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
-func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
+func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultErr error) {
 	// 已取消的启动无需继续读取配置或尝试联网；保留错误链供上层区分取消与普通故障。
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("initialize application: %w", err)
@@ -45,6 +47,15 @@ func Init(ctx context.Context, configDir string) (*appruntime.Runtime, error) {
 		return nil, fmt.Errorf("initialize deployment environment: %w", err)
 	}
 	deployment := env.Current()
+	if err := company.Init(filepath.Join(configDir, "integrations", "company"), deployment.Environment); err != nil {
+		return nil, fmt.Errorf("initialize company HTTP clients: %w", err)
+	}
+	companyClients := company.Current()
+	defer func() {
+		if resultErr != nil {
+			companyClients.CloseIdleConnections()
+		}
+	}()
 	// 认证配置和密钥在建立数据库连接前校验，缺少密钥等装配错误直接阻止启动。
 	jwtConfig, err := authnjwt.LoadConfig(filepath.Join(configDir, "authn", "jwt"), deployment.Environment)
 	if err != nil {

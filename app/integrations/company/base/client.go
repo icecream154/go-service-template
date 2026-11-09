@@ -26,7 +26,7 @@ type Client struct {
 // New 校验配置并构造 Client，不发起网络请求。
 // transport 由调用方创建并按目标服务共享，本函数不修改它或接管其生命周期。
 func New(config Config, transport *http.Transport) (*Client, error) {
-	if err := config.validate(); err != nil {
+	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 	if transport == nil {
@@ -41,7 +41,8 @@ func New(config Config, transport *http.Transport) (*Client, error) {
 	}, nil
 }
 
-func (config Config) validate() error {
+// Validate 检查配置，可在创建连接池和 Client 前提前校验。
+func (config Config) Validate() error {
 	if !utf8.ValidString(config.BaseURL) || strings.TrimSpace(config.BaseURL) != config.BaseURL {
 		return errors.New("base_url must be valid UTF-8 without surrounding whitespace")
 	}
