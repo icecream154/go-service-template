@@ -76,6 +76,33 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	response.Success(ctx, result)
 }
 
+// QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
+// 仅允许已认证的 service/admin 调用；默认值和输入校验由 Validator 完成。
+func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
+	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	var isEnabled *bool
+	if request.IsEnabled != nil {
+		value := *request.IsEnabled == "true"
+		isEnabled = &value
+	}
+	serviceResult, err := composition.Current().UserProfile.QueryUserProfilePage(userservice.QueryUserProfilePageParams{
+		PageNumber: request.PageNumber, PageSize: request.PageSize,
+		UserName: request.UserName, IsEnabled: isEnabled,
+	})
+	if err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	result := userprofiledto.QueryUserProfilePageResponse{
+		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), PageNumber: request.PageNumber,
+		PageSize: request.PageSize, TotalCount: serviceResult.TotalCount,
+	}
+	response.Success(ctx, result)
+}
+
 // CreateUser 允许匿名或已认证调用，创建成功后为本次生成的内部用户 ID 签发 user/member 凭证。
 // 无效凭证由公共认证入口拒绝；已有身份不改变首次创建语义，也不决定新用户的 ID。
 // Request DTO 由领域 Validator 绑定后传入，本方法不再读取或解析 HTTP 请求体。
@@ -115,6 +142,23 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 		ExpiresAt:   issued.ExpiresAt,
 	}
 	response.Success(ctx, result)
+}
+
+// GenerateUserAvatar 仅允许已认证的 user/member 生成头像，不修改用户资料。
+// Prompt 由 Validator 校验，调用沿用内部 Request Context，成功只返回头像地址。
+func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *userprofiledto.GenerateUserAvatarRequest) {
+	if _, err := httpauthz.RequireMemberUserID(ctx); err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	result, err := composition.Current().UserProfile.GenerateUserAvatar(ctx.Request.Context(), userservice.GenerateUserAvatarParams{
+		Prompt: request.Prompt,
+	})
+	if err != nil {
+		failUserProfileOperation(ctx, err)
+		return
+	}
+	response.Success(ctx, userprofiledto.GenerateUserAvatarResponse{AvatarURL: result.AvatarURL})
 }
 
 // UpdateUserProfile 使用 Validator 已校验的完整资料及版本调用 Service。
@@ -171,33 +215,6 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 	}
 	result := userprofiledto.BatchQueryUserProfilesResponse{
 		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), MissingUserIDList: missing,
-	}
-	response.Success(ctx, result)
-}
-
-// QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
-// 仅允许已认证的 service/admin 调用；默认值和输入校验由 Validator 完成。
-func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
-	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
-		failUserProfileOperation(ctx, err)
-		return
-	}
-	var isEnabled *bool
-	if request.IsEnabled != nil {
-		value := *request.IsEnabled == "true"
-		isEnabled = &value
-	}
-	serviceResult, err := composition.Current().UserProfile.QueryUserProfilePage(userservice.QueryUserProfilePageParams{
-		PageNumber: request.PageNumber, PageSize: request.PageSize,
-		UserName: request.UserName, IsEnabled: isEnabled,
-	})
-	if err != nil {
-		failUserProfileOperation(ctx, err)
-		return
-	}
-	result := userprofiledto.QueryUserProfilePageResponse{
-		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), PageNumber: request.PageNumber,
-		PageSize: request.PageSize, TotalCount: serviceResult.TotalCount,
 	}
 	response.Success(ctx, result)
 }

@@ -2,13 +2,13 @@
 
 ## 1. 适用范围与职责
 
-1. **本文规定 `UserProfileController` 五个接口的调用资格和数据访问范围。** 创建用户允许匿名调用；单个资料的查询、修改仅限用户本人；批量及分页查询仅限管理服务。本规范独立维护 user 领域规则，不将这些接口规则写入通用认证契约。
+1. **本文规定 `UserProfileController` 六个接口的调用资格和数据访问范围。** 创建用户允许匿名调用；单个资料的查询、修改仅限用户本人；头像生成仅限普通用户；批量及分页查询仅限管理服务。本规范独立维护 user 领域规则，不将这些接口规则写入通用认证契约。
 
 2. **通用身份结构与项目命名空间沿用既有声明。** `Principal`、签发器、认证器及通用认证错误见[公共身份认证与 JWT 实现](../../application/api-authentication.md)；用户与服务命名空间分别声明在 [user_namespace.go](../../../app/identity/user_namespace.go) 和 [service_namespace.go](../../../app/identity/service_namespace.go)。本文规定接口使用哪一种身份以及创建后的凭证响应，签名算法和有效期配置沿用公共 JWT 组件。
 
 3. **身份认证与业务授权分别成立。** 有效凭证证明调用方身份；本规范决定该身份能够调用哪个接口、访问哪些资料。公共类型或命名空间常量的声明本身不执行认证，也不会自动赋予全部接口权限。
 
-4. **五个接口共用全局可选认证，各 Controller 执行自己的访问检查。** `/api` 分组统一执行 `AuthenticateIfPresent`：完全没有 Authorization 头时匿名继续，有凭证时必须认证成功。随后由 Validator 完成参数绑定和校验，Controller 再按下述权限矩阵决定是否允许调用；不在各路由重复挂载强制认证中间件。
+4. **六个接口共用全局可选认证，各 Controller 执行自己的访问检查。** `/api` 分组统一执行 `AuthenticateIfPresent`：完全没有 Authorization 头时匿名继续，有凭证时必须认证成功。随后由 Validator 完成参数绑定和校验，Controller 再按下述权限矩阵决定是否允许调用；不在各路由重复挂载强制认证中间件。
 
 ## 2. 身份与主体标识
 
@@ -18,13 +18,14 @@
 
 3. **授权同时检查主体类别和命名空间。** 仅检查 `Namespace == "admin"` 不足以确认管理服务；必须同时确认 `Kind == service` 且凭证对应已认可的管理服务主体。用户身份不能通过修改命名空间变成管理服务，其他服务命名空间也不自动获得本规范的管理服务权限。
 
-## 3. 五个接口的权限矩阵
+## 3. 六个接口的权限矩阵
 
 | 方法 | 完整路径 | 允许的调用方 | 数据范围或成功结果 |
 | --- | --- | --- | --- |
 | POST | `/api/v1/user/userProfile/createUser` | 无凭证时允许匿名调用；携带凭证时必须有效 | 创建新用户，成功响应同时返回用户资料和该新用户的身份凭证 |
 | GET | `/api/v1/user/userProfile/queryUserProfileByUserId` | 已认证的 `user/member` | 仅能查询本人资料，目标用户 ID 必须等于认证主体的内部用户 ID |
 | POST | `/api/v1/user/userProfile/updateUserProfile` | 已认证的 `user/member` | 仅能修改本人资料，目标用户 ID 必须等于认证主体的内部用户 ID |
+| POST | `/api/v1/user/userProfile/generateUserAvatar` | 已认证的 `user/member` | 根据提示词生成并返回头像地址，不查询或修改用户资料 |
 | POST | `/api/v1/user/userProfile/batchQueryUserProfiles` | 已认证的 `service/admin` | 按请求 ID 集合批量查询资料，继续遵守批量数量和查询结果契约 |
 | GET | `/api/v1/user/userProfile/queryUserProfilePage` | 已认证的 `service/admin` | 按请求筛选及分页条件查询资料，继续遵守分页输入和结果契约 |
 
@@ -82,3 +83,28 @@
 4. **技术故障不转换成认证失败或权限不足。** 认证依赖、数据库或签发过程发生执行故障时，按实际错误及[错误声明、传递与响应规范](../../application/api-error.md)处理，不能因为无法完成检查而默认放行。认证中间件的具体挑战头和错误映射见[HTTP 认证适配层](../../application/api-authentication.md#7-http-认证适配层)。
 
 5. **共用身份检查只返回错误，当前 Controller 统一映射并输出。** `app/http/authz` 不设置挑战头、不调用 `response` 或 `Abort`；Controller 的 `mapUserProfileErrorCodes` 识别公共错误，`failUserProfileOperation` 设置既有挑战头并写响应，调用方法随后立即 `return`。Controller 不重复声明缺少身份和成员标识错误，也不在自身文件复制共用身份检查；本人访问规则及其错误仍留在 Controller。Service 的本人约束和错误继续独立保留。
+
+## 8. 生成用户头像
+
+`POST /api/v1/user/userProfile/generateUserAvatar` 只允许已认证的 `user/member` 调用。Validator 校验请求后，Controller 通过 `authz.RequireMemberUserID(ctx)` 取得可信成员 ID，主体标识仍须为正 int64；匿名、身份范围不符或主体标识非法时沿用上述 401、403、401 规则。接口不接收目标用户 ID，不查询用户资料，也不检查或更改资料版本。
+
+请求使用 JSON，仅包含 `prompt`，要求为非空白的 UTF-8 文本，原样传给图片生成 Client，不自行增加尺寸、长度限制或默认值：
+
+```json
+{
+  "prompt": "一只戴眼镜的卡通猫"
+}
+```
+
+生成成功返回 HTTP 200，仅交付头像地址，不保存到用户资料：
+
+```json
+{
+  "data": {
+    "avatar_url": "https://images.example/avatar.png"
+  },
+  "error": null
+}
+```
+
+Service 调用已有 `ImageGenClient.GenerateImage`；其图片生成路径及字段仍为暂定示例，尚未确认真实 Python 服务契约。生成失败沿用 Controller 既有错误映射，不额外重试。本路由响应等待为 65 秒，当前 `image_gen` Client 的请求超时默认配置为 60 秒；等待超时沿用 HTTP 503 和 `SERVICE_UNAVAILABLE`，已开始的内部处理继续执行，晚到响应被丢弃。

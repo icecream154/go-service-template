@@ -21,7 +21,7 @@ type HTTPHandler struct {
 	// 请求没有命中方法和路径的覆盖配置时，进入此 Handler。
 	defaultHandler http.Handler
 	// routeHandlers 保存接口覆盖配置对应的入口，键为“HTTP 方法 + 空格 + 完整路径”。
-	// 当前包含分页查询的 5 秒入口和创建用户的 10 秒入口；查询参数不属于键。
+	// 当前包含分页查询的 5 秒、创建用户的 10 秒和头像生成的 65 秒入口；查询参数不属于键。
 	// 每个入口包装同一个 Gin Engine，与 defaultHandler 并列，请求只选择其中一个。
 	routeHandlers map[string]http.Handler
 	// timeouts 保存默认及全部覆盖项的中间件实例，供 Shutdown 逐个等待内部处理结束。
@@ -45,6 +45,8 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 	}{
 		{http.MethodGet, "/api/v1/user/userProfile/queryUserProfilePage", 5 * time.Second},
 		{http.MethodPost, "/api/v1/user/userProfile/createUser", 10 * time.Second},
+		// 图片生成 Client 当前总超时为 60 秒，另留 5 秒用于认证、校验与响应处理。
+		{http.MethodPost, "/api/v1/user/userProfile/generateUserAvatar", 65 * time.Second},
 	}
 
 	// 启动阶段已初始化共享 JWT 组件；完整 Gin Engine 在 /api 分组挂一次可选认证。
@@ -108,7 +110,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // cmd/web 先调用 http.Server.Shutdown 停止接收并等待 HTTP 请求，再调用本方法等待内部处理。
 // HTTP 外层可能已返回 503，而内部业务仍在执行；仅等待 HTTP Server 无法覆盖这些工作。
 // 本方法不另设计时器：HTTP 收尾及这里所有实例共用调用方传入的同一个停机 Context。
-// 当前停机总预算默认 10 秒，由 -shutdown-timeout 配置，与接口的 3、5、10 秒响应等待无关。
+// 当前停机总预算默认 10 秒，由 -shutdown-timeout 配置，与接口各自的响应等待时间无关。
 // 例如 HTTP 收尾已用 4 秒，后续实例共用剩余约 6 秒，不是每个实例再等待完整 10 秒。
 //
 // 每个 ResponseTimeout.Shutdown 先停止自身接纳新工作，再等待自己的 active 计数归零。

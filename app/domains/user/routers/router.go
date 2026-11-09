@@ -14,6 +14,8 @@ type UserRouter struct {
 	userProfiles *userv1controller.UserProfileController
 	// createUserValidator 绑定创建用户请求，再交给同一个用户资料控制器处理。
 	createUserValidator *userprofilevalidator.CreateUserValidator
+	// generateUserAvatarValidator 绑定并校验头像生成请求。
+	generateUserAvatarValidator *userprofilevalidator.GenerateUserAvatarValidator
 	// queryUserProfileByUserIDValidator 绑定并校验按 ID 查询请求。
 	queryUserProfileByUserIDValidator *userprofilevalidator.QueryUserProfileByUserIDValidator
 	// queryUserProfilePageValidator 绑定并校验分页查询请求。
@@ -30,6 +32,7 @@ func NewRouter() *UserRouter {
 	return &UserRouter{
 		userProfiles:                      controller,
 		createUserValidator:               userprofilevalidator.NewCreateUserValidator(controller),
+		generateUserAvatarValidator:       userprofilevalidator.NewGenerateUserAvatarValidator(controller),
 		queryUserProfileByUserIDValidator: userprofilevalidator.NewQueryUserProfileByUserIDValidator(controller),
 		queryUserProfilePageValidator:     userprofilevalidator.NewQueryUserProfilePageValidator(controller),
 		updateUserProfileValidator:        userprofilevalidator.NewUpdateUserProfileValidator(controller),
@@ -45,6 +48,7 @@ func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	userProfile.GET("/queryUserProfileByUserId", r.queryUserProfileByUserIDValidator.QueryUserProfileByUserID)
 	userProfile.GET("/queryUserProfilePage", r.queryUserProfilePageValidator.QueryUserProfilePage)
 	userProfile.POST("/createUser", r.createUserValidator.CreateUser)
+	userProfile.POST("/generateUserAvatar", r.generateUserAvatarValidator.GenerateUserAvatar)
 	userProfile.POST("/updateUserProfile", r.updateUserProfileValidator.UpdateUserProfile)
 	userProfile.POST("/batchQueryUserProfiles", r.batchQueryUserProfilesValidator.BatchQueryUserProfiles)
 }

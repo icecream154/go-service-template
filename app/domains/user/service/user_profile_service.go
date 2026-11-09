@@ -2,6 +2,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"log"
 	"math"
@@ -9,9 +10,12 @@ import (
 	"go-service-template/app/domains/user/models"
 	"go-service-template/app/domains/user/repository"
 	"go-service-template/app/domains/user/tables"
+	"go-service-template/app/integrations/company"
+	companyimage "go-service-template/app/integrations/company/python-service-template/image"
 	"go-service-template/internal/check/collection"
 	"go-service-template/internal/check/relation"
 	"go-service-template/internal/check/scalar"
+	checktext "go-service-template/internal/check/text"
 	dbmysql "go-service-template/internal/database/mysql"
 	"go-service-template/internal/database/sqlvalue"
 	appruntime "go-service-template/internal/runtime"
@@ -101,6 +105,93 @@ func (s *UserProfileService) QueryUserProfileByUserID(params QueryUserProfileByU
 	return profileModel(profile), nil
 }
 
+// use case: QueryUserProfilePage
+
+// QueryUserProfilePageParams 表示页码分页与可选的精确筛选条件。
+type QueryUserProfilePageParams struct {
+	// PageNumber 不小于 MinUserProfilePageNumber，调用方在未提供时显式采用默认值。
+	PageNumber int
+	// PageSize 取值位于 MinUserProfilePageSize～MaxUserProfilePageSize，包含边界。
+	PageSize int
+	// UserName 非空时按完整昵称精确匹配。
+	UserName string
+	// IsEnabled 为 nil 时同时查询启用、停用用户。
+	IsEnabled *bool
+}
+
+// QueryUserProfilePageResult 组合当前页的资料和全部匹配记录的数量。
+// 当前页无记录时仍返回成功结果；总数与当前页不承诺来自同一个数据库快照。
+type QueryUserProfilePageResult struct {
+	// UserProfiles 保存按用户 ID 降序排列的当前页资料，无匹配时为空切片。
+	UserProfiles []*models.UserProfile
+	// TotalCount 是符合筛选条件的总记录数，不是当前页的记录数。
+	TotalCount int64
+}
+
+const (
+	// MinUserProfilePageNumber 表示有效页码的下限，允许等于该值。
+	MinUserProfilePageNumber = 1
+	// DefaultUserProfilePageNumber 供入口在未提供页码时准备输入，不覆盖显式非法值。
+	DefaultUserProfilePageNumber = 1
+	// MinUserProfilePageSize 表示每页返回条数的下限，允许等于该值。
+	MinUserProfilePageSize = 1
+	// DefaultUserProfilePageSize 供入口在未提供每页条数时准备输入，不覆盖显式非法值。
+	DefaultUserProfilePageSize = 20
+	// MaxUserProfilePageSize 表示每页返回条数的上限，允许等于该值。
+	MaxUserProfilePageSize = 100
+)
+
+// validateQueryUserProfilePageParams 先保证页码及每页条数有效，再检查偏移范围与可选筛选值。
+// 默认值由调用入口准备，显式零值不在 Service 内自动改写。
+func validateQueryUserProfilePageParams(params QueryUserProfilePageParams) error {
+	if err := scalar.IntInRange(params.PageSize, MinUserProfilePageSize, MaxUserProfilePageSize); err != nil {
+		return err
+	}
+	if err := scalar.IntAtLeast(params.PageNumber, MinUserProfilePageNumber); err != nil {
+		return err
+	}
+	if err := scalar.IntAtMost(params.PageNumber-1, math.MaxInt/params.PageSize); err != nil {
+		return err
+	}
+	if params.UserName != "" {
+		if err := models.ValidateUserName(params.UserName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// QueryUserProfilePage 查询精确昵称、启用状态筛选下的资料页和总数。
+// 输入非法时原样返回公共检查或领域字段规则错误，查询故障记录操作上下文后原样返回。
+// 资料固定按 ID 降序排列，页码超出结果范围时返回空页及实际总数。
+func (s *UserProfileService) QueryUserProfilePage(params QueryUserProfilePageParams) (*QueryUserProfilePageResult, error) {
+	if err := validateQueryUserProfilePageParams(params); err != nil {
+		return nil, err
+	}
+	result, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
+	if err != nil {
+		log.Printf("Query user profile page failed: error=%v", err)
+		return nil, err
+	}
+	return result, nil
+}
+
+// queryUserProfilePage 读取总数及当前页，保留仓储的排序和查询语义。
+func queryUserProfilePage(params QueryUserProfilePageParams, profiles *repository.UserProfileRepository) (*QueryUserProfilePageResult, error) {
+	rows, total, err := profiles.QueryProfilePage(params.UserName, params.IsEnabled, params.PageNumber, params.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	result := &QueryUserProfilePageResult{
+		UserProfiles: make([]*models.UserProfile, 0, len(rows)),
+		TotalCount:   total,
+	}
+	for i := range rows {
+		result.UserProfiles = append(result.UserProfiles, profileModel(&rows[i]))
+	}
+	return result, nil
+}
+
 // use case: CreateUser
 
 // CreateUserParams 表示首次注册所需的外部账户身份与初始资料。
@@ -182,6 +273,40 @@ func createUser(params CreateUserParams, profiles *repository.UserProfileReposit
 		return nil, err
 	}
 	return profileModel(profile), nil
+}
+
+// use case: GenerateUserAvatar
+
+// GenerateUserAvatarParams 表示生成头像所需的提示词，不指定目标用户或更新资料。
+type GenerateUserAvatarParams struct {
+	// Prompt 必须为非空白 UTF-8 文本，原样传给图片生成服务。
+	Prompt string
+}
+
+// GenerateUserAvatarResult 表示本次生成的头像地址，不代表头像已经保存到用户资料。
+type GenerateUserAvatarResult struct {
+	AvatarURL string
+}
+
+// validateGenerateUserAvatarParams 检查提示词，不修改输入或补充默认值。
+func validateGenerateUserAvatarParams(params GenerateUserAvatarParams) error {
+	return checktext.NotBlank(params.Prompt)
+}
+
+// GenerateUserAvatar 使用共享图片生成 Client 生成头像，仅返回地址，不读取或修改数据库。
+// ctx 表示内部业务执行上下文；远端请求预算由 Client 控制，故障记录后原样返回。
+func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params GenerateUserAvatarParams) (*GenerateUserAvatarResult, error) {
+	if err := validateGenerateUserAvatarParams(params); err != nil {
+		return nil, err
+	}
+	generated, err := company.Current().PythonServiceTemplate.Image.ImageGen.GenerateImage(ctx, companyimage.GenerateImageParams{
+		Prompt: params.Prompt,
+	})
+	if err != nil {
+		log.Printf("Generate user avatar failed: error=%v", err)
+		return nil, err
+	}
+	return &GenerateUserAvatarResult{AvatarURL: generated.ImageURL}, nil
 }
 
 // use case: UpdateUserProfile
@@ -372,93 +497,6 @@ func batchQueryUserProfiles(userIDs []int64, profiles *repository.UserProfileRep
 		} else {
 			result.MissingUserIDs = append(result.MissingUserIDs, id)
 		}
-	}
-	return result, nil
-}
-
-// use case: QueryUserProfilePage
-
-// QueryUserProfilePageParams 表示页码分页与可选的精确筛选条件。
-type QueryUserProfilePageParams struct {
-	// PageNumber 不小于 MinUserProfilePageNumber，调用方在未提供时显式采用默认值。
-	PageNumber int
-	// PageSize 取值位于 MinUserProfilePageSize～MaxUserProfilePageSize，包含边界。
-	PageSize int
-	// UserName 非空时按完整昵称精确匹配。
-	UserName string
-	// IsEnabled 为 nil 时同时查询启用、停用用户。
-	IsEnabled *bool
-}
-
-// QueryUserProfilePageResult 组合当前页的资料和全部匹配记录的数量。
-// 当前页无记录时仍返回成功结果；总数与当前页不承诺来自同一个数据库快照。
-type QueryUserProfilePageResult struct {
-	// UserProfiles 保存按用户 ID 降序排列的当前页资料，无匹配时为空切片。
-	UserProfiles []*models.UserProfile
-	// TotalCount 是符合筛选条件的总记录数，不是当前页的记录数。
-	TotalCount int64
-}
-
-const (
-	// MinUserProfilePageNumber 表示有效页码的下限，允许等于该值。
-	MinUserProfilePageNumber = 1
-	// DefaultUserProfilePageNumber 供入口在未提供页码时准备输入，不覆盖显式非法值。
-	DefaultUserProfilePageNumber = 1
-	// MinUserProfilePageSize 表示每页返回条数的下限，允许等于该值。
-	MinUserProfilePageSize = 1
-	// DefaultUserProfilePageSize 供入口在未提供每页条数时准备输入，不覆盖显式非法值。
-	DefaultUserProfilePageSize = 20
-	// MaxUserProfilePageSize 表示每页返回条数的上限，允许等于该值。
-	MaxUserProfilePageSize = 100
-)
-
-// validateQueryUserProfilePageParams 先保证页码及每页条数有效，再检查偏移范围与可选筛选值。
-// 默认值由调用入口准备，显式零值不在 Service 内自动改写。
-func validateQueryUserProfilePageParams(params QueryUserProfilePageParams) error {
-	if err := scalar.IntInRange(params.PageSize, MinUserProfilePageSize, MaxUserProfilePageSize); err != nil {
-		return err
-	}
-	if err := scalar.IntAtLeast(params.PageNumber, MinUserProfilePageNumber); err != nil {
-		return err
-	}
-	if err := scalar.IntAtMost(params.PageNumber-1, math.MaxInt/params.PageSize); err != nil {
-		return err
-	}
-	if params.UserName != "" {
-		if err := models.ValidateUserName(params.UserName); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// QueryUserProfilePage 查询精确昵称、启用状态筛选下的资料页和总数。
-// 输入非法时原样返回公共检查或领域字段规则错误，查询故障记录操作上下文后原样返回。
-// 资料固定按 ID 降序排列，页码超出结果范围时返回空页及实际总数。
-func (s *UserProfileService) QueryUserProfilePage(params QueryUserProfilePageParams) (*QueryUserProfilePageResult, error) {
-	if err := validateQueryUserProfilePageParams(params); err != nil {
-		return nil, err
-	}
-	result, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
-	if err != nil {
-		log.Printf("Query user profile page failed: error=%v", err)
-		return nil, err
-	}
-	return result, nil
-}
-
-// queryUserProfilePage 读取总数及当前页，保留仓储的排序和查询语义。
-func queryUserProfilePage(params QueryUserProfilePageParams, profiles *repository.UserProfileRepository) (*QueryUserProfilePageResult, error) {
-	rows, total, err := profiles.QueryProfilePage(params.UserName, params.IsEnabled, params.PageNumber, params.PageSize)
-	if err != nil {
-		return nil, err
-	}
-	result := &QueryUserProfilePageResult{
-		UserProfiles: make([]*models.UserProfile, 0, len(rows)),
-		TotalCount:   total,
-	}
-	for i := range rows {
-		result.UserProfiles = append(result.UserProfiles, profileModel(&rows[i]))
 	}
 	return result, nil
 }
