@@ -2,7 +2,7 @@
 
 本文面向第一次阅读本项目的开发者，说明一个 HTTP 请求如何进入系统、经过各层处理、访问数据库，再转换成最终响应。以 `createUser` 为主线，最后补充查询、分页、批量和更新接口的差异。
 
-本文描述各层的调用关系，以及 HTTP 入口统一启用 TraceId 和响应等待超时后的处理约定。所有接口默认等待 3 秒，分页查询、创建用户和头像生成分别覆盖为 5 秒、10 秒、65 秒；超时只结束响应等待，不取消内部业务。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
+本文描述各层的调用关系，以及 HTTP 入口统一启用 TraceId 和响应等待超时后的处理约定。所有接口默认等待 3 秒，分页查询、创建用户和头像生成分别覆盖为 5 秒、10 秒、125 秒；超时只结束响应等待，不取消内部业务。路由与 DTO 的命名规则见[接口路由与命名规范](api-routing.md)，响应结构与错误码规则见[接口返回规范](api-response.md)。文中的源码路径均以仓库根目录为起点，点击文件链接即可继续阅读实现。
 
 ## 1. 先看整体链路
 
@@ -126,7 +126,7 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 1. **入站统一使用 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行。头不存在或值为空时，通过 `traceid.New()` 生成 16 字节随机数并编码为 32 位小写十六进制字符串；非空时原样沿用，不要求上游值也符合本服务的生成格式。生成失败返回统一 HTTP 500，不继续业务处理。
 2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
 3. **成功确定 TraceId 后，通过同名响应头返回。** 该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
-4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 已按这条链路传递，无须为本次机制批量改造未调用外部服务的方法或 Repository。
+4. **Controller、Service 和 Client 显式传递执行 Context。** Controller 使用 `ctx.Request.Context()`，Service 将收到的 Context 继续传给具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
 现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。当前机制完成标识生成和传递，尚未自动为日志注入 TraceId，也未创建或导出 Span；后续规划见[日志与可观测性体系设计](application-log.md#4-统一标识与链路上下文)。

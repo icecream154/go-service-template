@@ -29,9 +29,9 @@
 | --- | --- | --- |
 | [启动入口](../../cmd/web/main.go)、[bootstrap](../../bootstrap/init.go) | 管理初始化、HTTP 监听、收尾和资源关闭；主要输出文本日志 | 初始化观测资源、记录生命周期事件，并纳入退出清理 |
 | [Gin 路由](../../routers/web.go) | 使用 `gin.Logger`、`gin.CustomRecovery` | 替换为统一观测中间件和结构化 Recovery，避免并行输出两套访问日志 |
-| [HTTP 装配](../../routers/http_handler.go)、[响应等待组件](../../app/http/middleware/response_timeout.go) | 已在等待前确定 TraceId；默认等待 3 秒，分页 5 秒，创建用户 10 秒，头像生成 65 秒；超时后内部继续 | HTTP 外层观察真正选中的响应；内部独立观察工作结束 |
+| [HTTP 装配](../../routers/http_handler.go)、[响应等待组件](../../app/http/middleware/response_timeout.go) | 已在等待前确定 TraceId；默认等待 3 秒，分页 5 秒，创建用户 10 秒，头像生成 125 秒，覆盖 Qwen 优化和图片生成的顺序调用；超时后内部继续 | HTTP 外层观察真正选中的响应；内部独立观察工作结束 |
 | [公共响应组件](../../internal/response/response.go) | 输出统一错误、记录编码和写出失败 | 在写出时登记结构化结果，日志使用同一请求上下文 |
-| [Service](../../app/domains/user/service/user_profile_service.go)、[Repository](../../app/domains/user/repository/user_profile_repository.go) | 头像生成已接收并向 company Client 传递标准 Context；其他用例和仓储尚未统一接入，部分 Service 记录技术故障 | 按需显式增加 Context，保持 Params、领域模型和错误语义 |
+| [Service](../../app/domains/user/service/user_profile_service.go)、[Repository](../../app/domains/user/repository/user_profile_repository.go) | 头像生成已接收并向 Qwen 和 company 图片 Client 传递同一个标准 Context；其他用例和仓储尚未统一接入，部分 Service 记录技术故障 | 按需显式增加 Context，保持 Params、领域模型和错误语义 |
 | [MySQL Manager](../../internal/database/mysql/client.go) | 管理 `user/post/order/transaction` 独立连接池，配置 GORM 参数化日志 | 安装统一 ORM 观测插件和日志适配器，提供只读池统计 |
 
 目前尚无统一的 OpenTelemetry、Prometheus 指标端点、集中日志平台和性能诊断入口。实施 Context 改造时，须同步更新 README 及[接口处理流程](api-handle.md)、[Service 调用规范](api-service-validator.md)中有关签名和仓储不接收 Context 的描述。标准 Context 用于执行控制及观测，不引入 Gin、认证对象或 HTTP DTO 到 Service 和 Repository。

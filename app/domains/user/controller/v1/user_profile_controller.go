@@ -145,7 +145,8 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 }
 
 // GenerateUserAvatar 仅允许已认证的 user/member 生成头像，不修改用户资料。
-// Prompt 由 Validator 校验，调用沿用内部 Request Context，成功只返回头像地址。
+// Prompt 由 Validator 校验，Service 先经 Qwen 优化再生成图片；调用沿用内部 Request Context。
+// 成功只返回头像地址。
 func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *userprofiledto.GenerateUserAvatarRequest) {
 	if _, err := httpauthz.RequireMemberUserID(ctx); err != nil {
 		failUserProfileOperation(ctx, err)

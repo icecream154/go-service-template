@@ -23,7 +23,7 @@ type HTTPHandler struct {
 	// 请求没有命中方法和路径的覆盖配置时，进入此 Handler。
 	defaultHandler http.Handler
 	// routeHandlers 保存接口覆盖配置对应的入口，键为“HTTP 方法 + 空格 + 完整路径”。
-	// 当前包含分页查询的 5 秒、创建用户的 10 秒和头像生成的 65 秒入口；查询参数不属于键。
+	// 当前包含分页查询的 5 秒、创建用户的 10 秒和头像生成的 125 秒入口；查询参数不属于键。
 	// 每个入口包装同一个 Gin Engine，与 defaultHandler 并列，请求只选择其中一个。
 	routeHandlers map[string]http.Handler
 	// timeouts 保存默认及全部覆盖项的中间件实例，供 Shutdown 逐个等待内部处理结束。
@@ -48,8 +48,8 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 	}{
 		{http.MethodGet, "/api/v1/user/userProfile/queryUserProfilePage", 5 * time.Second},
 		{http.MethodPost, "/api/v1/user/userProfile/createUser", 10 * time.Second},
-		// 图片生成 Client 当前总超时为 60 秒，另留 5 秒用于认证、校验与响应处理。
-		{http.MethodPost, "/api/v1/user/userProfile/generateUserAvatar", 65 * time.Second},
+		// Qwen 优化和图片生成串行调用，当前各有 60 秒预算，另留 5 秒用于认证、校验与响应。
+		{http.MethodPost, "/api/v1/user/userProfile/generateUserAvatar", 125 * time.Second},
 	}
 
 	// 启动阶段已初始化共享 JWT 组件；完整 Gin Engine 在 /api 分组挂一次可选认证。

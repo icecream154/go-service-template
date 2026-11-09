@@ -88,7 +88,7 @@
 
 `POST /api/v1/user/userProfile/generateUserAvatar` 只允许已认证的 `user/member` 调用。Validator 校验请求后，Controller 通过 `authz.RequireMemberUserID(ctx)` 取得可信成员 ID，主体标识仍须为正 int64；匿名、身份范围不符或主体标识非法时沿用上述 401、403、401 规则。接口不接收目标用户 ID，不查询用户资料，也不检查或更改资料版本。
 
-请求使用 JSON，仅包含 `prompt`，要求为非空白的 UTF-8 文本，原样传给图片生成 Client，不自行增加尺寸、长度限制或默认值：
+请求使用 JSON，仅包含 `prompt`，要求为非空白的 UTF-8 文本。Service 先用 Qwen 优化原始提示词，再将优化结果交给图片生成 Client，不自行增加尺寸、长度限制或默认值：
 
 ```json
 {
@@ -107,4 +107,8 @@
 }
 ```
 
-Service 调用已有 `ImageGenClient.GenerateImage`；其图片生成路径及字段仍为暂定示例，尚未确认真实 Python 服务契约。生成失败沿用 Controller 既有错误映射，不额外重试。本路由响应等待为 65 秒，当前 `image_gen` Client 的请求超时默认配置为 60 秒；等待超时沿用 HTTP 503 和 `SERVICE_UNAVAILABLE`，已开始的内部处理继续执行，晚到响应被丢弃。
+Controller 继续负责鉴权、传递 `ctx.Request.Context()` 及构造响应 DTO。Service 先调用 `thirdparty.Current().AI.LLM.Qwen.GenerateText`，使用固定模型 `llm.QwenModel38Flash`，将头像提示词优化指令与原始 Prompt 一起传入；指令要求保留用户意图，补充适合头像的构图、光线等描述，只输出优化后的提示词。Qwen 调用失败或返回空白文本时立即结束，沿用 Controller 既有错误映射，不回退原始提示词，也不调用图片生成服务。
+
+优化后的非空文本原样传给已有 `ImageGenClient.GenerateImage`；其图片生成路径及字段仍为暂定示例，尚未确认真实 Python 服务契约。两次远端调用顺序执行并沿用同一个标准 Context，故障记录后原样返回，不额外重试；生成成功只返回图片地址，不读取或修改用户资料。
+
+本路由响应等待为 125 秒，覆盖当前 Qwen 和 `image_gen` Client 各 60 秒的独立请求超时，并预留 5 秒用于认证、校验与响应处理；调整 Client 超时后应同步检查此等待预算。等待超时沿用 HTTP 503 和 `SERVICE_UNAVAILABLE`，已开始的内部处理继续执行，晚到响应被丢弃。
