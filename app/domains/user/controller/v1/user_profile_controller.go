@@ -91,7 +91,7 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 
 	// 6. 将领域模型转换为当前版本 DTO 并处理响应，随后记录本方法已完成处理。
 	// HTTP 对外状态由公共入口记录，不把方法返回等同于客户端已收到正文。
-	result := userprofiledto.QueryUserProfileByUserIDResponse(userProfileDTO(profile))
+	result := userProfileDTO(profile)
 	response.Success(ctx, result)
 	lg.Info(requestCtx, "User profile query request handled")
 }
@@ -268,7 +268,7 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 		return
 	}
 	// 5. 将更新后的领域模型映射为当前版本 DTO，响应处理后直接记录阶段完成，不输出资料正文。
-	result := userprofiledto.UpdateUserProfileResponse(userProfileDTO(profile))
+	result := userProfileDTO(profile)
 	response.Success(ctx, result)
 	lg.Info(requestCtx, "User profile update request handled")
 }

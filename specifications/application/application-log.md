@@ -88,6 +88,8 @@ HTTP Controller 将响应等待层隔离取消后的 `ctx.Request.Context()` 传
 
 Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用域，后续共享 Logger 从中自动取得 `component=service` 和 `{领域名}.{Service 类型名}.{方法名}`。同一方法内部的流程日志保持同一 operation，使用 message 说明具体步骤，普通步骤省略 event。需要记录步骤或失败时，在对应业务位置直接调用日志方法；不要求业务方法维护日志状态、增加计时或 defer，也不要求配齐 started、finished。HTTP 和 Client 等公共边界仍可统一记录生命周期及耗时。调用其他 Service 或 Client 时继续传入当前 Context，由新入口建立自己的作用域，上层 Context 不变。需要流程日志的私有辅助函数显式接收并沿用该 Context，纯校验、转换和构造函数无需机械添加参数。
 
+同一代码块中直接相邻、使用相同 Context 和 operation、等级相同且中间没有业务操作的普通说明日志，内容相关时应合并，在一条 message 中表达相关阶段。例如，提示词优化完成后立即准备生成图片，可以记录 `Avatar prompt optimized; requesting image generation`。两条日志之间执行了调用、查询或状态变更时，各自表达独立的执行位置；不同 TraceId、operation 或生命周期事件的日志也分别保留。同等级本身不作为合并条件，Logger 不按输出顺序自动合并或丢弃日志。
+
 当前用户资料的六个 Controller 业务方法均在入口建立操作作用域，并将派生 Context 保存回 `ctx.Request`，供 Service、凭证签发及后续响应处理沿用。对应的六个 Service 公开业务方法统一接收 Context 首参，在各自入口建立 Service 作用域。`user_profile_controller.go`、`user_profile_service.go` 中的日志均已使用共享 Logger，局部变量统一为 `lg`，在业务执行位置直接打印。只有传入当前 Context 的日志才会带上对应请求和操作信息。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
 Controller 接收请求、处理完成及 Service 正常结果使用 `INFO`；授权拒绝、输入不符合约束和已知业务结果使用 `WARN`；未知执行故障使用 `ERROR`。查询未命中、重复账户、用户停用及版本冲突仍按原有业务错误返回，不因为增加日志改变响应分类。六个用例的 Service 失败日志均由 Service 负责，Controller 继续完成错误映射和响应，不重复输出同一 Service 故障摘要；Controller 自身的授权拒绝和凭证签发故障在当前 Controller 记录，不输出凭证、用户字段或原始错误文本。

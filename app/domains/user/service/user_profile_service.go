@@ -430,9 +430,8 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 		})
 		return nil, errEmptyOptimizedAvatarPrompt
 	}
-	// 5. 优化结果可用时直接记录步骤完成，并在图片调用前记录即将执行的下一步。
-	lg.Info(ctx, "Avatar prompt optimized")
-	lg.Info(ctx, "Avatar image generation requested")
+	// 5. 优化结果可用时，将优化完成与即将生成图片合并为一条步骤日志，避免同一执行位置重复输出。
+	lg.Info(ctx, "Avatar prompt optimized; requesting image generation")
 	// 6. 将同一个 Service Context 传给图片 Client，其公共请求与调用日志继续沿用本次 TraceId。
 	generated, err := company.Current().PythonServiceTemplate.Image.ImageGen.GenerateImage(ctx, companyimage.GenerateImageParams{
 		Prompt: optimized.Content,
