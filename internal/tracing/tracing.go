@@ -8,6 +8,7 @@ import (
 	"errors"
 	"reflect"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -46,9 +47,12 @@ func (t *Tracer) StartHTTP(ctx context.Context, method, routeTemplate string) (c
 		panic("tracing HTTP method is required")
 	}
 	// 2. 使用方法和注册模板生成稳定名称，已有远端或本地父 Span 时由 SDK 自动建立关系。
-	ctx, span := t.start(ctx, httpOperation(method, routeTemplate), trace.SpanKindServer)
+	ctx, span := t.start(ctx, httpOperation(method, routeTemplate), trace.SpanKindServer,
+		attribute.String("http.request.method", method))
 	// 3. 只在本次 Span 句柄中保存不可变方法名，供路由确认后更新名称，不保存请求对象。
 	span.httpMethod = method
+	// 3.1. 独立调用时也可直接提供模板；未知状态占位只用于名称，不写成真实注册路由属性。
+	span.SetHTTPRoute(routeTemplate)
 	return ctx, span
 }
 
@@ -98,7 +102,7 @@ func (t *Tracer) StartSDKClient(ctx context.Context, operation string) (context.
 
 // start 是五类固定入口共用的内部创建流程，不对业务层开放任意 Span kind 或附加创建选项。
 // ctx 必须由调用入口提供；本方法不补造 Background，也不修改父 Context 的其他值。
-func (t *Tracer) start(ctx context.Context, operation string, kind trace.SpanKind) (context.Context, *Span) {
+func (t *Tracer) start(ctx context.Context, operation string, kind trace.SpanKind, attributes ...attribute.KeyValue) (context.Context, *Span) {
 	// 1. 未构造实例和 nil Context 都是入口接入错误，不能悄悄转成丢失父链路的根调用。
 	if t == nil || t.tracer == nil {
 		panic("tracer is not initialized")
@@ -108,7 +112,8 @@ func (t *Tracer) start(ctx context.Context, operation string, kind trace.SpanKin
 	}
 	// 2. SDK 从标准 Context 读取父节点，并管理 TraceId、SpanId、开始时间及采样状态。
 	// 不使用 WithNewRoot，因此已有上游链路时不会在本地擅自断开。
-	derived, span := t.tracer.Start(ctx, operation, trace.WithSpanKind(kind))
+	// 已知属性在创建时交给 SDK，便于采样器取得入口信息；属性只由本包的固定边界提供。
+	derived, span := t.tracer.Start(ctx, operation, trace.WithSpanKind(kind), trace.WithAttributes(attributes...))
 	// 3. 以受限句柄交回结束责任；派生 Context 传给下层，调用方原有 Context 仍保留原 Span。
 	return derived, &Span{span: span}
 }

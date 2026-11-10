@@ -1,6 +1,9 @@
 package tracing
 
 import (
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -49,6 +52,33 @@ func (s *Span) End() {
 	}
 }
 
+// EndHTTP 在外层响应完成时保存 HTTP 结果，并按该时刻结束入站 Span。
+// statusCode 只传实际选定的状态，未知时传 0；failureDescription 仅接受公共边界提供的受控说明。
+// finishedAt 须由外层响应返回时取得，避免把等待路由锁或同步输出结束日志的时间计入 Span。
+// 本方法不 recover、不修改响应，也不等待内部业务；外围仍直接 defer End 作为异常收尾保障。
+func (s *Span) EndHTTP(statusCode int, failureDescription string, finishedAt time.Time) {
+	// 1. 只接受 HTTP 入口句柄，不创建新 Span，也不允许借用其他边界提交 HTTP 结果。
+	if s == nil || s.span == nil || s.httpMethod == "" {
+		return
+	}
+	// 2. 只记录实际取得的状态码；0 表示未知，不伪造 200、500 或取消专用状态。
+	if statusCode != 0 {
+		s.span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
+	}
+	// 3. 写入、取消或异常终止以明确失败说明为准；单纯 4xx 不作为服务端 Span 故障。
+	switch {
+	case failureDescription != "":
+		// 3.1. 不记录原始错误对象、panic 值或任意请求数据，只复用边界已确认的固定说明。
+		s.Fail(failureDescription)
+	case statusCode >= 500 && statusCode <= 599:
+		// 3.2. 5xx 标记 Error；原因已经可以从 HTTP 状态推断，不重复填写状态描述。
+		s.span.SetStatus(codes.Error, "")
+	}
+	// 4. 在结束日志之前提交实际结束时刻；后续日志仍能从 Context 读取本次 Span 的标识。
+	// SDK 忽略重复 End，外围的 defer End 不会延长已经确定的执行区间。
+	s.span.End(trace.WithTimestamp(finishedAt))
+}
+
 // SetHTTPRoute 在路由匹配后更新 HTTP Span 名称，不创建新 Span 或修改调用方的 operation Context。
 // routeTemplate 由 HTTP 路由层提供；真正未匹配时传 <unmatched>，尚未确定时传空或 <unresolved>。
 // 只对 StartHTTP 创建的句柄生效，不允许借此重命名 Controller、Service 或 Client Span。
@@ -60,6 +90,10 @@ func (s *Span) SetHTTPRoute(routeTemplate string) {
 	// 2. 使用创建时的方法和当前已确认的注册模板更新同一个节点，SDK 忽略结束后的更新。
 	// 路由层负责与 HTTP 日志使用相同的冻结规则，不能让晚到的结果改写已完成的请求身份。
 	s.span.SetName(httpOperation(s.httpMethod, routeTemplate))
+	// 3. 只将实际注册模板写入路由属性；unmatched、unresolved 继续由名称表达，不伪造真实路由。
+	if routeTemplate != "" && routeTemplate != "<unmatched>" && routeTemplate != "<unresolved>" {
+		s.span.SetAttributes(attribute.String("http.route", routeTemplate))
+	}
 }
 
 // httpOperation 按日志规范生成稳定的 HTTP 操作名，不读取原始 URL 或 Query。

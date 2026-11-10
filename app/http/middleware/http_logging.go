@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go-service-template/internal/logger"
+	"go-service-template/internal/tracing"
 
 	"github.com/gin-gonic/gin"
 )
@@ -22,11 +23,12 @@ const (
 // httpLogContextKey 关联外层 HTTP 观察器与内层路由匹配，不保存或共享 Gin Context。
 type httpLogContextKey struct{}
 
-// httpRequestLog 只属于一次请求，模板首次确认后保持不变。
+// httpRequestLog 共同管理一次请求的日志和 HTTP Span，模板首次确认后保持不变。
 // Gin 工作协程与外层响应协程通过 mu 交接模板及日志顺序，不并发读取各自的 Writer 或 Gin Context。
 type httpRequestLog struct {
 	mu            sync.Mutex
 	log           *logger.Logger
+	span          *tracing.Span
 	baseContext   context.Context
 	method        string
 	startedAt     time.Time
@@ -35,28 +37,34 @@ type httpRequestLog struct {
 }
 
 // HTTPLogging 记录 HTTP 请求开始和对外响应结束，必须位于 TraceID 之后、ResponseTimeout 之前。
-// 构造时取得已初始化的共享 Logger；单次请求仅共享受锁元信息，不把响应日志交给内部业务计时。
+// 构造时取得共享 Logger 和 Tracer；每次请求只创建一个 HTTP Span，路由状态与日志共用。
 func HTTPLogging(next http.Handler) http.Handler {
-	// 1. 显式检查装配参数，再捕获进程共享 Logger；缺少初始化属于启动顺序错误。
+	// 1. 显式检查装配参数，再取得共享 Logger 与 Tracer；缺少初始化属于启动顺序错误。
 	if next == nil {
 		panic("HTTP logging handler must not be nil")
 	}
 	lg := logger.Current()
+	tracer := tracing.Current()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 2. 在进入响应等待层前记下开始时间，后续耗时包含路由、认证及全部响应等待。
-		// baseContext 已含 TraceId；它只供外层日志使用，不替换业务协程隔离取消后的 Context。
+		// 2. 在响应等待之前开始计时并创建 SERVER Span，沿用入口已提取的远端父节点或兼容 TraceId。
+		// 直接登记 End，异常退出时保留受控故障标记并继续传播原 panic，不替代既有 Recovery。
+		startedAt := time.Now()
+		spanContext, span := tracer.StartHTTP(r.Context(), r.Method, "")
+		defer span.End()
+		// 2.1. 日志观察器与下游 Request 使用同一 Span Context；内层稍后仍按原规则隔离取消。
 		state := &httpRequestLog{
 			log:         lg,
-			baseContext: r.Context(),
+			span:        span,
+			baseContext: spanContext,
 			method:      r.Method,
-			startedAt:   time.Now(),
+			startedAt:   startedAt,
 		}
 		// 3. 通过标准 Context 把请求独有的状态传给 Gin；创建请求副本，不改写其他请求或共享实例。
-		request := r.WithContext(context.WithValue(r.Context(), httpLogContextKey{}, state))
+		request := r.WithContext(context.WithValue(spanContext, httpLogContextKey{}, state))
 		output := &httpLogResponseWriter{ResponseWriter: w}
 		returnedNormally := false
 		// 4. 外层结束时统一写结束记录；即使 next 传播 panic，也先记录已知响应信息并继续原有异常流程。
-		// 不在这里 recover 或伪造 HTTP 500，避免改变 net/http 及既有 Recovery 的处理语义。
+		// 本闭包不 recover 或伪造 HTTP 500；先记录实际结束结果，随后由直接 defer 的 Span.End 继续异常流程。
 		defer func() {
 			state.finish(output, returnedNormally)
 		}()
@@ -112,6 +120,8 @@ func (state *httpRequestLog) startLocked(routeTemplate string) {
 	// 1. 保存模板和专属于 HTTP 观察器的 Context；业务后续建立自己的操作作用域不会影响它。
 	state.routeTemplate = routeTemplate
 	state.logContext = logger.WithHTTPOperation(state.baseContext, state.method, routeTemplate)
+	// 1.1. 在同一状态锁下更新唯一 HTTP Span 的名称，路由冻结后晚到处理不再改写。
+	state.span.SetHTTPRoute(routeTemplate)
 	// 2. 开始记录不携带响应状态或耗时，表示 HTTP 处理已开始，而不是业务已经成功。
 	// 同步输出期间继续持有状态锁，确保并发的外层结束不会先输出 finished。
 	// 日志器在内部处理输出故障，本层不维护重复的失败处理或改变业务响应。
@@ -121,7 +131,8 @@ func (state *httpRequestLog) startLocked(routeTemplate string) {
 // finish 在外层响应路径返回时记录选定状态及耗时，不等待超时后仍执行的内部业务。
 func (state *httpRequestLog) finish(output *httpLogResponseWriter, returnedNormally bool) {
 	// 1. 在外层刚结束时截取耗时，避免把后续等候元信息锁或补写日志的时间计入响应等待。
-	durationMS := float64(time.Since(state.startedAt)) / float64(time.Millisecond)
+	finishedAt := time.Now()
+	durationMS := float64(finishedAt.Sub(state.startedAt)) / float64(time.Millisecond)
 	// 2. 与 Gin 的首次模板绑定串行，确保读取的是已经固定的作用域，而不是可变的 Gin Context。
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -153,7 +164,10 @@ func (state *httpRequestLog) finish(output *httpLogResponseWriter, returnedNorma
 		// 4.3. 请求 Context 已结束时记录取消事实，不能把无状态返回误写成成功响应。
 		fields.Error = "HTTP request context ended"
 	}
-	// 5. 外层 finished 表示响应路径结束，状态码不证明客户端已完整收到正文，也不证明内部工作结束。
+	// 5. Span 按外层真实响应结束时刻收尾，保存同一状态码及受控失败说明，不等待内部业务。
+	// 在同步结束日志之前结束 Span，避免把输出时间算入 HTTP 执行区间；标识仍可从 Context 读取。
+	state.span.EndHTTP(status, fields.Error, finishedAt)
+	// 6. 外层 finished 表示响应路径结束，状态码不证明客户端已完整收到正文，也不证明内部工作结束。
 	// 日志器统一兜底编码及写入故障，已经选定的 HTTP 响应不受日志输出结果影响。
 	state.log.Info(state.logContext, "HTTP response finished", fields)
 }

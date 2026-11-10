@@ -82,7 +82,7 @@ Logger 的启动装配中，`bootstrap.Init` 只调用 `logger.Init`，传入 `l
 
 第三方 Client 的启动装配中，`bootstrap.Init` 只调用根 `thirdparty.Init(configDir, environment)` 并处理资源清理，其 `configDir` 为 `integrations/thirdparty` 叶子目录，环境仅支持 `dev/test/prod`。根层选择 `<environment>/ai` 后交给 `ai.NewClients`，AI 层将 `llm` 目录交给 `llm.NewClients`，由 LLM 层读取 `qwen.yml`、`minimax.yml` 并调用各自的 Loader、构造方法。根层不维护具体供应商文件名，子层不设置全局 `Init` 或 `Current`。注册配置缺失或非法时停止启动，不回退其他环境，也不在启动时调用模型；其他尚未注册的 SDK 占位文件不要求提前提供配置。
 
-`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。装配对象在启动时创建完整 Gin Engine、各个等待包装器，以及 TraceId、HTTP 日志外层；每次请求依次经过 TraceId、HTTP 日志外层、选定的等待包装器，再进入 Gin，不重新创建路由或中间件。HTTP 日志外层使用已经初始化的共享 Logger，Gin 在匹配路由后提供模板；元数据通过每请求的受锁状态传递，不跨 goroutine 读取 Gin Context。`routers.New(authenticator)` 接收已装配的认证器，只返回 Gin Engine；其模板绑定中间件在没有外层日志状态时直接透传，不隐式依赖 Logger 初始化。独立使用时，调用方按需要在初始化 Logger 后包装 `middleware.TraceID(middleware.HTTPLogging(engine))`；响应等待与收尾则另行装配。生产入口由 `NewHTTPHandler` 完成全部装配。配置和执行边界见第 5.4 节，日志细节见[HTTP 请求与响应日志](application-log.md#http-请求与响应日志)。
+`cmd/web` 将 `routers.NewHTTPHandler` 返回的装配对象设置为 `http.Server.Handler`，并保存其 `Shutdown` 收尾入口。每次请求依次经过 TraceId、HTTP 日志与 Span 外层、选定的等待包装器，再进入 Gin，不重新创建路由或中间件。TraceId 中间件先提取合法标准上下文；HTTPLogging 使用共享 Logger 和 Tracer 创建唯一的 SERVER Span，将派生 Context 传给日志及下游。Gin 在匹配后提供模板，Span 名称与日志 operation 通过同一个受锁状态冻结，不跨 goroutine 读取 Gin Context。`routers.New(authenticator)` 仍只返回 Gin Engine，没有外层状态时模板绑定直接透传。独立使用完整入口必须先初始化 Logger 和 tracing，再包装 `middleware.TraceID(middleware.HTTPLogging(engine))`；响应等待与收尾另行装配。配置和执行边界见第 5.4 节，日志与 Span 细节见[HTTP 请求与响应日志](application-log.md#http-请求与响应日志)。
 
 ### 2.2 共享对象分别由谁持有
 
@@ -108,7 +108,7 @@ MySQL 组件为每个启用的命名连接创建独立连接池，完成连通�
 
 `logger.Current()` 返回已经发布的 Logger 指针，初始化前调用会 panic，重复初始化返回错误。包级 `logger.Sync()` 未初始化时直接返回 nil，因此进程入口可以在初始化前登记最终同步；Logger 没有关闭 stdout 或替换全局标准库日志的隐式行为。
 
-`tracing.Current()` 返回 Logger 初始化之后创建的共享 Tracer。Resource 复用 Logger 配置副本中的服务名、实例标识和已有部署环境，初始化细节封装在 `internal/tracing`；未设置全局 Provider，未配置导出器，也未接入实际 Span 边界。包级 `tracing.Shutdown(ctx)` 由进程入口在业务排空后、最终日志同步前调用，具体约定见[追踪初始化](application-log.md#tracing-初始化与共享实例)。
+`tracing.Current()` 返回 Logger 初始化之后创建的共享 Tracer。Resource 复用服务名、实例标识和已有部署环境，初始化细节封装在 `internal/tracing`，未设置全局 Provider 或导出器。HTTP 公共入口已接入 SERVER Span，其余四类边界尚未建立各自的 Span。包级 `tracing.Shutdown(ctx)` 由进程入口在业务排空后、最终日志同步前调用，具体约定见[追踪初始化](application-log.md#tracing-初始化与共享实例)。
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
@@ -137,13 +137,13 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 
 ### 2.4 TraceId 的生成、保存与透传
 
-1. **入站优先沿用 Context 中已确定的标识，再处理 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行，通过 `tracing.TraceID(ctx)` 读取已有标识；没有值时读取自定义请求头，头名由 `tracing.TraceIDHeaderName` 声明。候选值通过 `tracing.IsValidTraceID()` 检查是否恰好为 32 个小写十六进制字符且不全为零。合法值原样沿用；缺失、为空或非法时，通过 `tracing.NewTraceID()` 生成 16 字节密码学随机数并编码，排除全零值后取得新的合法标识。格式非法不拒绝业务请求，也不修剪、转换或回显原值。生成失败返回统一 HTTP 500，不继续业务处理。标准 `traceparent` 提取、注入及 Span 创建的公共能力已实现，实际 HTTP 及业务链路尚未接入。
+1. **入站优先提取标准上下文，再兼容 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 先通过 `tracing.Extract` 提取合法 `traceparent`、`tracestate`；无合法标准头时保留原 Context，再由 `tracing.TraceID(ctx)` 读取已有值，无值才读取旧头。候选 TraceId 严格校验 32 个小写十六进制字符且非全零，缺失或非法时通过 `tracing.NewTraceID()` 生成；格式问题不拒绝业务，也不回显非法原值。随后 HTTPLogging 创建 SERVER Span，有效标准上下文成为远端父节点；没有父节点时，共享 SDK IDGenerator 沿用已确定的合法 TraceId 创建本地根节点，并生成独立 SpanId。生成失败的既有 HTTP 500 路径不进入后续业务。公司出站标准头注入及其他四类 Span 边界尚未接入。
 2. **Context 存储与读取统一由 tracing 提供。** `tracing.WithTraceID(ctx, id)` 使用私有类型的 key 保存已经确定的合法值，中间件将新 Context 放回 Request；后续统一通过 `tracing.TraceID(ctx)` 读取。读取优先有效标准 SpanContext，缺失时使用私有 key 的值，两者都没有或 Context 为 nil 时返回空字符串。存储不隐式校验或生成标识，其他入口应先通过 `NewTraceID` 生成或 `IsValidTraceID` 校验；不创建 Span 或伪造 SpanId。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
 3. **成功确定 TraceId 后，通过同名响应头返回。** 响应头同样使用 `tracing.TraceID` 从派生 Context 读取，避免标准节点与兼容值冲突时输出两个标识。该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
 4. **Controller、Service 和 Client 显式传递执行 Context。** 所有 Service 公开业务方法统一以 `ctx context.Context` 为首参，Controller 使用内部 `ctx.Request.Context()`，Service 入口建立自己的日志操作作用域，再将派生 Context 继续传给其他 Service、具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个执行 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
-现有 `context.WithoutCancel` 保留 Context 值，因此 HTTP 等待超时或客户端断开后继续执行的内部工作仍使用相同 TraceId。HTTP 模板绑定以 Gin 当前的 Request Context 建立操作作用域，保留这层取消隔离；不能拿外层可取消 Context 替换内部 Context。公共 Logger 已完成启动初始化，HTTP 请求与响应日志自动读取 TraceId；其他业务日志尚未统一迁移，也未创建或导出 Span。日志字段及操作作用域见[请求日志规范](application-log.md)。
+现有 `context.WithoutCancel` 保留 TraceId 和标准 SpanContext，因此 HTTP 超时或客户端断开后，继续执行的内部日志仍能关联当前链路和 HTTP SpanId。HTTP Span 按外层真实响应结束时刻结束，晚到业务不改写它的结果；后续业务层需要独立区间时再建立子 Span。HTTP 模板绑定以 Gin 当前 Context 建立作用域，不能替换成外层可取消 Context。共享 Logger 自动读取两类标识，但其他日志尚未全部迁移，当前也未配置 Span 导出器。日志字段及操作作用域见[请求日志规范](application-log.md)。
 
 ## 3. 跟随一次 createUser 请求
 
@@ -185,7 +185,7 @@ userProfile.POST("/createUser", r.createUserValidator.CreateUser)
 
 一次请求到来后，Gin 按 HTTP 方法和路径选择已注册的处理链。公共中间件围绕后续处理执行：
 
-- `HTTPRouteLogging` 读取匹配后的 `FullPath()`，通过 `logger.WithHTTPOperation` 建立 `http_entry` 作用域，并让请求专属状态输出一次 `started`。外层 `HTTPLogging` 在对外响应结束时输出一次 `finished`，附实际选定的状态和外层耗时；原有 `gin.Logger()` 及响应等待层旧摘要已移除，避免重复记录或把内部缓冲状态当作对外状态。
+- `HTTPRouteLogging` 读取匹配后的 `FullPath()`，建立 `http_entry` 作用域，并在同一个状态锁下固定日志 operation 和 HTTP Span 名称，再输出一次 `started`。外层 HTTPLogging 按真实响应结束时刻保存 Span 状态并结束，随后输出 `finished`；同步日志时间不计入 Span 结束时刻，超时后的内部结果不覆盖对外响应。
 - `gin.CustomRecovery` 捕获当前请求处理链中的未处理 `panic`，框架错误的返回方式见第 5 节。
 - `AuthenticateIfPresent` 只在完全没有 Authorization 头时匿名放行；头显式为空、重复或格式错误时返回 400，凭证无效、过期或方案不支持时返回 401，技术故障返回 500。携带有效凭证时先保存 Principal，再进入 Validator；失败时不降级匿名，公开接口也遵守这一规则。
 

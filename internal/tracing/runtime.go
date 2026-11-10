@@ -24,7 +24,7 @@ var shared struct {
 // Init 构造 SDK Provider 并发布共享 Tracer，必须在接收请求或启动业务协程之前调用。
 // serviceName、instanceID 由装配方从已初始化 Logger 的配置副本传入，deployment 复用已有环境配置。
 // 不另读 YAML、不生成另一份实例标识，也不设置 OpenTelemetry 全局 Provider 或传播器。
-// 当前不注册处理器或导出器；实际边界尚未接入，初始化本身不会产生、打印或上报 Span。
+// 当前不注册处理器或导出器；初始化本身不会产生、打印或上报 Span。
 func Init(serviceName, instanceID string, deployment env.Config) error {
 	// 1. 串行构造并发布，避免重复创建 Provider，或替换运行中的共享实例。
 	shared.Lock()
@@ -58,6 +58,9 @@ func Init(serviceName, instanceID string, deployment env.Config) error {
 	// 当前没有导出器或后台批处理协程；SDK 原始 panic 采集关闭，由边界 End 记录受控说明。
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(identity),
+		// 4.1. 根 Span 沿用入口已经确定的合法 TraceId，子节点仍由 SDK 管理父子关系。
+		// 不通过伪造上游 SpanId 实现兼容，也不修改上游的采样或随机性标志。
+		sdktrace.WithIDGenerator(contextIDGenerator{}),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 		sdktrace.WithoutPanicRecording(),
 	)

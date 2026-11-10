@@ -30,7 +30,7 @@ TraceId 统一采用 W3C Trace Context 的标识格式：128 位，即 16 字节
 
 TraceId 的生成、校验、存储与标准 Span 追踪统一位于 [internal/tracing](../../internal/tracing/)。所有读取使用 `tracing.TraceID(ctx)`：有效标准 SpanContext 优先，即使未采样也读取其 TraceId；没有有效标准节点时读取 `tracing.WithTraceID(ctx, id)` 保存的值；两者都没有或 Context 为 nil 时返回空字符串。读取不生成标识、不创建 Span，也不修改父 Context。
 
-入站中间件先通过统一入口读取 Context 中已有的标识；没有值时，才按照下表处理自定义请求头。响应头、Logger 及公司 HTTP Client 也通过同一入口读取，避免上下文存在标准 Span 时仍使用旧头中的另一个值。
+入站中间件先通过 `tracing.Extract` 提取合法 `traceparent`、`tracestate`，再通过统一入口读取标识；合法标准上下文优先于旧 `TraceId` 请求头，没有合法标准头时保留原 Context。若 Context 仍无标识，才按照下表处理自定义请求头。响应头、Logger 及公司 HTTP Client 使用同一读取入口，避免出现两个链路标识。
 
 | 入站 `TraceId` 请求头 | 当前处理规则 |
 | --- | --- |
@@ -40,7 +40,7 @@ TraceId 的生成、校验、存储与标准 Span 追踪统一位于 [internal/t
 
 生成失败继续返回统一 HTTP 500，不进入业务处理。成功确定标识后，响应头 `TraceId`、Request Context、日志 `trace_id` 及公司 HTTP 请求头使用同一个值。`tracing.WithTraceID` 只负责保存标准上下文缺失时的兼容值，调用方必须通过 `NewTraceID` 取得标识，或先用 `IsValidTraceID` 校验外来值；已有标准 SpanContext 不会被该存储方法覆盖，也不会伪造 SpanId。后台任务同样遵守这个约定，自定义 HTTP 头名统一由 `tracing.TraceIDHeaderName` 声明。
 
-生产 HTTP 链路仍使用自定义 `TraceId` 请求头，尚未接入标准 `traceparent` 的提取、注入和 Span 创建。公共 tracing 包虽已提供标准上下文方法，但不会自动改变现有请求处理。这里满足的是标识格式要求，完整链路接入及旧头兼容规则见下文。
+生产 HTTP 入口已接入标准上下文提取和 HTTP Span 创建，同名 `TraceId` 响应头继续兼容既有调用方。有效上游标准上下文建立真正的远端父子关系；只有合法旧 TraceId 时，本地创建同一 TraceId 的根 Span，不伪造上游父 Span。公司出站标准头注入及 Controller、Service、Client 各自的 Span 创建仍待后续接入。
 
 ## operation 自动识别与 Context 作用域
 
@@ -101,7 +101,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 ## Span 与调用链规范
 
-本节约定链路追踪的固定边界。`internal/tracing` 已提供公共 Span 与标准上下文封装，并在进程启动时构造 SDK Provider、发布共享 Tracer；HTTP 中间件、Controller、Service 和 Client 尚未接入 Span 创建。TraceId 工具及统一读取入口已被现有流程使用，生产流程尚未采集或导出业务 Span。`logger.WithCurrentOperation` 继续只管理操作身份，当前也不能查询调用树。
+本节约定链路追踪的固定边界。`internal/tracing` 在进程启动时发布共享 Tracer，生产 HTTP 公共入口已为每个请求创建一个 SERVER Span；Controller、Service 和 Client 尚未创建各自的 Span，当前日志沿用传入 Context 中的 HTTP SpanId，同时保留各层 operation。`logger.WithCurrentOperation` 继续只管理操作身份。当前未配置导出器，仍不能通过集中查询系统展示调用树。
 
 日志时间线按时间展示发生了什么，调用树通过 Span 的父子关系展示谁调用了谁，耗时瀑布图结合 Span 的开始、结束时间展示串行、并行及等待过程。Span 表示一次具体操作的执行区间，可以关联多条日志；`started`、`finished` 日志本身不是 Span，也不通过配对日志来推导 Span。
 
@@ -159,7 +159,7 @@ Span 与 SpanContext 复用 OpenTelemetry 标准 API，不在业务层另造数�
 1. **上下层沿用 TraceId，分别持有自己的当前 Span。** 进入允许的边界时，公共封装基于传入 Context 创建子 Span，并返回派生 Context。向下调用时传入该 Context；辅助方法直接沿用，不创建新 Span。根 Span 只在没有上游 Span 时产生，HTTP 入口已有远端父 Span 时继续上游链路。
 2. **下层返回不改变上层身份。** 子 Context 不修改父 Context；下层结束自己的 Span 后，上层继续使用原有 Context 中的 Span 和 operation，无须恢复。同一 Context 传给并发子调用时，各子调用分别创建自己的 Span，不共享可变的请求状态。
 3. **跨服务传递标准追踪上下文。** 公司 HTTP Client 在发送前注入 W3C `traceparent` 等标准追踪头，被调用服务提取后创建自己的服务端 Span。调用方 Client Span 与被调用方 Server Span 是两个不同的执行节点，通过父子关系连接；仅透传相同的自定义 `TraceId` 不能还原调用树。[W3C Trace Context](https://www.w3.org/TR/trace-context/)
-4. **标准上下文接入与旧头兼容分步处理。** 当前自定义 `TraceId` 已按上文收紧格式，非法值重新生成；公共 tracing 包已提供标准 `traceparent` 的提取、注入方法，但入站与出站请求尚未调用。后续接入标准上下文时，优先沿用合法 `traceparent`，并以其中的 TraceId 统一响应头、日志、Span 及公司 HTTP 透传；与旧头冲突时以合法标准头为准。缺少合法标准上下文、只有合法旧 `TraceId` 时，需要兼容适配才能保留该标识，不能伪造上游 SpanId，因而也不能仅凭旧头恢复远端父子关系。这些优先级属于项目兼容约定。
+4. **标准上下文与旧头使用同一个链路标识。** 入站已调用标准提取方法，合法 `traceparent` 优先；与旧头冲突时，以其中的 TraceId 统一响应头、日志、Span 及公司 HTTP 的既有 TraceId 透传。没有合法标准上下文时，使用 Context 已有标识或校验旧头，缺失、非法时生成；共享 SDK 的私有 IDGenerator 在创建根 Span 时沿用该合法值，并独立生成 SpanId，不伪造远端父节点。仅凭旧头仍无法恢复上游父子关系。出站 `traceparent` 注入尚未接入，这些优先级属于项目兼容约定。
 5. **第三方默认只做本地关联。** SDK Client Span 与本次请求使用相同 TraceId；不因为接入 Span 就默认向第三方供应商发送内部追踪头，对方内部节点也不在当前可观测范围内。
 6. **所有退出路径可靠结束，保持业务语义。** 正常返回、提前失败及 panic 退出均须由边界封装结束本次 Span；不吞掉 panic、不改变错误链、超时、重试或响应行为。`WithCurrentOperation` 继续只管理操作身份，不能单靠现有的入口调用自动取得方法退出时机。
 7. **各 Span 按自己的实际执行区间结束。** 当前 HTTP 等待层可能先返回 503，内部业务仍继续执行。HTTP Span 在实际响应处理结束时结束，Controller、Service 和 Client Span 在各自执行结束时结束，允许子 Span 晚于父 Span 结束；不能为了使图形嵌套而提前结束业务 Span，也不能用后续业务结果改写已结束的 HTTP 结果。
@@ -178,7 +178,7 @@ HTTP 入口 Span
 
 Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通道。只增加日志字段不会自动获得调用树；后续仍需由追踪基础设施导出 Span，并由集中查询系统保存和展示。本节先固定采集边界，不代表已经选定或部署收集服务、存储及前端。
 
-### 公共 tracing 包（已初始化，业务 Span 尚未接入）
+### 公共 tracing 包（已初始化，HTTP 入口已接入）
 
 公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。独立构造方法 `New(provider trace.TracerProvider)` 接收外部 Provider，其关闭责任仍属于调用方。进程启动通过 `Init(serviceName, instanceID, deployment)` 在包内创建真实 SDK Provider，并通过 `tracing.Current()` 获取共享 Tracer，包级 `Shutdown(ctx)` 管理该 Provider。两种方式均不设置 OpenTelemetry 全局 Provider 或传播器，也不启动导出器；具体启动和退出约定见[tracing 初始化与共享实例](#tracing-初始化与共享实例)。
 
@@ -194,11 +194,11 @@ Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通�
 
 operation 参数供后续统一入口和公共调用层传递识别结果，不表示业务代码需要手写名称。当前 Logger 的操作解析仍保留原位置，tracing 不依赖 Logger、不复制运行时解析逻辑；后续接入时统一取得元信息再调用对应创建入口，避免 Logger 与 tracing 循环依赖。`StartHTTP` 创建的句柄支持 `SetHTTPRoute` 更新同一 Span 的名称，HTTP 路由层负责沿用已有模板冻结规则；该方法对其他边界不生效。
 
-创建后由边界直接使用 `defer span.End()` 收尾。`span.Fail(description)` 仅设置错误状态和受控说明，不记录原始 Go error，也不提前结束；正常结束不强制写入 OK，保留已经标记的失败。`End` 的重复调用遵循 SDK 幂等约定；直接作为 defer 执行时，panic 只写入固定的异常退出说明，结束后重新抛出同一值，不记录原始 panic 内容。若通过额外闭包间接调用 `End`，异常标记需由该边界负责；本包不根据业务返回值自动推断错误。
+创建后由边界直接使用 `defer span.End()` 收尾。`span.Fail(description)` 仅设置错误状态和受控说明，不记录原始 Go error，也不提前结束；正常结束不强制写入 OK，保留已经标记的失败。`End` 的重复调用遵循 SDK 幂等约定；直接作为 defer 执行时，panic 只写入固定的异常退出说明，结束后重新抛出同一值，不记录原始 panic 内容。HTTP 外层使用受限的 `EndHTTP(statusCode, failureDescription, finishedAt)` 保存真实结果及结束时间，再写结束日志；直接 defer 的 `End` 继续保障意外退出。其他通过额外闭包间接调用 `End` 的边界仍须自行标记异常，本包不根据业务返回值自动推断错误。
 
-`Extract(ctx, carrier)`、`Inject(ctx, carrier)` 使用标准 `propagation.TraceContext` 处理 W3C `traceparent`、`tracestate`，不默认传播 Baggage。提取合法远端上下文只派生 Context、不创建 Span；无合法头时沿用传入 Context。注入由公司 HTTP 公共请求层在发送前显式触发，载体须可写且没有其他请求遗留的追踪头，不自动影响任何现有 HTTP 或 SDK 请求。
+`Extract(ctx, carrier)`、`Inject(ctx, carrier)` 使用标准 `propagation.TraceContext` 处理 W3C `traceparent`、`tracestate`，不默认传播 Baggage。入站 `TraceID` 中间件已调用提取方法，合法远端上下文只派生 Context、不创建 Span；无合法头时沿用传入 Context。出站注入仍须后续在公司 HTTP 公共请求层接入，载体须可写且没有其他请求遗留的追踪头，不自动作用于第三方 SDK。
 
-`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。将仅有旧 `TraceId` 的 Context 交给 SDK 创建根 Span 时，仍需后续兼容适配，不能认为保存私有 key 就已使 SDK 沿用该 TraceId。进程级 Provider 已完成装配，各实际 Span 边界仍留待后续接入。
+`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。共享 `Init` 已配置根标识兼容桥，独立 `New(provider)` 仍由调用方负责 Provider 策略，不能只保存私有 key 就假定任意外部 Provider 都会沿用该 TraceId。Controller、Service 和 Client 的独立 Span 仍待后续接入。
 
 ## Service 上下文与业务流程日志
 
@@ -288,20 +288,104 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 })
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略；同时自动填充 `trace_id`、`span_id`，不存在时按上述规则省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client、Qwen 与 MiniMax 文本调用、用户资料六个用例的 Controller 和 Service 日志，以及头像生成 Validator 的未知校验故障日志已统一使用共享 Logger；其他 Validator、第三方 SDK、业务组件、数据库与其他异常日志尚未全部迁移。当前实际调用尚未创建 Span，因此正常生产请求仍只有 TraceId，不会因新增字段自动出现 SpanId；本次未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法自动读取 `component`、`operation`、`trace_id`、`span_id`，缺失时按上述规则省略。生产 HTTP 入口现已创建 Span，请求与响应及其下游沿用 Context 的日志自动携带同一 TraceId 和当前 HTTP SpanId；各业务层尚未建立独立 Span。公司 HTTP Client、Qwen 与 MiniMax 文本调用、用户资料六个用例的 Controller 和 Service，以及头像生成 Validator 的未知校验故障日志已统一使用共享 Logger；其他 Validator、SDK、数据库与其他异常日志尚未全部迁移，本次未新增测试用例。
 
 ## HTTP 请求与响应日志
 
-生产入口按 `TraceID → HTTPLogging → 响应等待包装器 → Gin` 装配。`HTTPLogging` 使用已初始化的共享 Logger，为每个请求保存独立的开始时间和路由元数据，观察外层实际选定的响应；Gin 的 `HTTPRouteLogging` 在路由匹配后读取 `FullPath()`，向本次请求的状态提供注册模板。
+生产入口按 `TraceID → HTTPLogging → 响应等待包装器 → Gin` 装配。`TraceID` 先提取标准父上下文并确定兼容标识；`HTTPLogging` 使用共享 Logger 与 Tracer，在进入等待层前创建唯一的 HTTP SERVER Span，并将派生 Context 同时用于本次日志状态和下游 Request。Gin 的 `HTTPRouteLogging` 在路由匹配后读取 `FullPath()`，向同一个请求状态提供注册模板，不再创建另一套 Span 或路由状态。
+
+### 一次请求的完整流程（当前实现）
+
+进程启动时创建的是可复用的 TracerProvider 和 Tracer；每次 HTTP 请求进入时才确定本次链路标识，并创建独立的 HTTP Span。**当前本服务为每次请求创建一个 HTTP Span，Controller、Service、Client 尚未创建各自的 Span，它们的日志暂时都关联这个 HTTP Span。**
+
+以下使用简写说明标识，真实 TraceId 为 32 个小写十六进制字符，SpanId 为 16 个；`T`、`P`、`H` 不能直接作为实际请求头值：
+
+| 简写 | 含义 |
+| --- | --- |
+| `T` | 整条链路的 TraceId |
+| `P` | 上游调用方的 SpanId，可能不存在 |
+| `H` | 本服务为这次 HTTP 请求新创建的 SpanId |
+
+```mermaid
+flowchart TD
+    A["HTTP 请求进入"] --> B["① TraceID 中间件<br/>提取标准追踪头，确定 TraceId T<br/>保存上游父节点 P（如果有）"]
+    B --> C["② HTTPLogging<br/>创建本服务的 HTTP Span H<br/>TraceId=T，父节点=P 或无"]
+    C --> D["③ 将携带 T、H 的 Context<br/>传给下游"]
+    D --> W["响应等待层"]
+    W -->|"启动内部处理"| E["④ Gin 匹配路由<br/>确定 Span 名称和日志 operation<br/>打印 started 日志"]
+    E --> F["⑤ Controller → Service → Client<br/>当前都沿用 HTTP Span H"]
+    F -->|"等待期限内完成"| G["⑥ 外层响应处理结束"]
+    W -->|"等待超时，选定 503"| G
+    G --> H["⑦ 保存真实状态和结束时刻<br/>结束 HTTP Span H<br/>打印 finished 日志"]
+```
+
+图中展示可以正常建立标识的请求；随机源故障导致 TraceId 生成失败时，仍按既有规则直接返回 500，不进入后续 Span 创建。路由未匹配或响应结束前尚未取得模板的名称与日志补写规则见下文。
+
+**① 确定链路归属，尚未创建本地 HTTP Span。** [TraceID 中间件](../../app/http/middleware/trace_id.go) 先提取标准头，确定本次请求属于哪个 Trace；合法 `traceparent` 同时提供调用方 SpanId，旧 `TraceId` 头只有链路标识，无法提供远端父节点。普通外部请求主要有以下三种情况；Context 已有合法标识时按前文优先级沿用。
+
+| 请求携带的信息 | 确定的 TraceId | 是否知道远端父节点 |
+| --- | --- | --- |
+| 合法 `traceparent`，包含 `T` 和 `P` | 沿用 `T` | 知道，是 `P` |
+| 只有合法旧 `TraceId=T` | 沿用 `T` | 不知道 |
+| 没有可用标识 | 生成新的 `T` | 没有 |
+
+两个头冲突时，合法标准上下文优先。确定后保存到 Request Context，并设置响应头 `TraceId=T`。这里准备的是链路标识和父上下文，还没有创建本服务的 HTTP 执行节点。
+
+**② 创建本服务的 HTTP Span。** [HTTPLogging](../../app/http/middleware/http_logging.go) 调用 `StartHTTP` 创建 `H`：有上游 `P` 时，`H` 是 `P` 的子节点；没有父节点时，`H` 是本地根节点。两种情况均使用已经确定的 `T`，本地 `H` 每次独立生成，不直接沿用上游的 SpanId。共享 Provider 的兼容桥保证合法旧 TraceId 不会在创建根 Span 时被替换成另一个值。
+
+**③ 通过 Context 逐层传递。** Span 创建后的派生 Context 携带 `TraceId=T` 和当前节点 `H`，传给响应等待层、Gin、Controller、Service、Client。Logger 从调用方传入的 Context 自动读取标识；共享 Logger 本身不保存当前请求身份，因此并发请求可以分别携带 `(T1, H1)`、`(T2, H2)`。Context 在进程内传递；跨进程需要将追踪信息编码到请求头，而不是传递 Context 对象本身。
+
+**④ 路由匹配后确定名称。** HTTP Span 创建时通常还不知道注册模板，名称暂为 `POST <unresolved>`。Gin 匹配头像接口后，更新为 `POST /api/v1/user/userProfile/generateUserAvatar`，同步确定 HTTP 日志的 operation 并打印 `started`。因此 Span 早于开始日志启动，不能把 `started` 日志的打印时刻当成 Span 创建时刻。
+
+**⑤ 当前只切换 operation，不新增业务 Span。** 以头像生成流程为例，下表 operation 为省略命名空间的阅读简写，实际格式仍遵循前文规范：
+
+| 写日志的位置 | trace_id | span_id | operation 简写 |
+| --- | --- | --- | --- |
+| HTTP 请求开始 | `T` | `H` | `POST .../generateUserAvatar` |
+| Controller | `T` | `H` | `UserProfileController.GenerateUserAvatar` |
+| Service | `T` | `H` | `UserProfileService.GenerateUserAvatar` |
+| Qwen Client | `T` | `H` | `QwenClient.GenerateText` |
+| 公司图片 Client | `T` | `H` | `ImageGenClient.GenerateImage` |
+| HTTP 响应结束 | `T` | `H` | `POST .../generateUserAvatar` |
+
+operation 说明日志来自哪个操作，SpanId 说明关联哪一次执行。当前各方法使用的 `WithCurrentOperation` 只更新操作身份，所以这些日志的 operation 不同，SpanId 仍相同。后续接入 Controller、Service、Client 的边界封装后，才会分别建立各自的子 Span。
+
+**⑥⑦ 对外响应结束，结束 HTTP Span 后写结束日志。** 外层记录实际选定的状态、结束时刻及受控故障，结束 `H`，随后打印 `finished`。结束 Span 不会删除 Context 中的标识，因此结束日志仍能读取 `T`、`H`。5xx、响应写入失败及异常终止按规则标记错误，普通 4xx 不会仅凭状态码标记为服务端 Span 故障。
+
+### 等待超时后的 Span 与日志
+
+HTTP Span 结束表示本服务的对外响应处理结束，不表示内部业务已经结束。下面假设某接口的等待预算为 3 秒，仅用于解释时间顺序；实际等待预算使用各路由配置，头像接口不是本例中的 3 秒。
+
+```mermaid
+sequenceDiagram
+    participant C as 调用方
+    participant H as HTTP入口
+    participant B as 内部业务
+    C->>H: 发起请求
+    Note over H: 创建 HTTP Span H
+    H->>B: 传入 Context(T,H)
+    Note over H,B: 等待预算结束，业务尚未完成
+    H-->>C: 选定 503 响应，携带 TraceId=T
+    Note over H: 结束 H，打印 finished
+    B->>B: 继续执行，日志仍携带 T、H
+```
+
+响应等待层隔离业务取消并保留 Context 值，超时不会自动取消内部工作。当前业务层尚无独立 Span，所以晚到日志仍关联已结束的 `H`；这些日志不会使 `H` 重新开始、延长其区间或改写已经选定的 503。响应写出也不保证调用方已经完整接收正文。
+
+当前 stdout JSON 日志能够显示上述标识，但没有配置 SpanProcessor 或 Exporter；完整 Span 数据未被集中保存，前端调用树也尚未具备。创建 Span、关联日志、导出和查询是分别需要接入的能力。
+
+### 生命周期日志与响应边界
 
 | 日志边界 | event | operation 来源 | 结果字段 |
 | --- | --- | --- | --- |
 | 请求开始 | `started` | 模板首次可知时确定 `{HTTP 方法} {注册路由模板}`；在认证、Validator 和 Controller 执行前记录 | 不预填 HTTP 状态或最终耗时 |
 | 对外响应结束 | `finished` | 复用本次请求已确定的 HTTP 操作标识 | 记录从 HTTP 外层接管请求起计算的 `duration_ms`、实际已选定的 `status_code`，以及可确认的写入、取消或异常终止信息 |
 
-两条日志均使用 `component=http_entry`，自动携带同一 TraceId 和进程公共信息。`started` 的写出时刻是模板首次可知时，计时起点仍由外层在请求进入时保存。HTTP 入口不默认记录原始 URL、Query、请求正文、响应正文或认证头。
+两条日志均使用 `component=http_entry`，自动携带同一 TraceId、HTTP SpanId 和进程公共信息。Span 在外层请求进入时开始；`started` 日志的写出时刻仍是模板首次可知时，日志计时起点继续由外层保存。HTTP 入口不默认记录原始 URL、Query、请求正文、响应正文或认证头。
 
-真正执行 `NoRoute` 时，Gin 已确认没有匹配模板，使用 `<unmatched>`。若外层先结束、停机拒绝请求，或者 Gin 自动重定向绕过全局中间件，则尚未取得模板，使用 `<unresolved>`；此时按顺序补出 `started` 和 `finished`，冻结同一个标识，晚到的内部处理不能改写已记录的 HTTP 操作身份。未知与尚未解析分别表达，不把所有缺少模板的情况都称为 404。
+真正执行 `NoRoute` 时使用 `<unmatched>`；外层先结束、停机拒绝或自动重定向尚未取得模板时使用 `<unresolved>`，并按顺序补出 `started`、`finished`。日志 operation 与 Span 名称在同一个状态锁下首次固定，晚到路由不能改写。Span 保存 `http.request.method`，仅实际匹配的注册模板写入 `http.route`；两种占位值只用于名称，不当作真实路由。
+
+外层响应路径返回时立即保存结束时刻，按原有规则确定真实状态及受控故障，再通过 `EndHTTP` 记录 `http.response.status_code` 并结束 Span，最后写 `finished`。结束时间不包含等候路由元信息锁、补写开始日志或同步输出结束日志的时间。只收到实际状态时才写状态属性；5xx 标记 Error，单纯 4xx 保持 Unset，写入失败、Context 结束及异常终止使用固定说明标记 Error，不记录原始异常。正常成功不强制写 OK。规则参考 [OpenTelemetry HTTP Span 状态规范](https://opentelemetry.io/docs/specs/semconv/http/http-spans/#status)。
 
 路由元数据只通过本次请求的受锁状态共享，跨 goroutine 不读取或保存 Gin Context。Gin 为下游建立 HTTP 操作作用域时，以其当前 `Request.Context()` 为基础，保留响应等待层已经应用的取消隔离、TraceId 和其他值；后续方法作用域可以在自己的派生 Context 中覆盖操作身份，外层响应日志仍使用自己的 HTTP 作用域。
 
@@ -309,7 +393,7 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 
 原有 `gin.Logger()` 和响应等待层的对外摘要、重复写入故障输出已移除，请求与响应由统一入口各记录一次。现有 Recovery、内部逃逸 panic 及其他业务日志继续按其原有边界处理，本阶段不宣称全部日志来源已经完成关联。HTTP 日志直接调用共享 Logger，输出故障由 Logger 内部统一使用 stderr 兜底，HTTP 层不重复报告，也不替换业务响应。
 
-独立调用 `routers.New(authenticator)` 只会安装 Gin 的模板绑定中间件；没有外层 HTTP 日志状态时直接透传，不隐式取得共享 Logger。生产 `NewHTTPHandler` 负责外层装配，要求先完成启动初始化；独立使用完整 HTTP 日志时，也应在初始化 Logger 后按上述顺序包装。
+独立调用 `routers.New(authenticator)` 只会安装 Gin 的模板绑定中间件；没有外层 HTTP 日志状态时直接透传，不隐式取得共享 Logger 或 Tracer。生产 `NewHTTPHandler` 负责外层装配；独立使用完整入口时须先初始化 Logger 和 tracing，再按上述顺序包装。TraceId 生成失败的既有 500 路径在进入 HTTPLogging 前返回，无法创建 HTTP Span，仍保留原有失败语义。
 
 ## 公司 HTTP Client 调用日志
 
@@ -387,7 +471,9 @@ Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取
 
 `Init` 校验这些显式元信息后创建不可变 Resource，再创建 SDK TracerProvider 并复用已有 `New(provider)` 完成封装。采样固定为 `ParentBased(AlwaysSample)`：根链路全量采样，子节点尊重父节点决定；不在本步增加采样配置。SDK 自动记录原始 panic 的行为关闭，沿用边界 `End` 的固定说明和原值传播。Provider 和 Resource 的标准行为参考 [OpenTelemetry SDK API](https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace)。
 
-当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 输出到 stdout、文件或远端服务；SDK 初始化本身不会创建 Span。实际五类边界尚未接入，因此普通请求仍只有既有 TraceId 日志，不能据此查看调用树或认定数据已上报。
+共享 Provider 通过私有 `contextIDGenerator` 兼容根 TraceId：只有缺少有效父节点时才读取已校验的兼容值，没有合法值则生成随机 TraceId；根与子 Span 的 SpanId 始终独立随机生成并排除全零。有效上游父链路由 SDK 原样继承，不伪造父 Span 或将外来 TraceId 声明为必然随机，独立 `New(provider)` 的策略不变。
+
+当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 输出到 stdout、文件或远端服务。HTTP 入口已创建 Span，JSON 日志可看到其标识；初始化本身不创建 Span，Controller、Service、Client 尚未建立独立节点，也不能据此查看集中调用树或认定数据已上报。
 
 全部构造成功后，`Init` 在锁保护下一次性发布共享 Tracer 和本包拥有的 Provider；失败不发布部分实例。`tracing.Current()` 初始化前调用会 panic，重复成功初始化返回错误；关闭后不清空指针，也不支持运行中重建。包级 `tracing.Shutdown(ctx)` 未初始化时安全返回 nil，只关闭本包 `Init` 创建的 Provider，不接管独立 `New` 注入的外部 Provider。
 

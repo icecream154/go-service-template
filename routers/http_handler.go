@@ -98,7 +98,7 @@ func NewHTTPHandler() (*HTTPHandler, error) {
 		handler.timeouts = append(handler.timeouts, timeout)
 	}
 	// 6. 按请求执行顺序装配最外层入口：先确定 TraceId，再创建 HTTP 日志状态，最后选择响应等待入口。
-	// HTTPLogging 在构造时取得共享 Logger；因此生产入口必须在应用 Logger 初始化完成后装配。
+	// HTTPLogging 在构造时取得共享 Logger 与 Tracer；生产入口须在两者启动初始化完成后装配。
 	// Gin 只回传路由模板，日志结束状态由外层 Writer 提供，超时后晚到的业务结果不会覆盖它。
 	handler.entryHandler = middleware.TraceID(middleware.HTTPLogging(http.HandlerFunc(handler.serveHTTP)))
 	// 7. 全部默认及覆盖入口均创建成功后返回完整对象，由进程入口同时持有处理与 Shutdown 能力。
