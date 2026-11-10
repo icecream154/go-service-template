@@ -68,6 +68,9 @@ type Record struct {
 	Event Event `json:"event,omitempty"`
 	// TraceID 来自当前 Context；无请求链路标识的进程日志省略。
 	TraceID string `json:"trace_id,omitempty"`
+	// SpanID 来自当前有效标准 SpanContext；未采样节点同样保留，无标准节点时省略。
+	// 由 Logger 自动读取，不从兼容 TraceId 推导，也不接受调用方通过 Fields 覆盖。
+	SpanID string `json:"span_id,omitempty"`
 	// ServiceName 来自应用配置，通过 Logger 构造参数注入。
 	ServiceName string `json:"service_name"`
 	// Environment 复用构造时传入的 env.Config.Environment，日志配置不重复声明。

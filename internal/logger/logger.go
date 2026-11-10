@@ -185,10 +185,13 @@ func (l *Logger) write(ctx context.Context, level zapcore.Level, message string,
 	if caller.Defined {
 		record.Caller = caller.TrimmedPath()
 	}
-	// 8. 从统一入口取出 TraceId：优先标准 SpanContext，缺失时沿用入口保存的兼容值。
-	// 已取消 Context 中的值仍可读取，取消之后的排障日志也应保留原链路标识。
+	// 8. 从追踪公共入口读取本次日志的关联标识，不在日志层创建 Span 或生成标识。
+	// 已取消 Context 中的值仍可读取，取消之后的排障日志也应保留原链路和执行节点。
 	if ctx != nil {
+		// 8.1. TraceId 优先使用有效标准 SpanContext，缺失时沿用入口保存的兼容值。
 		record.TraceID = tracing.TraceID(ctx)
+		// 8.2. SpanId 只取有效标准节点，未采样时仍保留；只有兼容 TraceId 时为空，编码时省略。
+		record.SpanID = tracing.SpanID(ctx)
 	}
 	// 9. 将时间、级别、消息和调用位置交给 Zap Entry 的专用编码器，其他字段由 recordFields 按需追加。
 	// 这些字段不会作为额外字段重复传入，避免一条 JSON 内出现同名键。
@@ -246,31 +249,36 @@ func recordFields(record Record) []zap.Field {
 	if record.TraceID != "" {
 		fields = append(fields, zap.String("trace_id", record.TraceID))
 	}
-	// 3. 有明确操作作用域时输出组件类别；识别失败的空值不进入 JSON。
+	// 3. 仅在标准 Context 确实提供有效节点时追加 SpanId；不输出空字符串或推导虚构节点。
+	// write 从相同 Context 读取两种标识，因此本字段存在时 TraceId 也会指向同一条标准链路。
+	if record.SpanID != "" {
+		fields = append(fields, zap.String("span_id", record.SpanID))
+	}
+	// 4. 有明确操作作用域时输出组件类别；识别失败的空值不进入 JSON。
 	if record.Component != "" {
 		fields = append(fields, zap.String("component", string(record.Component)))
 	}
-	// 4. 有明确操作标识时输出其稳定名称，名称与开始、结束或成功、失败结果无关。
+	// 5. 有明确操作标识时输出其稳定名称，名称与开始、结束或成功、失败结果无关。
 	if record.Operation != "" {
 		fields = append(fields, zap.String("operation", record.Operation))
 	}
-	// 5. 仅生命周期日志需要事件字段；普通过程说明可以省略。
+	// 6. 仅生命周期日志需要事件字段；普通过程说明可以省略。
 	if record.Event != "" {
 		fields = append(fields, zap.String("event", string(record.Event)))
 	}
-	// 6. 指针非 nil 表示实际采集过耗时，包含数值 0；输出 JSON 数值而非字符串。
+	// 7. 指针非 nil 表示实际采集过耗时，包含数值 0；输出 JSON 数值而非字符串。
 	if record.DurationMS != nil {
 		fields = append(fields, zap.Float64("duration_ms", *record.DurationMS))
 	}
-	// 7. 指针非 nil 表示取得了 HTTP 状态，避免把未提供状态的业务或数据库日志默认写成 200。
+	// 8. 指针非 nil 表示取得了 HTTP 状态，避免把未提供状态的业务或数据库日志默认写成 200。
 	if record.StatusCode != nil {
 		fields = append(fields, zap.Int("status_code", *record.StatusCode))
 	}
-	// 8. 仅追加已有受控错误文本；不在编码阶段展开 Go error、SDK 响应或其内部原因。
+	// 9. 仅追加已有受控错误文本；不在编码阶段展开 Go error、SDK 响应或其内部原因。
 	if record.Error != "" {
 		fields = append(fields, zap.String("error", record.Error))
 	}
-	// 9. 返回本条记录独有的字段切片，交由调用方与 Zap Entry 一起编码，不缓存请求内容。
+	// 10. 返回本条记录独有的字段切片，交由调用方与 Zap Entry 一起编码，不缓存请求内容。
 	return fields
 }
 

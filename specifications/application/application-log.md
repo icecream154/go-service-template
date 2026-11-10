@@ -6,6 +6,7 @@
 | `component` | 日志来源的代码职责类别，统一取值为 `http_entry`、`controller`、`service`、`client`、`repository`；外部依赖调用组件统一归为 `client`；不适用或无法识别时省略 | 公共日志规范统一约定分类，框架在操作入口识别并写入派生 Context，Logger 自动读取 | `client` |
 | `event` | 操作的生命周期节点，首期统一为 `started`、`finished`；`finished` 只表示操作结束，结果通过 `error`、`status_code` 等字段表达；普通说明性日志可省略 | 公共日志规范统一定义，各组件和业务代码复用相同取值 | `finished` |
 | `trace_id` | 当前请求所属链路的标识，使用 32 个小写十六进制字符且不能全零；没有请求上下文的进程日志省略 | `tracing.TraceID(ctx)` 统一读取，优先标准 SpanContext，缺失时读取入口生成或校验后保存的值；公共 Logger 自动填充 | `4bf92f3577b34da6a3ce929d0e0e4736` |
+| `span_id` | 产生日志时当前执行节点的标识，使用 16 个小写十六进制字符且不能全零；没有有效标准 SpanContext 时省略，未采样节点仍保留 | 公共 Logger 调用 `tracing.SpanID(ctx)` 自动读取；调用方不手填，不从兼容 TraceId 推导 | `00f067aa0ba902b7` |
 | `service_name` | 产生日志的服务名称 | 应用配置显式提供，初始化 Logger 时统一注入 | `go-service-template` |
 | `environment` | 当前进程所在的部署环境 | 复用已有 `env.Config.Environment`，由装配方传入 Logger；日志 Config 不单独声明 | `dev` |
 | `instance_id` | 当前服务进程的标识，用于区分副本和重启；同一进程内保持一致 | 启动流程生成一次随机标识，初始化 Logger 时统一注入 | `2f7b6d598dbd4d61a4d4ab8652e22d74` |
@@ -139,11 +140,15 @@ Controller 的接口处理方法创建 HTTP 入口 Span 的子 Span，调用 Ser
 
 Span 与 SpanContext 复用 OpenTelemetry 标准 API，不在业务层另造数据模型、随机标识或父子关系；实际采集及导出方式由后续 Provider 和导出器配置确定。名称、上下文传递和 Span 生命周期参考 [OpenTelemetry Go 接入文档](https://opentelemetry.io/docs/languages/go/instrumentation/)。
 
-正式接入时，现有单行 JSON 日志增加以下自动字段；当前 `Record` 仍是下文说明的 14 个字段，尚不包含该规划字段：
+单行 JSON 日志已包含自动字段 `span_id`，与首表中的其他字段共同组成 `Record` 的 15 个字段。共享 Logger 和独立构造的 Logger 使用相同写入流程，四级打印方法均自动读取 Context，调用方不修改现有日志调用方式。
 
-| 字段 | 含义 | 定义方 | 示例 |
-| --- | --- | --- | --- |
-| `span_id` | 产生日志时 Context 中当前 Span 的标识；没有有效 Span 时省略 | 公共 Logger 从标准追踪上下文自动读取，调用方不手填 | `00f067aa0ba902b7` |
+| Context 中的追踪信息 | 日志 `trace_id` | 日志 `span_id` |
+| --- | --- | --- |
+| 有有效标准 SpanContext，包括未采样节点 | 标准上下文中的 TraceId | 同一个标准上下文中的 SpanId |
+| 仅有 `WithTraceID` 保存的兼容值 | 已保存的 TraceId | 省略 |
+| 没有追踪信息或 Context 为 nil | 省略 | 省略 |
+
+自动读取不创建或结束 Span，不生成标识，不改变原 Context；Span 是否采样不决定日志是否输出，日志仍按现有最低级别过滤。`Fields` 不增加 TraceId 或 SpanId，因此业务代码不能覆盖这些自动字段。
 
 日志中的 `trace_id` 与当前 Span 的 TraceId 使用同一来源，不能形成两套不同的链路标识。父子关系保存在 Span 数据中，普通日志不重复增加 `parent_span_id`。查询整个 Trace 时展示整条链路的日志；查询其中一个 Span 时，通过 `trace_id`、`span_id` 定位这一次执行的日志。[OpenTelemetry 日志数据模型](https://opentelemetry.io/docs/specs/otel/logs/data-model/)
 
@@ -193,7 +198,7 @@ operation 参数供后续统一入口和公共调用层传递识别结果，不�
 
 `Extract(ctx, carrier)`、`Inject(ctx, carrier)` 使用标准 `propagation.TraceContext` 处理 W3C `traceparent`、`tracestate`，不默认传播 Baggage。提取合法远端上下文只派生 Context、不创建 Span；无合法头时沿用传入 Context。注入由公司 HTTP 公共请求层在发送前显式触发，载体须可写且没有其他请求遗留的追踪头，不自动影响任何现有 HTTP 或 SDK 请求。
 
-`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。将仅有旧 `TraceId` 的 Context 交给 SDK 创建根 Span 时，仍需后续兼容适配，不能认为保存私有 key 就已使 SDK 沿用该 TraceId。Logger 自动读取 `span_id`、进程级 Provider 装配和各实际 Span 边界接入均留待后续完成。
+`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。将仅有旧 `TraceId` 的 Context 交给 SDK 创建根 Span 时，仍需后续兼容适配，不能认为保存私有 key 就已使 SDK 沿用该 TraceId。进程级 Provider 装配和各实际 Span 边界接入仍留待后续完成。
 
 ## Service 上下文与业务流程日志
 
@@ -229,9 +234,9 @@ Controller 和 Service 不为这些业务日志增加计时、状态变量或 de
 
 ## 当前数据结构与基础写入范围
 
-日志数据结构统一放在 `internal/logger/types.go`：`Level` 声明四种日志级别，`Component` 声明五种职责类别，`Event` 声明 `started`、`finished`，`Record` 对应字段表中的 14 个字段及 JSON 名称。`Fields` 只包含调用方可按需补充的 `Event`、`DurationMS`、`StatusCode`、`Error`，自动字段由 Logger 维护。
+日志数据结构统一放在 `internal/logger/types.go`：`Level` 声明四种日志级别，`Component` 声明五种职责类别，`Event` 声明 `started`、`finished`，`Record` 对应字段表中的 15 个字段及 JSON 名称，包含 `TraceID`、`SpanID`。`Fields` 只包含调用方可按需补充的 `Event`、`DurationMS`、`StatusCode`、`Error`，自动字段由 Logger 维护。
 
-`Timestamp` 使用 `time.Time`。`DurationMS` 使用 `*float64`，`StatusCode` 使用 `*int`：`nil` 表示未记录，非 nil 的零值仍保留，避免将零耗时与未采集混淆。`Error` 保存已处理的错误文本，不直接序列化 Go `error` 对象。`Component`、`Event`、`TraceID`、`Caller`、`Operation`、`Error` 无值时省略；服务名称、部署环境、进程标识作为公共元信息保留。
+`Timestamp` 使用 `time.Time`。`DurationMS` 使用 `*float64`，`StatusCode` 使用 `*int`：`nil` 表示未记录，非 nil 的零值仍保留，避免将零耗时与未采集混淆。`Error` 保存已处理的错误文本，不直接序列化 Go `error` 对象。`Component`、`Event`、`TraceID`、`SpanID`、`Caller`、`Operation`、`Error` 无值时省略；服务名称、部署环境、进程标识作为公共元信息保留。
 
 基础 Logger 通过 `New(config Config, deployment env.Config, output io.Writer)` 构造。日志专属 `Config` 仅声明 `ServiceName`、`InstanceID` 和 `MinLevel`；部署环境复用现有 `env.Config`，装配方可在 `env.Init()` 成功后传入 `env.Current()`。Logger 按值保存部署配置，不重复读取环境变量或依赖全局初始化调用。服务名称、实例标识及传入的环境名称必须非空白，最低级别必须使用已声明的合法值；部署环境的允许值仍由 `env` 包管理。构造过程不读取配置文件、不推断服务名称，也不生成实例标识。
 
@@ -244,7 +249,7 @@ lg := logger.Current()
 lg.Info(ctx, "Avatar prompt optimized")
 ```
 
-`Debug`、`Info`、`Warn`、`Error` 接收标准 Context、消息及可选的一个 `Fields`，均无返回值；不需要额外字段时直接省略 `Fields`。业务代码通过 `logger.Current()` 取得共享实例，在需要的位置直接调用对应级别方法，无须在日志外层处理输出结果。每条日志自动补充 UTC 时间、对应级别、Context 中的 TraceId、实际调用位置和三项公共元信息。Context 为 nil 或未保存 TraceId 时省略 `trace_id`，Logger 不补生成标识。
+`Debug`、`Info`、`Warn`、`Error` 接收标准 Context、消息及可选的一个 `Fields`，均无返回值；不需要额外字段时直接省略 `Fields`。业务代码通过 `logger.Current()` 取得共享实例，在需要的位置直接调用对应级别方法，无须在日志外层处理输出结果。每条日志自动补充 UTC 时间、对应级别、Context 中的 TraceId、SpanId、实际调用位置和三项公共元信息。TraceId 通过 `tracing.TraceID` 统一读取，SpanId 通过 `tracing.SpanID` 读取标准节点；没有对应标识时分别省略，Logger 不补生成标识或创建 Span。
 
 最低级别以下的日志被过滤，不触发故障输出；其余日志同步输出为单行 JSON，不抽样、不建立异步队列。参数校验、JSON 编码、写入及短写故障由 Logger 内部统一处理，向独立 stderr 输出故障说明，TraceId 使用引用格式转义；不递归调用 Logger、不重试业务调用，也不替换业务返回或 HTTP 响应。stderr 自身写入失败时不继续报告。`Fields` 不接受原始 Go `error` 或 SDK 对象，错误文本须由调用方先做受控处理；耗时必须为有限的非负数，HTTP 状态码来自实际交互。
 
@@ -283,7 +288,7 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 })
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client、Qwen 与 MiniMax 文本调用、用户资料六个用例的 Controller 和 Service 日志，以及头像生成 Validator 的未知校验故障日志已统一使用共享 Logger；其他 Validator、第三方 SDK、业务组件、数据库与其他异常日志尚未全部迁移，未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略；同时自动填充 `trace_id`、`span_id`，不存在时按上述规则省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client、Qwen 与 MiniMax 文本调用、用户资料六个用例的 Controller 和 Service 日志，以及头像生成 Validator 的未知校验故障日志已统一使用共享 Logger；其他 Validator、第三方 SDK、业务组件、数据库与其他异常日志尚未全部迁移。当前实际调用尚未创建 Span，因此正常生产请求仍只有 TraceId，不会因新增字段自动出现 SpanId；本次未新增测试用例。
 
 ## HTTP 请求与响应日志
 
