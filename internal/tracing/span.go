@@ -1,0 +1,73 @@
+package tracing
+
+import (
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Span 是单次执行的受限生命周期句柄，不重新定义 OpenTelemetry 的 Span 数据模型。
+// Context 中的实际节点由 SDK 管理；句柄不公开底层 TracerProvider 或任意属性、事件写入入口。
+// 创建后应在所属边界直接使用 defer span.End()，保证所有 return 和 panic 路径均结束 Span。
+type Span struct {
+	// span 是 SDK 创建的实际节点，负责线程安全、结束时间和重复 End 的幂等处理。
+	span trace.Span
+	// httpMethod 仅由 StartHTTP 在返回句柄前设置，之后保持只读；其他边界为空。
+	httpMethod string
+}
+
+// Fail 将本次执行标记为失败，description 必须是调用边界提供的受控说明。
+// 不传入原始 error.Error()、panic 值、SDK 对象、凭证或请求响应正文；本方法不结束 Span。
+func (s *Span) Fail(description string) {
+	// 1. 空句柄没有可更新的节点，直接返回，不隐式创建 Span 或改变业务返回值。
+	if s == nil || s.span == nil {
+		return
+	}
+	// 2. 仅写入明确的错误状态及受控说明，不调用 RecordError 自动序列化原始异常。
+	// SDK 对已经结束的 Span 忽略更新；本方法不会把已有错误状态重置为成功。
+	s.span.SetStatus(codes.Error, description)
+}
+
+// End 结束本次 Span；重复调用遵循 SDK 的幂等约定，不重复提交同一个执行节点。
+// 正常结束不强制标记 OK，保留此前 Fail 写入的错误状态。
+// 直接用于 defer span.End() 时会标记 panic 异常退出，并重新抛出同一值，不记录原始 panic 内容。
+// 若外层用闭包间接调用 End，recover 无法观察外层 panic，届时异常标记由该边界自行负责。
+func (s *Span) End() {
+	// 1. recover 必须位于直接被 defer 的方法内，才能观察正在离开当前边界的 panic。
+	// 普通主动结束或重复结束时返回 nil，不改变正常执行流程。
+	panicValue := recover()
+	// 2. 异常退出只记录固定说明，避免供应商异常或业务 panic 携带的敏感内容进入追踪系统。
+	if panicValue != nil {
+		s.Fail("Operation terminated by panic")
+	}
+	// 3. SDK 记录结束时间并把已采集数据交给其处理器；不在此处启动、刷新或关闭导出器。
+	if s != nil && s.span != nil {
+		s.span.End()
+	}
+	// 4. 结束追踪后继续传播原 panic，保持原有 Recovery 和业务异常处理路径。
+	if panicValue != nil {
+		panic(panicValue)
+	}
+}
+
+// SetHTTPRoute 在路由匹配后更新 HTTP Span 名称，不创建新 Span 或修改调用方的 operation Context。
+// routeTemplate 由 HTTP 路由层提供；真正未匹配时传 <unmatched>，尚未确定时传空或 <unresolved>。
+// 只对 StartHTTP 创建的句柄生效，不允许借此重命名 Controller、Service 或 Client Span。
+func (s *Span) SetHTTPRoute(routeTemplate string) {
+	// 1. 空句柄或其他边界没有 HTTP 方法元信息，不更新其名称，也不推测请求类型。
+	if s == nil || s.span == nil || s.httpMethod == "" {
+		return
+	}
+	// 2. 使用创建时的方法和当前已确认的注册模板更新同一个节点，SDK 忽略结束后的更新。
+	// 路由层负责与 HTTP 日志使用相同的冻结规则，不能让晚到的结果改写已完成的请求身份。
+	s.span.SetName(httpOperation(s.httpMethod, routeTemplate))
+}
+
+// httpOperation 按日志规范生成稳定的 HTTP 操作名，不读取原始 URL 或 Query。
+func httpOperation(method, routeTemplate string) string {
+	// 1. 创建 Span 时可能尚未匹配路由，使用明确的占位模板，不能提前断言为未知接口。
+	if routeTemplate == "" {
+		routeTemplate = "<unresolved>"
+	}
+	// 2. 方法与模板之间固定一个空格；实际模板和 <unmatched> 等状态由 HTTP 层确定。
+	return method + " " + routeTemplate
+}

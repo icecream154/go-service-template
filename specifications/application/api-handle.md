@@ -90,7 +90,7 @@ Logger 的启动装配中，`bootstrap.Init` 只调用 `logger.Init`，传入 `l
 | [internal/logger](../../internal/logger/runtime.go) | 已加载日志配置并生成实例标识的共享 Logger | HTTP 请求与响应日志已使用共享实例；日志方法接收标准 Context，其他业务日志尚未统一切换 |
 | [internal/authn/jwt](../../internal/authn/jwt/runtime.go) | 共享 JWT 签发与认证组件 | 作为 `authn.Authenticator` 传给 Router 的全局可选认证中间件；创建成功后 Controller 取得组件签发凭证 |
 | [HTTP 认证中间件](../../app/http/middleware/authentication.go) | 捕获已装配认证器的 Gin Handler | 认证已提供的凭证并保存 Principal；Controller 调用 authz，共用方法通过 `PrincipalFromContext` 读取 |
-| [TraceId 中间件](../../app/http/middleware/trace_id.go)、[公共读写方法](../../internal/traceid/trace_id.go) | 包装请求分发的 `net/http` Handler；公共方法不保存全局请求状态 | 入站确定 TraceId，保存到标准 Request Context，并通过响应头和 company 请求头传递 |
+| [TraceId 中间件](../../app/http/middleware/trace_id.go)、[公共存储方法](../../internal/tracing/trace_id.go)、[统一读取入口](../../internal/tracing/context.go) | 包装请求分发的 `net/http` Handler；公共方法不保存全局请求状态 | 入站确定 TraceId，保存到标准 Request Context，并通过响应头和 company 请求头传递 |
 | [internal/snowflake](../../internal/snowflake/snowflake.go) | 共享雪花发号器 | 创建用户时调用 `snowflake.NextID()` |
 | [internal/runtime](../../internal/runtime/runtime.go) | DB 入口和 Repository | Service 调用 `appruntime.Current()` 获取 |
 | [internal/composition](../../internal/composition/services.go) | 默认 `UserProfileService` | Controller 调用 `composition.Current().UserProfile` 获取 |
@@ -134,9 +134,9 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 
 ### 2.4 TraceId 的生成、保存与透传
 
-1. **入站统一使用 `TraceId` 请求头并严格校验格式。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行，通过 `traceid.IsValid()` 检查值是否恰好为 32 个小写十六进制字符且不全为零。合法值原样沿用；头不存在、为空或非法时，通过 `traceid.New()` 生成 16 字节密码学随机数并编码，排除全零值后取得新的合法标识。格式非法不拒绝业务请求，也不修剪、转换或回显原值。生成失败返回统一 HTTP 500，不继续业务处理。当前只规范自定义头中的标识，标准 `traceparent` 的提取、注入及 Span 接入仍属规划。
-2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存已经确定的合法值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。该存储方法不隐式校验或生成标识，其他入口应先通过 `New` 生成或 `IsValid` 校验。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
-3. **成功确定 TraceId 后，通过同名响应头返回。** 该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
+1. **入站优先沿用 Context 中已确定的标识，再处理 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行，通过 `tracing.TraceID(ctx)` 读取已有标识；没有值时读取自定义请求头，头名由 `tracing.TraceIDHeaderName` 声明。候选值通过 `tracing.IsValidTraceID()` 检查是否恰好为 32 个小写十六进制字符且不全为零。合法值原样沿用；缺失、为空或非法时，通过 `tracing.NewTraceID()` 生成 16 字节密码学随机数并编码，排除全零值后取得新的合法标识。格式非法不拒绝业务请求，也不修剪、转换或回显原值。生成失败返回统一 HTTP 500，不继续业务处理。标准 `traceparent` 提取、注入及 Span 创建的公共能力已实现，实际 HTTP 及业务链路尚未接入。
+2. **Context 存储与读取统一由 tracing 提供。** `tracing.WithTraceID(ctx, id)` 使用私有类型的 key 保存已经确定的合法值，中间件将新 Context 放回 Request；后续统一通过 `tracing.TraceID(ctx)` 读取。读取优先有效标准 SpanContext，缺失时使用私有 key 的值，两者都没有或 Context 为 nil 时返回空字符串。存储不隐式校验或生成标识，其他入口应先通过 `NewTraceID` 生成或 `IsValidTraceID` 校验；不创建 Span 或伪造 SpanId。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
+3. **成功确定 TraceId 后，通过同名响应头返回。** 响应头同样使用 `tracing.TraceID` 从派生 Context 读取，避免标准节点与兼容值冲突时输出两个标识。该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
 4. **Controller、Service 和 Client 显式传递执行 Context。** 所有 Service 公开业务方法统一以 `ctx context.Context` 为首参，Controller 使用内部 `ctx.Request.Context()`，Service 入口建立自己的日志操作作用域，再将派生 Context 继续传给其他 Service、具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个执行 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 

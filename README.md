@@ -6,7 +6,7 @@
 
 第三方 Client 按功能、子功能及供应商文件组织，装配也由 thirdparty、AI、LLM 逐层完成。当前 Qwen、MiniMax 已支持独立配置读取、SDK 构造和进程启动初始化，通过 `thirdparty.Current().AI.LLM.Qwen`、`thirdparty.Current().AI.LLM.MiniMax` 获取共享实例；其他供应商仍为包占位。每次文本生成须指定模型，不在配置中保存默认模型。
 
-生产 HTTP 入口在响应等待中间件之前处理 `TraceId`：请求头不存在或为空时生成 16 字节随机数编码的 32 位十六进制值；已有非空值时原样沿用。该值保存到 `Request.Context()` 并通过同名响应头返回。Controller、Service 和 company Client 传递标准 Context，公共 `GetJSON`、`PostJSON` 自动设置出站 `TraceId`；无值的独立调用不由 Client 补生成。请求与响应日志通过共享 Logger 输出 `started`、`finished`，自动填充 `component=http_entry` 和方法、注册路由模板组成的 `operation`；外层记录实际选定的响应状态及等待耗时，超时后的内部工作仍沿用 TraceId。直接使用 `routers.New(authenticator)` 时，HTTP 模板绑定在没有外层日志状态时直接透传；如需 TraceId 与请求、响应日志，应在 Logger 初始化后依次包装 `middleware.TraceID(middleware.HTTPLogging(engine))`，响应等待及收尾另行装配。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)及[HTTP 请求与响应日志](specifications/application/application-log.md#http-请求与响应日志)。
+生产 HTTP 入口在响应等待中间件之前处理 `TraceId`：优先沿用 Context 已有标识，无值时校验自定义请求头，仅接受 32 个小写十六进制字符且非全零的值，缺失或非法时生成新值。TraceId 能力统一位于 `internal/tracing`；`tracing.TraceID(ctx)` 优先读取有效标准 SpanContext，缺失时读取 `WithTraceID` 保存的兼容值，响应头、Logger 和 company 出站请求均使用这一入口。Controller、Service 和 company Client 传递标准 Context，公共 `GetJSON`、`PostJSON` 自动设置出站 `TraceId`；无值的独立调用不由 Client 补生成。请求与响应日志通过共享 Logger 输出 `started`、`finished`，自动填充 `component=http_entry` 和方法、注册路由模板组成的 `operation`；外层记录实际选定的响应状态及等待耗时，超时后的内部工作仍沿用 TraceId。直接使用 `routers.New(authenticator)` 时，HTTP 模板绑定在没有外层日志状态时直接透传；如需 TraceId 与请求、响应日志，应在 Logger 初始化后依次包装 `middleware.TraceID(middleware.HTTPLogging(engine))`，响应等待及收尾另行装配。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)及[HTTP 请求与响应日志](specifications/application/application-log.md#http-请求与响应日志)。
 
 ## 启动
 
@@ -235,7 +235,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 接收认证器，创建 Gin Engine，在 `/api` 挂载可选认证，再注册版本及领域路由 |
 | `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
-| `internal/traceid` | 生成 TraceId，通过标准 Context 保存和读取，集中声明 HTTP 头名称 |
+| `internal/tracing` | 提供 TraceId 生成、校验、存储及统一读取，声明自定义 HTTP 头名；封装五类 Span 与标准上下文传播，Span 能力尚未接入启动和实际业务 |
 | `app/http/middleware/trace_id.go` | 在响应等待前确定 TraceId，保存到请求 Context，并写入同名响应头 |
 | `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
 | `app/http/middleware/authentication.go`、`principal.go` | 可选认证；按请求保存、读取可信身份，认证失败时统一输出 |

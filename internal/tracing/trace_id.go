@@ -1,5 +1,4 @@
-// Package traceid 提供符合 W3C 格式的 TraceId 生成、校验及标准 Context 存取，不依赖 HTTP 框架。
-package traceid
+package tracing
 
 import (
 	"context"
@@ -7,16 +6,17 @@ import (
 	"encoding/hex"
 )
 
-// HeaderName 是入站、响应及 company 出站请求统一使用的 TraceId 头名称。
-const HeaderName = "TraceId"
+// TraceIDHeaderName 是现有入站、响应及 company 出站请求统一使用的自定义 TraceId 头名称。
+// 标准 traceparent、tracestate 由 Extract 和 Inject 处理，不使用本常量替代。
+const TraceIDHeaderName = "TraceId"
 
-// contextKey 只供本包存取 TraceId，避免与其他 Context 值发生键冲突。
-type contextKey struct{}
+// traceIDContextKey 保存尚未关联标准 SpanContext 时的 TraceId，与 SDK 及 operation 的 key 隔离。
+type traceIDContextKey struct{}
 
-// New 生成符合 W3C Trace Context 标识格式的 TraceId。
+// NewTraceID 生成符合 W3C Trace Context 标识格式的 TraceId。
 // 使用 16 字节密码学随机数，编码为 32 个小写十六进制字符，排除全零值。
 // 本方法只生成链路标识，不创建 Span，也不构造 traceparent 请求头。
-func New() (string, error) {
+func NewTraceID() (string, error) {
 	// 1. 为本次生成准备独立的 128 位缓冲区，不保存或复用其他请求的标识。
 	var value [16]byte
 	// 2. 生成有效标识后才返回；极低概率出现的全零随机值需要重新生成。
@@ -34,9 +34,9 @@ func New() (string, error) {
 	}
 }
 
-// IsValid 检查 TraceId 是否严格满足 32 个小写十六进制字符且不全为零。
+// IsValidTraceID 检查 TraceId 是否严格满足 32 个小写十六进制字符且不全为零。
 // 不修剪空白、不转换大小写，也不修改输入；空字符串及不符合上述格式的旧值返回 false。
-func IsValid(id string) bool {
+func IsValidTraceID(id string) bool {
 	// 1. 文本形式必须恰好为 32 字节；只允许 ASCII，因此字节数也就是合法字符数。
 	if len(id) != 32 {
 		return false
@@ -58,19 +58,12 @@ func IsValid(id string) bool {
 	return hasNonZero
 }
 
-// WithContext 返回保存 TraceId 的派生 Context，不修改传入的 Context。
-// ctx 必须非 nil；调用方须通过 New 取得标识，或先通过 IsValid 校验外来值。
-// 本方法只存储已确定的标识，不隐式生成、转换或替换输入。
-func WithContext(ctx context.Context, id string) context.Context {
+// WithTraceID 返回保存 TraceId 的派生 Context，不修改传入的 Context。
+// ctx 必须非 nil；调用方须通过 NewTraceID 取得标识，或先通过 IsValidTraceID 校验外来值。
+// 本方法只存储已确定的标识，不生成 SpanId、不创建 Span，也不改写标准 SpanContext。
+// 已有有效标准 SpanContext 时，TraceID 仍优先返回其中的标识，不受本次保存值影响。
+func WithTraceID(ctx context.Context, id string) context.Context {
 	// 1. 使用本包私有 key 写入派生节点，保留父 Context 的取消、截止时间及其他值。
-	return context.WithValue(ctx, contextKey{}, id)
-}
-
-// FromContext 读取当前 Context 中的 TraceId，未设置时返回空字符串。
-// ctx 必须非 nil；本方法不生成标识或修改 Context。
-func FromContext(ctx context.Context) string {
-	// 1. 读取最近的 TraceId 值；不存在时返回空字符串，不重新生成或修改当前链路标识。
-	id, _ := ctx.Value(contextKey{}).(string)
-	// 2. 原样返回入口已经确定的值，供 Logger、响应及公司 HTTP 透传共同使用。
-	return id
+	// 该值作为标准 SpanContext 缺失时的兼容来源，统一通过 TraceID 读取。
+	return context.WithValue(ctx, traceIDContextKey{}, id)
 }

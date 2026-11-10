@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"go-service-template/internal/logger"
-	"go-service-template/internal/traceid"
+	"go-service-template/internal/tracing"
 )
 
 // GetJSON 向目标服务发送 GET 请求，将 HTTP 200 的 JSON 正文解码到 result。
@@ -112,9 +112,9 @@ func (c *Client) sendJSON(ctx context.Context, method, path string, query url.Va
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
-	if id := traceid.FromContext(ctx); id != "" {
+	if id := tracing.TraceID(ctx); id != "" {
 		// 5.2. 头部与日志从同一个 Context 读取标识，使上下游调用能关联到同一请求。
-		request.Header.Set(traceid.HeaderName, id)
+		request.Header.Set(tracing.TraceIDHeaderName, id)
 	}
 	// 6. 使用既有连接池和请求超时发送一次，不增加重试；收到响应后立即保存真实 HTTP 状态。
 	response, err := c.httpClient.Do(request)

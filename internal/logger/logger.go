@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"go-service-template/env"
-	"go-service-template/internal/traceid"
+	"go-service-template/internal/tracing"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -185,10 +185,10 @@ func (l *Logger) write(ctx context.Context, level zapcore.Level, message string,
 	if caller.Defined {
 		record.Caller = caller.TrimmedPath()
 	}
-	// 8. 从当前 Context 取出既有 TraceId；nil Context 或没有标识时不生成替代值。
+	// 8. 从统一入口取出 TraceId：优先标准 SpanContext，缺失时沿用入口保存的兼容值。
 	// 已取消 Context 中的值仍可读取，取消之后的排障日志也应保留原链路标识。
 	if ctx != nil {
-		record.TraceID = traceid.FromContext(ctx)
+		record.TraceID = tracing.TraceID(ctx)
 	}
 	// 9. 将时间、级别、消息和调用位置交给 Zap Entry 的专用编码器，其他字段由 recordFields 按需追加。
 	// 这些字段不会作为额外字段重复传入，避免一条 JSON 内出现同名键。
