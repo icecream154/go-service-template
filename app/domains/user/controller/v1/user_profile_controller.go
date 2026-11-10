@@ -16,6 +16,7 @@ import (
 	"go-service-template/internal/composition"
 	"go-service-template/internal/logger"
 	"go-service-template/internal/response"
+	"go-service-template/internal/tracing"
 
 	"github.com/gin-gonic/gin"
 )
@@ -51,9 +52,12 @@ func NewUserProfileController() *UserProfileController {
 // 仅允许已认证的 user/member 查询本人，身份或权限不满足时不调用 Service。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userprofiledto.QueryUserProfileByUserIDRequest) {
-	// 1. 为当前 Controller 方法建立操作作用域，保存回请求并直接记录请求到达。
+	// 1. 为当前 Controller 方法建立操作作用域和子 Span，保存回请求并直接记录请求到达。
 	// 派生 Context 保留 TraceId 和内部执行控制，不记录用户标识或请求正文。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. 复用入口自动识别的 operation，直接登记 Span 收尾，覆盖正常返回、提前失败和 panic。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	lg := logger.Current()
 	lg.Info(requestCtx, "User profile query request received")
@@ -63,6 +67,7 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
 	if err != nil {
 		// 3.1. 不记录凭证、主体文本或原始错误，响应继续沿用现有分类和文案。
+		span.Fail("User profile query access denied")
 		lg.Warn(requestCtx, "User profile query request rejected", logger.Fields{
 			Error: "User profile query access denied",
 		})
@@ -72,6 +77,7 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	// 4. 本用例只允许查询本人；公共身份转换不决定业务目标的访问范围。
 	if operatorUserID != userID {
 		// 4.1. 在越权分支直接记录受控说明，保持现有权限错误和响应契约。
+		span.Fail("Querying another user's profile is not permitted")
 		lg.Warn(requestCtx, "User profile query request rejected", logger.Fields{
 			Error: "Querying another user's profile is not permitted",
 		})
@@ -85,6 +91,7 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 	})
 	if err != nil {
 		// 5.1. Service 负责对应失败日志，此处仅沿用现有分类和响应，不重复输出故障摘要。
+		span.Fail("User profile query service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -99,14 +106,18 @@ func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, reque
 // QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
 // 仅允许已认证的 service/admin 调用；默认值和输入校验由 Validator 完成。
 func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
-	// 1. 建立当前 Controller 操作作用域并直接记录请求到达，保留已有 TraceId 和执行控制。
+	// 1. 建立当前 Controller 操作作用域和子 Span，保留已有 TraceId 和执行控制。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. Span 名称复用自动识别结果，直接 defer 结束本次方法执行，不改变原有日志顺序。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	lg := logger.Current()
 	lg.Info(requestCtx, "User profile page request received")
 	// 2. 要求可信的 service/admin 身份，未满足接口调用资格时不发起分页查询。
 	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
 		// 2.1. 记录固定拒绝原因，不打印凭证或主体文本，响应仍采用原有错误。
+		span.Fail("User profile page access denied")
 		lg.Warn(requestCtx, "User profile page request rejected", logger.Fields{
 			Error: "User profile page access denied",
 		})
@@ -127,6 +138,7 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 	})
 	if err != nil {
 		// 4.1. Service 已记录对应失败，此处保持原有错误分类和响应，避免重复故障摘要。
+		span.Fail("User profile page service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -145,8 +157,11 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 // 外部账户字段仅为调用方声明，不核验外部身份，也不据此为已有用户补发凭证。
 // 签发失败返回 500，但不会回滚已经完成的创建；仅在创建和签发均成功时输出成功响应。
 func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
-	// 1. 建立当前 Controller 操作作用域并直接记录请求到达，不输出账户输入或用户资料。
+	// 1. 建立当前 Controller 操作作用域和子 Span，不输出账户输入或用户资料。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. 以当前具名方法的自动识别结果创建 Span，正常、提前失败及 panic 均在方法退出时结束。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	lg := logger.Current()
 	lg.Info(requestCtx, "User creation request received")
@@ -159,6 +174,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 	})
 	if err != nil {
 		// 3.1. 创建失败由 Service 记录，此处输出原有错误响应，重复注册等情况不继续签发凭证。
+		span.Fail("User creation service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -175,6 +191,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 	if err != nil {
 		// 5.1. 签发发生在 Controller，直接记录固定失败阶段，不打印用户 ID、凭证或原始错误。
 		// 创建已经完成，保留原有返回错误的语义，不在这里声称回滚。
+		span.Fail("User credential issuance failed")
 		lg.Error(requestCtx, "Issue user credential failed", logger.Fields{
 			Error: "User credential issuance failed",
 		})
@@ -196,9 +213,12 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 // Prompt 由 Validator 校验，Service 先经 Qwen 优化再生成图片；调用沿用内部 Request Context。
 // 成功只返回头像地址，流程日志在实际执行位置记录，HTTP 状态和耗时由公共入口统计。
 func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *userprofiledto.GenerateUserAvatarRequest) {
-	// 1. 从当前内部 Request Context 派生 Controller 操作作用域，并交回本次请求供后续处理使用。
+	// 1. 从当前内部 Request Context 派生 Controller 操作作用域与子 Span，交回请求供后续处理使用。
 	// WithCurrentOperation 自动识别具名方法，保留 TraceId 和响应等待层已经应用的取消隔离。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. 读取已有 operation 创建本次 Controller Span，直接 defer 收尾，不为业务日志维护结束状态。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	// 2. 取得共享 Logger 并记录请求已到达当前 Controller，不记录提示词、凭证或完整请求。
 	lg := logger.Current()
@@ -206,6 +226,7 @@ func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *us
 	// 3. 要求可信的 user/member 身份，未满足接口调用资格时不执行提示词优化或图片生成。
 	if _, err := httpauthz.RequireMemberUserID(ctx); err != nil {
 		// 3.1. 在拒绝位置直接记录固定原因，日志故障由 Logger 内部处理，响应继续使用原有错误映射。
+		span.Fail("User avatar request access denied")
 		lg.Warn(requestCtx, "User avatar request rejected", logger.Fields{
 			Error: "User avatar request access denied",
 		})
@@ -219,6 +240,7 @@ func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *us
 	})
 	if err != nil {
 		// 4.1. Service 已记录具体失败阶段，此处只沿用原有错误响应，不重复输出故障摘要。
+		span.Fail("User avatar service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -233,8 +255,11 @@ func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *us
 // 仅允许已认证的 user/member 修改本人，发起方 ID 来自 Principal，不接收请求自行声明。
 // Service 继续独立检查本人关系、用户状态和实际版本冲突。
 func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userprofiledto.UpdateUserProfileRequest) {
-	// 1. 建立当前 Controller 操作作用域并记录请求到达，沿用 TraceId 和内部执行控制。
+	// 1. 建立当前 Controller 操作作用域和子 Span，沿用 TraceId 和内部执行控制。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. Span 使用自动识别的稳定方法名，直接 defer 结束，派生 Context 继续传给授权及 Service。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	lg := logger.Current()
 	lg.Info(requestCtx, "User profile update request received")
@@ -242,6 +267,7 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
 	if err != nil {
 		// 2.1. 在拒绝位置记录固定说明，原有身份错误继续用于响应，不输出凭证或主体信息。
+		span.Fail("User profile update access denied")
 		lg.Warn(requestCtx, "User profile update request rejected", logger.Fields{
 			Error: "User profile update access denied",
 		})
@@ -251,6 +277,7 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 	// 3. 本用例只允许修改本人；发起方已由公共身份转换确定，目标仍由请求表达。
 	if operatorUserID != request.UserID {
 		// 3.1. 越权目标在调用 Service 前拒绝，日志不记录实际用户标识，响应沿用原有权限错误。
+		span.Fail("Updating another user's profile is not permitted")
 		lg.Warn(requestCtx, "User profile update request rejected", logger.Fields{
 			Error: "Updating another user's profile is not permitted",
 		})
@@ -264,6 +291,7 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 	})
 	if err != nil {
 		// 4.1. Service 负责业务状态检查及对应失败日志，此处仅输出既有错误响应。
+		span.Fail("User profile update service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -277,14 +305,18 @@ func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *use
 // 仅允许已认证的 service/admin 调用，不将服务身份解释为某个用户或要求其主体为数字。
 // 数量和 ID 格式由 Validator 校验；Service 对重复 ID 去重并保留首次出现的顺序。
 func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userprofiledto.BatchQueryUserProfilesRequest) {
-	// 1. 建立当前 Controller 操作作用域，记录请求到达并沿用已有 TraceId，不输出 ID 列表。
+	// 1. 建立当前 Controller 操作作用域和子 Span，沿用已有 TraceId，不输出 ID 列表。
 	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	// 1.1. 当前方法名由日志入口自动取得，Span 仅覆盖本次 Controller 调用，不为每个用户创建节点。
+	requestCtx, span := tracing.Current().StartController(requestCtx, logger.Operation(requestCtx))
+	defer span.End()
 	ctx.Request = ctx.Request.WithContext(requestCtx)
 	lg := logger.Current()
 	lg.Info(requestCtx, "User profile batch query request received")
 	// 2. 要求可信的 service/admin 身份，不将服务主体解释为用户数字标识。
 	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
 		// 2.1. 身份失败直接记录固定拒绝原因，保持现有错误分类和响应。
+		span.Fail("User profile batch query access denied")
 		lg.Warn(requestCtx, "User profile batch query request rejected", logger.Fields{
 			Error: "User profile batch query access denied",
 		})
@@ -304,6 +336,7 @@ func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request
 	})
 	if err != nil {
 		// 4.1. 查询失败由 Service 记录，此处沿用原有响应，不把故障当作全部用户缺失。
+		span.Fail("User profile batch query service call failed")
 		failUserProfileOperation(ctx, err)
 		return
 	}

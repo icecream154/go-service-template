@@ -39,6 +39,13 @@ func WithCurrentOperation(ctx context.Context) context.Context {
 	return context.WithValue(ctx, operationContextKey{}, operation)
 }
 
+// Operation 返回入口已经识别并保存的稳定操作名，供公共追踪边界复用，不要求业务手写字符串。
+// 本方法只读 Context，不重新解析调用栈、不创建作用域或 Span；nil 或未识别时返回空字符串。
+func Operation(ctx context.Context) string {
+	// 1. 复用本包的只读访问流程，取最近的作用域；空作用域不会向父 Context 借用错误的操作身份。
+	return operationFromContext(ctx).name
+}
+
 // WithHTTPOperation 根据 HTTP 框架已确定的方法和路由模板建立 http_entry 操作作用域。
 // 本方法由 HTTP 日志基础设施调用，业务日志只需沿用返回的 Context，不手写操作标识。
 // method 和 routeTemplate 按框架提供的原值拼接，不读取原始 URL，也不通过调用栈猜测路由。
