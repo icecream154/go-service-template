@@ -85,8 +85,12 @@ func (t *Tracer) StartCompanyClient(ctx context.Context, operation string) (cont
 	if operation == "" {
 		operation = "company_client <unresolved>"
 	}
-	// 2. 仅创建本地调用节点；标准头注入由公共请求层使用本次派生 Context 显式触发。
-	return t.start(ctx, operation, trace.SpanKindClient)
+	// 2. 创建独立的本地调用节点，标准头注入由公共请求层使用本次派生 Context 显式触发。
+	ctx, span := t.start(ctx, operation, trace.SpanKindClient)
+	// 3. 只在返回前登记公司 HTTP 边界，供受限收尾方法写入实际响应状态和结束时刻。
+	// 标记之后保持只读，不公开任意属性入口，也不允许借用其他边界的句柄提交 HTTP 结果。
+	span.companyHTTP = true
+	return ctx, span
 }
 
 // StartSDKClient 创建一次项目封装的第三方 SDK Client 业务调用的 CLIENT Span。

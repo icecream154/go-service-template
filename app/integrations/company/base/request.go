@@ -14,6 +14,8 @@ import (
 
 	"go-service-template/internal/logger"
 	"go-service-template/internal/tracing"
+
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // GetJSON 向目标服务发送 GET 请求，将 HTTP 200 的 JSON 正文解码到 result。
@@ -32,17 +34,26 @@ func (c *Client) PostJSON(ctx context.Context, path string, params, result any) 
 	return c.requestJSON(ctx, http.MethodPost, path, nil, params, result)
 }
 
-// requestJSON 统一记录一次公司 HTTP 调用的生命周期，并保留原有请求错误和 panic 语义。
-// Logger 必须已在启动流程初始化；日志状态只属于本次调用，不写入可并发复用的 Client。
+// requestJSON 统一管理一次公司 HTTP 调用的 Span 和日志生命周期，保留原有请求错误和 panic 语义。
+// Logger 和 tracing 必须已在启动流程初始化；单次状态不写入可并发复用的 Client。
 func (c *Client) requestJSON(ctx context.Context, method, path string, query url.Values, params, result any) (err error) {
 	// 1. 取得共享 Logger，并在请求校验前开始计时，使未发出网络请求的失败也有完整调用记录。
-	// Context 沿用具体 Client 的操作作用域；缺少 TraceId 时不在出站层另行生成。
+	// Context 中的 operation 已由具体 Client 自动识别，本层不解析 GetJSON、PostJSON 或私有方法名。
 	call := &httpCallLog{log: logger.Current(), ctx: ctx, startedAt: time.Now()}
+	// 1.1. 有执行 Context 时创建唯一的 Client Span，日志与 HTTP 请求统一使用返回的子 Context。
+	// 共享 SDK 沿用有效父链路或兼容 TraceId；没有合法标识的独立调用由 SDK 创建根节点。
+	if ctx != nil {
+		ctx, call.span = tracing.Current().StartCompanyClient(ctx, logger.Operation(ctx))
+		call.ctx = ctx
+	}
+	// 1.2. 直接登记异常退出兜底；nil Context 不创建 Span，仍由原执行层返回参数错误。
+	// 正常收尾会在 finished 日志之前结束 Span，此处的重复 End 幂等，panic 继续按原值传播。
+	defer call.span.End()
 	returnedNormally := false
-	// 2. 无论正常返回还是异常退出，都先记录结束事件；异常结束只标明事实，不 recover 或吞掉 panic。
-	// sendJSON 内的响应关闭先于本层 defer 执行，因此耗时覆盖准备、发送、读取、解码及关闭。
+	// 2. 无论正常返回还是异常退出，都先提交调用结果、结束 Span，再记录结束事件。
+	// sendJSON 内的响应关闭先于本层收尾执行，因此区间覆盖准备、发送、读取、解码及关闭。
 	defer func() {
-		// 2.1. 命名返回值保留实际业务错误，正常返回标识避免 panic 时把 nil 错误误记成成功。
+		// 2.1. 正常返回标识避免 panic 时把 nil 错误误记成成功；此处不 recover 或吞掉异常。
 		call.finish(err, returnedNormally)
 	}()
 	// 3. 开始记录不预填耗时、状态或结果；日志输出失败只写独立兜底，不阻止真实调用。
@@ -106,14 +117,18 @@ func (c *Client) sendJSON(ctx context.Context, method, path string, query url.Va
 		}
 		request.URL.RawQuery = values.Encode()
 	}
-	// 5. 声明 JSON 协议并透传已有 TraceId；没有请求标识时不补造，认证头和其他头部不进入日志。
+	// 5. 声明 JSON 协议，并把本次 Client 子 Context 的标准追踪头和兼容 TraceId 写入新请求。
+	// 每次调用使用独立 Header，不复用其他请求的追踪值，也不记录认证头或任何头部正文。
 	if method == http.MethodPost {
 		// 5.1. 只有实际携带 JSON 正文的 POST 才设置正文类型。
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
+	// 5.2. 由标准传播器注入 traceparent 及非空 tracestate，使用当前 Client SpanId 作为远端父节点。
+	// 不手工拼接标识、采样标志或状态，不传播 Baggage，也不向第三方 SDK 隐式注入内部头。
+	tracing.Inject(ctx, propagation.HeaderCarrier(request.Header))
 	if id := tracing.TraceID(ctx); id != "" {
-		// 5.2. 头部与日志从同一个 Context 读取标识，使上下游调用能关联到同一请求。
+		// 5.3. 兼容头与标准头、日志读取同一个子 Context，保证上下游使用同一 TraceId。
 		request.Header.Set(tracing.TraceIDHeaderName, id)
 	}
 	// 6. 使用既有连接池和请求超时发送一次，不增加重试；收到响应后立即保存真实 HTTP 状态。

@@ -16,6 +16,8 @@ type Span struct {
 	span trace.Span
 	// httpMethod 仅由 StartHTTP 在返回句柄前设置，之后保持只读；其他边界为空。
 	httpMethod string
+	// companyHTTP 仅由 StartCompanyClient 设置，限制公司 HTTP 结果只能提交到对应的调用节点。
+	companyHTTP bool
 }
 
 // Fail 将本次执行标记为失败，description 必须是调用边界提供的受控说明。
@@ -76,6 +78,30 @@ func (s *Span) EndHTTP(statusCode int, failureDescription string, finishedAt tim
 	}
 	// 4. 在结束日志之前提交实际结束时刻；后续日志仍能从 Context 读取本次 Span 的标识。
 	// SDK 忽略重复 End，外围的 defer End 不会延长已经确定的执行区间。
+	s.span.End(trace.WithTimestamp(finishedAt))
+}
+
+// EndCompanyHTTP 保存一次公司 HTTP 调用的协议结果，并按公共请求层取得的结束时刻结束 Span。
+// statusCode 只传实际取得的响应状态，未知时传 0；失败说明由 base 按校验、发送及协议处理阶段提供。
+// HTTP 200 后的读取、大小检查或解码失败也须提供受控说明，不根据成功状态码覆盖本次失败。
+// 本方法不输出日志、不处理业务错误或 recover；调用边界仍直接 defer End 保障意外退出。
+func (s *Span) EndCompanyHTTP(statusCode int, failureDescription string, finishedAt time.Time) {
+	// 1. 只接收 StartCompanyClient 创建的句柄；nil Context 的原参数错误路径没有 Span，直接跳过。
+	// 不允许把 Controller、Service、入站 HTTP 或第三方 SDK 节点当作本次公司调用的结果载体。
+	if s == nil || s.span == nil || !s.companyHTTP {
+		return
+	}
+	// 2. 保存真实响应状态；没有收到响应时不写入 0，也不从网络错误中推测 HTTP 状态。
+	if statusCode != 0 {
+		s.span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
+	}
+	// 3. 公共请求层已经按完整 JSON 协议确定成败，只使用其固定说明，不记录原始异常或远端正文。
+	// 正常结束不强制设置 OK，保留此前已有的错误；失败标记本身不产生额外日志。
+	if failureDescription != "" {
+		s.Fail(failureDescription)
+	}
+	// 4. 与调用耗时共用同一结束时刻，在输出 finished 日志前结束，排除结束日志写入的开销。
+	// SDK 对重复 End 幂等，直接登记的 defer End 不会延长已完成的调用节点。
 	s.span.End(trace.WithTimestamp(finishedAt))
 }
 

@@ -19,7 +19,7 @@ app/integrations/company/
 ├── base/
 │   ├── client.go                 # 公共 Client 结构及构造方法
 │   ├── config.go                 # 服务及 controller 的共享配置类型
-│   ├── request.go                # 公共 GET/POST JSON 请求及 TraceId 透传
+│   ├── request.go                # 公共 GET/POST JSON 请求、Client Span 及追踪头注入
 │   └── transport.go              # 服务共享 Transport 的构造方法
 └── python-service-template/      # 目标服务包 pythonservicetemplate
     ├── clients.go                # 本服务的分组、注册校验和 Client 装配
@@ -119,13 +119,13 @@ python-service-template:
 
 ### TraceId 透传
 
-公司内部 HTTP 请求统一使用 `TraceId` 请求头。入站中间件确定本次请求的 TraceId 并保存到标准 `context.Context` 后，Controller 通过 `ctx.Request.Context()` 传给 Service；所有 Service 公开业务方法均以标准 Context 为首参，入口建立 Service 操作作用域后，将派生 Context 继续传给具体 Client，不在内部用 `context.Background()` 替换。已有头像生成用例沿用这条传递链；不向 DTO、Params 或共享 Client 字段增加请求级 TraceId。该签名约定同样适用于暂未调用外部依赖的查询及写入用例，详见[Service Context 约定](api-service-validator.md#service-context-约定)。
+公司内部 HTTP 请求使用 W3C `traceparent`、非空 `tracestate`，同时保留兼容 `TraceId` 请求头。入站中间件确定本次请求的 TraceId 并保存到标准 `context.Context` 后，Controller 通过 `ctx.Request.Context()` 传给 Service；所有 Service 公开业务方法均以标准 Context 为首参，入口建立 Service 操作作用域后，将派生 Context 继续传给具体 Client，不在内部用 `context.Background()` 替换。已有头像生成用例沿用这条传递链；不向 DTO、Params 或共享 Client 字段增加请求级 TraceId。该签名约定同样适用于暂未调用外部依赖的查询及写入用例，详见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
-`base.Client.requestJSON` 从传入的 Context 调用 `tracing.TraceID(ctx)` 统一读取标识：优先有效标准 SpanContext，没有标准节点时读取 `WithTraceID` 保存的兼容值；非空时设置出站 `TraceId` 请求头，头名由 `tracing.TraceIDHeaderName` 声明。`GetJSON`、`PostJSON` 及复用这两个方法的所有 company Client 统一生效，具体业务 Client 无须重复设置请求头。
+具体 Client 在公开业务方法入口自动识别 operation，`base.Client.requestJSON` 复用该身份，基于非 nil Context 创建唯一的 CLIENT Span，派生 Context 用于本次日志和请求。发送前，公共层通过 `tracing.Inject` 向本次新请求的 Header 注入标准头，再通过 `tracing.TraceID(ctx)` 设置同一标识的兼容头，头名由 `tracing.TraceIDHeaderName` 声明。下游提取标准头后创建自己的 SERVER Span，其父节点是本次 Client Span，不直接指向上层 Service。`GetJSON`、`PostJSON` 统一生效，具体 Client 和 Transport 不重复创建 Span 或设置追踪头，也不传播 Baggage。
 
-Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后台任务需要链路关联时，由任务入口通过 `tracing.NewTraceID()` 生成一次，再用 `tracing.WithTraceID(ctx, id)` 保存并贯穿一次任务的所有调用；外来标识先用 `tracing.IsValidTraceID(id)` 校验。保存标识不创建 Span 或伪造 SpanId，已有有效标准上下文时沿用其 TraceId。不得在调用过程中用 `context.Background()` 替换已有的执行 Context。
+有有效父 Span 时沿用其 TraceId 并独立生成 Client SpanId；没有父节点时，共享 SDK 沿用合法兼容 TraceId，或在没有合法标识时为本次根调用生成新值。独立后台任务需要多个调用归属同一链路时，由任务入口准备允许边界的父 Span，或通过 `tracing.NewTraceID()` 生成一次，再用 `tracing.WithTraceID(ctx, id)` 保存并贯穿任务；外来标识先用 `tracing.IsValidTraceID(id)` 校验。只保存标识不创建父 Span，多个根调用仅凭同一 TraceId 不能还原彼此调用关系。nil Context 保留原有参数错误，不创建 Span 或后台请求；不得在调用过程中用 `context.Background()` 替换已有执行 Context。
 
-公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP 和用户资料 Controller、Service 已分别创建 Span，公司 Client 日志沿用调用方传入的当前节点；公司调用仍只透传自定义 `TraceId`，尚未创建独立 Client Span 或注入标准追踪头。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
+公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取和标准传播入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP、用户资料 Controller/Service 及公司 HTTP Client 已分别创建 Span，Client 结果写入实际 HTTP 状态及受控失败说明，结束后调用方仍使用自己的 Context。第三方 SDK Span 和导出器尚未接入，标准头本次仅注入公司请求。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 

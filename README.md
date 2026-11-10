@@ -6,7 +6,7 @@
 
 第三方 Client 按功能、子功能及供应商文件组织，装配也由 thirdparty、AI、LLM 逐层完成。当前 Qwen、MiniMax 已支持独立配置读取、SDK 构造和进程启动初始化，通过 `thirdparty.Current().AI.LLM.Qwen`、`thirdparty.Current().AI.LLM.MiniMax` 获取共享实例；其他供应商仍为包占位。每次文本生成须指定模型，不在配置中保存默认模型。
 
-生产 HTTP 入口先提取合法 `traceparent`、`tracestate`，再沿用 Context 标识或合法旧 `TraceId`，缺失或非法时生成新值。公共 HTTPLogging 为每个请求创建一个 SERVER Span，共享 SDK 在没有标准父节点时沿用已确定的 TraceId，独立生成 SpanId；响应头与日志使用同一标识。Span 名称与日志 operation 在路由首次确认时同步冻结，外层响应结束时保存真实状态并结束 Span，超时后内部工作继续保留链路关联。用户资料六个 Controller 方法和对应 Service 业务方法已分别创建子 Span，Client 暂沿用 Service 节点；公司 HTTP 目前仍只透传自定义 TraceId，标准头注入待后续接入。独立使用完整入口时，应先初始化 Logger 和 tracing，再包装 `middleware.TraceID(middleware.HTTPLogging(engine))`；响应等待与收尾另行装配。当前未配置导出器，日志可见 TraceId、SpanId，尚无集中调用树。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)及[HTTP 请求与响应日志](specifications/application/application-log.md#http-请求与响应日志)。
+生产 HTTP 入口先提取合法 `traceparent`、`tracestate`，再沿用 Context 标识或合法旧 `TraceId`，缺失或非法时生成新值。公共 HTTPLogging 为每个请求创建一个 SERVER Span，共享 SDK 在没有标准父节点时沿用已确定的 TraceId，独立生成 SpanId；响应头与日志使用同一标识。Span 名称与日志 operation 在路由首次确认时同步冻结，外层响应结束时保存真实状态并结束 Span，超时后内部工作继续保留链路关联。用户资料六个 Controller 方法和对应 Service 业务方法已分别创建子 Span；公司 HTTP 公共请求层创建独立 CLIENT Span，向下游注入 `traceparent`、非空 `tracestate` 并保留兼容 `TraceId`，第三方 SDK 暂沿用调用方节点。独立使用完整入口时，应先初始化 Logger 和 tracing，再包装 `middleware.TraceID(middleware.HTTPLogging(engine))`；响应等待与收尾另行装配。当前未配置导出器，日志可见 TraceId、SpanId，尚无集中调用树。详细约定见[TraceId 的生成、保存与透传](specifications/application/api-handle.md#24-traceid-的生成保存与透传)及[HTTP 请求与响应日志](specifications/application/application-log.md#http-请求与响应日志)。
 
 ## 启动
 
@@ -235,7 +235,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 接收认证器，创建 Gin Engine，在 `/api` 挂载可选认证，再注册版本及领域路由 |
 | `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
-| `internal/tracing` | 提供 TraceId 与标准上下文能力，启动共享 SDK Provider；HTTP 和用户资料 Controller、Service 已创建 Span，其他 Controller、Service、Client 及导出器待接入 |
+| `internal/tracing` | 提供 TraceId 与标准上下文能力，启动共享 SDK Provider；HTTP、用户资料 Controller/Service 及公司 HTTP Client 已创建 Span，其他 Controller/Service、第三方 SDK Span 及导出器待接入 |
 | `app/http/middleware/trace_id.go` | 在响应等待前确定 TraceId，保存到请求 Context，并写入同名响应头 |
 | `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
 | `app/http/middleware/authentication.go`、`principal.go` | 可选认证；按请求保存、读取可信身份，认证失败时统一输出 |
