@@ -114,7 +114,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 | HTTP 入口 | 每次收到 HTTP 请求时创建，覆盖接收请求至对外响应处理结束 | `SERVER` | HTTP 外层中间件创建和结束，路由匹配后补充注册模板 |
 | Controller 公开接口处理方法 | 每次进入处理接口请求的 Controller 方法时创建，覆盖方法进入至返回或异常退出 | `INTERNAL` | Controller 统一入口与退出封装管理，名称沿用该接口处理方法的 operation |
 | 公司 HTTP Client 调用 | 每次调用具体 Client 业务接口时创建，覆盖公共请求流程中的校验、编码、发送、读取、解码及资源清理 | `CLIENT` | 公司 HTTP 公共请求层管理，操作名称沿用具体 Client 的 operation |
-| 第三方 SDK Client 调用 | 每次调用项目封装的具体 Client 业务方法时创建，覆盖参数校验、SDK 执行及结果处理 | `CLIENT` | 对应功能的公共 SDK 适配层管理，操作名称沿用具体 Client 的 operation |
+| 第三方 SDK Client 调用 | 每次调用项目封装的具体 Client 业务方法时创建，覆盖参数校验、SDK 执行及结果处理 | `CLIENT` | 对应功能的公共 SDK 适配层管理；没有可复用公共流程时，可在具体 Client 的公开业务方法中接入，操作名称沿用该方法的 operation |
 | Service 公开业务方法 | 每次进入对外提供的 Service 业务方法时创建，覆盖方法进入至返回或异常退出 | `INTERNAL` | Service 统一入口与退出封装管理，名称沿用该业务方法的 operation |
 
 Service 范围限于公开业务方法，不包含构造方法、配置加载、关闭资源等生命周期方法，也不包含私有辅助方法、校验和数据转换。Service 调用另一个 Service 的公开业务方法时，被调用方法建立子 Span；同一个方法调用多次时，每次执行分别创建 Span。
@@ -558,6 +558,8 @@ Qwen、MiniMax 的 `GenerateText` 在入口对非 nil Context 调用 `logger.Wit
 | MiniMax | `thirdparty.ai.llm.MiniMaxClient.GenerateText` |
 
 `SDK` 表示第三方调用的实现方式，当前两者统一属于标准 `CLIENT` kind。Span 名称继续复用项目 operation 约定，单次调用的模型不进入名称。后续其他功能的 SDK 在各自公共适配层接入同一套 tracing 能力，不强制复用 OpenAI 兼容协议。
+
+没有可复用公共调用流程时，可以直接在具体 Client 的公开业务方法中接入 Span，由该方法负责创建、Context 传递、结果记录及结束。仍统一复用 `internal/tracing`，名称使用入口自动识别的 operation，一次公开业务调用只创建一个 `CLIENT` Span。后续抽取公共调用流程时，应一并集中 Span 管理，避免具体 Client 与公共层重复创建节点。
 
 ### Span 创建与 Context
 
