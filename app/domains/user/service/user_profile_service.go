@@ -23,6 +23,7 @@ import (
 	"go-service-template/internal/logger"
 	appruntime "go-service-template/internal/runtime"
 	"go-service-template/internal/snowflake"
+	"go-service-template/internal/tracing"
 
 	"gorm.io/gorm"
 )
@@ -60,7 +61,8 @@ var (
 )
 
 // UserProfileService 提供用户资料操作，返回领域模型或用例专属 Result。
-// 公开业务方法统一接收标准 Context 首参，由入口传递 TraceId 和独立执行控制。
+// 公开业务方法统一接收标准 Context 首参，自动识别 operation 并创建本次业务调用的 Service Span。
+// 派生 Context 沿用入口的 TraceId 和执行控制，日志及下游调用使用当前 Service 的 SpanId。
 // 结构体不保存仓储、请求 Context 或本次查询的状态；数据库仍沿用已有会话与事务约定。
 type UserProfileService struct{}
 
@@ -94,16 +96,21 @@ func validateQueryUserProfileByUserIDParams(params QueryUserProfileByUserIDParam
 // 输入非法时返回公共检查错误；访问他人返回 ErrUserProfilePermissionDenied；未命中返回 ErrUserProfileNotFound；
 // 其他查询故障记录操作上下文后原样返回，不替换为通用查询失败错误。
 func (s *UserProfileService) QueryUserProfileByUserID(ctx context.Context, params QueryUserProfileByUserIDParams) (*models.UserProfile, error) {
-	// 1. 在业务入口建立当前 Service 方法的操作作用域，沿用父 Context 的 TraceId 和执行控制。
+	// 1. 在业务入口建立当前 Service 方法的操作作用域和子 Span，沿用父 Context 的 TraceId 和执行控制。
 	// 调用方负责提供非 nil Context；此处不创建 Background，也不把请求上下文写入共享实例。
 	if ctx != nil {
 		// 1.1. 自动解析具名方法，日志使用本方法身份，数据库继续使用原有会话。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 复用自动识别的 operation 创建本次 Service Span，后续日志和下游调用使用派生 Context。
+	// 直接登记 Span 收尾，覆盖正常返回、提前失败和 panic；不改变调用方持有的父 Context。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 独立校验业务 Params，保证非 HTTP 入口同样遵守用户标识的格式与范围要求。
 	lg := logger.Current()
 	if err := validateQueryUserProfileByUserIDParams(params); err != nil {
-		// 2.1. 在输入失败位置直接记录固定说明，原样返回检查错误，不读取或打印用户标识。
+		// 2.1. 输入失败时标记当前 Span 并直接记录固定说明，原样返回检查错误，不读取或打印用户标识。
+		span.Fail("User profile query parameters are invalid")
 		lg.Warn(ctx, "Query user profile rejected", logger.Fields{
 			Error: "User profile query parameters are invalid",
 		})
@@ -111,7 +118,8 @@ func (s *UserProfileService) QueryUserProfileByUserID(ctx context.Context, param
 	}
 	// 3. 在访问仓储前保障本人访问约束；发起方身份真实性仍由各调用入口负责确认。
 	if params.OperatorUserID != params.UserID {
-		// 3.1. 无权访问时直接记录拒绝并返回原有业务错误，不读取目标资料。
+		// 3.1. 无权访问时标记当前 Span 并直接记录拒绝，返回原有业务错误，不读取目标资料。
+		span.Fail("User profile access denied")
 		lg.Warn(ctx, "Query user profile rejected", logger.Fields{
 			Error: "User profile access denied",
 		})
@@ -122,14 +130,16 @@ func (s *UserProfileService) QueryUserProfileByUserID(ctx context.Context, param
 	profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(params.UserID)
 	// 5. 区分明确未命中与技术故障，在各分支直接记录受控说明并保持原有错误映射。
 	if err != nil {
-		// 5.1. 仓储明确未命中时，按本用例语义解释为用户资料不存在。
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 5.1. 仓储明确未命中时标记当前 Span，按本用例语义解释为用户资料不存在。
+			span.Fail("User profile was not found")
 			lg.Warn(ctx, "User profile not found", logger.Fields{
 				Error: "User profile was not found",
 			})
 			return nil, ErrUserProfileNotFound
 		}
-		// 5.2. 技术故障只记录执行阶段，原错误继续返回调用方，避免日志带入 SQL 或驱动细节。
+		// 5.2. 技术故障以固定阶段标记当前 Span 并记录日志，原错误继续返回，避免带入 SQL 或驱动细节。
+		span.Fail("User profile query execution failed")
 		lg.Error(ctx, "Query user profile failed", logger.Fields{
 			Error: "User profile query execution failed",
 		})
@@ -201,16 +211,21 @@ func validateQueryUserProfilePageParams(params QueryUserProfilePageParams) error
 // 输入非法时原样返回公共检查或领域字段规则错误，查询故障记录操作上下文后原样返回。
 // 资料固定按 ID 降序排列，页码超出结果范围时返回空页及实际总数。
 func (s *UserProfileService) QueryUserProfilePage(ctx context.Context, params QueryUserProfilePageParams) (*QueryUserProfilePageResult, error) {
-	// 1. 沿用入口传入的标准 Context，在当前方法建立 Service 操作作用域，不修改父节点。
+	// 1. 沿用入口传入的标准 Context，在当前方法建立 Service 操作作用域和子 Span，不修改父节点。
 	// 非 nil Context 由调用方保证；这里不生成 TraceId、不创建执行期限或替换为 Background。
 	if ctx != nil {
 		// 1.1. 自动取得当前具名业务方法的信息，后续日志沿用本次 Service 的操作身份。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 用自动识别的 operation 创建本次 Service Span，派生 Context 供日志和下游使用。
+	// 直接 defer 收尾，保证正常、错误返回和 panic 均结束本次节点，不增加业务生命周期日志。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 检查分页与筛选 Params，保留输入默认值由调用方显式准备的契约。
 	lg := logger.Current()
 	if err := validateQueryUserProfilePageParams(params); err != nil {
-		// 2.1. 输入非法时直接记录固定说明并原样返回，不执行总数或分页查询。
+		// 2.1. 输入非法时标记当前 Span 并直接记录固定说明，原样返回，不执行总数或分页查询。
+		span.Fail("User profile page query parameters are invalid")
 		lg.Warn(ctx, "Query user profile page rejected", logger.Fields{
 			Error: "User profile page query parameters are invalid",
 		})
@@ -219,7 +234,8 @@ func (s *UserProfileService) QueryUserProfilePage(ctx context.Context, params Qu
 	// 3. 沿用现有仓储及分页处理流程；Context 不写入共享仓储，也不隐式绑定 GORM 会话。
 	result, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
-		// 3.1. 当前分支直接记录查询阶段失败，错误原样返回，日志不输出筛选实参或数据库错误对象。
+		// 3.1. 查询阶段失败时标记当前 Span 并直接记录，错误原样返回，不输出筛选实参或数据库错误对象。
+		span.Fail("User profile page query execution failed")
 		lg.Error(ctx, "Query user profile page failed", logger.Fields{
 			Error: "User profile page query execution failed",
 		})
@@ -285,33 +301,40 @@ func validateCreateUserParams(params CreateUserParams) error {
 // 输入非法时返回领域字段规则错误；重复账户返回 ErrAccountAlreadyExists；
 // 发号或持久化故障记录操作上下文后原样返回。本用例不核验外部身份凭证。
 func (s *UserProfileService) CreateUser(ctx context.Context, params CreateUserParams) (*models.UserProfile, error) {
-	// 1. 为本次创建建立 Service 操作作用域，保留调用方提供的 TraceId、取消和截止时间。
+	// 1. 为本次创建建立 Service 操作作用域和子 Span，保留调用方提供的 TraceId、取消和截止时间。
 	// 调用方应传入非 nil Context；本方法不创建 Background，也不把 Context 保存到 Service 字段。
 	if ctx != nil {
 		// 1.1. 从当前具名方法自动生成操作标识，不把 Params 或用户数据写入操作名称。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 复用自动识别的 operation 创建本次 Service Span，辅助流程沿用返回的 Context。
+	// 直接 defer 结束节点，覆盖所有返回与 panic；创建结果和凭证签发仍由原有流程决定。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 独立校验创建 Params，使 HTTP、后台任务等入口遵守相同业务输入约束。
 	lg := logger.Current()
 	if err := validateCreateUserParams(params); err != nil {
-		// 2.1. 输入失败直接记录并原样返回，不输出账户、昵称或头像等原始字段。
+		// 2.1. 输入失败时标记当前 Span 并直接记录，原样返回，不输出账户、昵称或头像等原始字段。
+		span.Fail("User creation parameters are invalid")
 		lg.Warn(ctx, "Create user rejected", logger.Fields{
 			Error: "User creation parameters are invalid",
 		})
 		return nil, err
 	}
-	// 3. 将当前 Service Context 传给创建辅助流程，其内部日志沿用同一 TraceId 和 operation。
+	// 3. 将当前 Service Context 传给创建辅助流程，其内部日志沿用同一 TraceId、SpanId 和 operation。
 	// 发号、写入与重复账户确认仍按原顺序执行，不改变数据库契约。
 	profile, err := createUser(ctx, params, appruntime.Current().Repositories.UserProfile, snowflake.NextID)
 	if err != nil {
-		// 3.1. 已确认的重复账户属于已知业务冲突，记录为警告后返回原有业务错误。
+		// 3.1. 已确认的重复账户属于已知业务冲突，标记当前 Span，记录为警告后返回原有业务错误。
 		if errors.Is(err, ErrAccountAlreadyExists) {
+			span.Fail("User account already exists")
 			lg.Warn(ctx, "Create user rejected", logger.Fields{
 				Error: "User account already exists",
 			})
 			return nil, err
 		}
-		// 3.2. 其他发号或持久化故障记录固定阶段，原错误继续交给调用方，不打印数据库细节。
+		// 3.2. 其他发号或持久化故障以固定阶段标记当前 Span 并记录，原错误继续返回，不打印数据库细节。
+		span.Fail("User creation execution failed")
 		lg.Error(ctx, "Create user failed", logger.Fields{
 			Error: "User creation execution failed",
 		})
@@ -323,7 +346,7 @@ func (s *UserProfileService) CreateUser(ctx context.Context, params CreateUserPa
 }
 
 // createUser 按次接收仓储和发号函数，不将依赖或单次注册状态保存在 Service 上。
-// Context 沿用 CreateUser 的操作作用域，不在私有辅助函数中重新识别；技术故障保持原始错误值。
+// Context 沿用 CreateUser 的操作作用域和 Span，不在私有辅助函数中重新识别或创建节点；技术故障保持原始错误值。
 func createUser(ctx context.Context, params CreateUserParams, profiles *repository.UserProfileRepository, nextID func() (int64, error)) (*models.UserProfile, error) {
 	// 1. 使用调用方提供的发号函数生成内部 ID，失败时保持原错误，不尝试数据库写入。
 	id, err := nextID()
@@ -393,16 +416,21 @@ func validateGenerateUserAvatarParams(params GenerateUserAvatarParams) error {
 // 两次调用沿用 ctx，各 Client 控制自己的请求预算；任一步失败即结束，不回退原始提示词。
 // 成功仅返回头像地址，不读取或修改数据库；远端故障记录后原样返回。
 func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params GenerateUserAvatarParams) (*GenerateUserAvatarResult, error) {
-	// 1. 在原有标准 Context 上建立当前 Service 的操作作用域，后续两个 Client 共用同一 TraceId。
-	// nil 保留给原有执行路径处理，不在 Service 中补造 Background 或改变远端请求的 Context 契约。
+	// 1. 在原有标准 Context 上建立当前 Service 的操作作用域和子 Span，后续两个 Client 共用同一 TraceId。
+	// 调用方负责提供非 nil Context；不在 Service 中补造 Background，也不改变远端请求的执行预算。
 	if ctx != nil {
 		// 1.1. 下游 Client 可建立自己的派生作用域，返回后不会改写本方法持有的操作身份。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 用自动识别的 operation 创建本次 Service Span，将派生 Context 交给后续两个 Client。
+	// 直接 defer 收尾，覆盖所有返回与 panic；Client 当前沿用该节点，不额外创建自定义步骤 Span。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 取得共享 Logger 并校验业务输入；日志直接写在发生位置，不维护额外的完成状态。
 	lg := logger.Current()
 	if err := validateGenerateUserAvatarParams(params); err != nil {
-		// 2.1. 输入失败在当前分支直接记录，不输出用户文本，已有检查错误继续原样返回。
+		// 2.1. 输入失败时标记当前 Span 并在此直接记录，不输出用户文本，已有检查错误继续原样返回。
+		span.Fail("User avatar generation parameters are invalid")
 		lg.Warn(ctx, "User avatar generation rejected", logger.Fields{
 			Error: "User avatar generation parameters are invalid",
 		})
@@ -416,7 +444,8 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 		Prompt: userAvatarPromptInstruction + params.Prompt,
 	})
 	if err != nil {
-		// 3.1. 优化调用失败时立即记录阶段并原样返回错误，不输出 SDK 对象或回退到原始提示词。
+		// 3.1. 优化调用失败时标记当前 Span 并立即记录阶段，原样返回错误，不输出 SDK 对象或回退提示词。
+		span.Fail("Avatar prompt optimization failed")
 		lg.Error(ctx, "User avatar generation failed", logger.Fields{
 			Error: "Avatar prompt optimization failed",
 		})
@@ -424,7 +453,8 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 	}
 	// 4. 空白生成文本属于本用例的远端结果异常，记录后直接结束，不继续生成图片。
 	if strings.TrimSpace(optimized.Content) == "" {
-		// 4.1. 日志保留固定异常说明，本层已声明错误继续原样返回，不记录生成文本。
+		// 4.1. 以固定说明标记当前 Span 并记录日志，本层已声明错误继续原样返回，不记录生成文本。
+		span.Fail("Avatar prompt optimization returned empty text")
 		lg.Error(ctx, "User avatar generation failed", logger.Fields{
 			Error: "Avatar prompt optimization returned empty text",
 		})
@@ -437,7 +467,8 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 		Prompt: optimized.Content,
 	})
 	if err != nil {
-		// 6.1. 在失败分支直接记录图片生成阶段，原始 Client 错误继续返回，不增加重试。
+		// 6.1. 图片生成失败时标记当前 Span 并直接记录阶段，原始 Client 错误继续返回，不增加重试。
+		span.Fail("Avatar image generation failed")
 		lg.Error(ctx, "User avatar generation failed", logger.Fields{
 			Error: "Avatar image generation failed",
 		})
@@ -499,16 +530,21 @@ func validateUpdateUserProfileParams(params UpdateUserProfileParams) error {
 // 输入非法时返回公共检查或领域字段规则错误；权限、缺失、停用、版本冲突分别返回对应业务错误。
 // 事务执行故障记录操作上下文后原样返回；事务内使用行锁保障状态检查和更新。
 func (s *UserProfileService) UpdateUserProfile(ctx context.Context, params UpdateUserProfileParams) (*models.UserProfile, error) {
-	// 1. 使用调用入口提供的标准 Context 建立 Service 操作作用域，不另行生成请求链路标识。
+	// 1. 使用调用入口提供的标准 Context 建立 Service 操作作用域和子 Span，沿用已有请求链路标识。
 	// 调用方负责传非 nil Context；HTTP 入口已隔离响应等待取消，本方法不自行增加数据库取消。
 	if ctx != nil {
 		// 1.1. 自动识别当前业务方法，Context 仅保存在本次调用的局部变量中。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 以自动识别的 operation 创建本次 Service Span，派生 Context 只保存在当前方法。
+	// 直接 defer 收尾，覆盖正常、错误和 panic 退出，不把追踪 Context 隐式绑定到数据库事务。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 检查完整替换所需的输入约束，参数错误原样交给入口处理。
 	lg := logger.Current()
 	if err := validateUpdateUserProfileParams(params); err != nil {
-		// 2.1. 参数非法时直接记录并返回原错误，不创建事务、读取记录或输出资料字段。
+		// 2.1. 参数非法时标记当前 Span 并直接记录，返回原错误，不创建事务、读取记录或输出资料字段。
+		span.Fail("User profile update parameters are invalid")
 		lg.Warn(ctx, "Update user profile rejected", logger.Fields{
 			Error: "User profile update parameters are invalid",
 		})
@@ -516,7 +552,8 @@ func (s *UserProfileService) UpdateUserProfile(ctx context.Context, params Updat
 	}
 	// 3. 纯输入检查通过后再保障本人操作约束；身份真实性仍由认证入口负责。
 	if params.OperatorUserID != params.UserID {
-		// 3.1. 发起方与目标不一致时直接记录拒绝，返回明确业务错误，不执行更新。
+		// 3.1. 发起方与目标不一致时标记当前 Span 并直接记录拒绝，返回明确业务错误，不执行更新。
+		span.Fail("User profile access denied")
 		lg.Warn(ctx, "Update user profile rejected", logger.Fields{
 			Error: "User profile access denied",
 		})
@@ -525,14 +562,16 @@ func (s *UserProfileService) UpdateUserProfile(ctx context.Context, params Updat
 	// 4. 沿用既有锁读、版本检查和事务更新，不将本次 Context 写回共享数据库或仓储。
 	profile, err := updateUserProfile(params, appruntime.Current().DB.User)
 	if err != nil {
-		// 4.1. 目标缺失、停用和版本冲突属于已知业务结果，记录为警告，错误继续原样返回。
+		// 4.1. 目标缺失、停用和版本冲突属于已知业务结果，标记当前 Span，记录为警告后原样返回。
 		if errors.Is(err, ErrUserProfileNotFound) || errors.Is(err, ErrUserDisabled) || errors.Is(err, ErrUserProfileVersionConflict) {
+			span.Fail("User profile state does not allow this update")
 			lg.Warn(ctx, "Update user profile rejected", logger.Fields{
 				Error: "User profile state does not allow this update",
 			})
 			return nil, err
 		}
-		// 4.2. 技术故障直接记录事务执行阶段，保留原有错误值，不输出 SQL 或驱动错误对象。
+		// 4.2. 技术故障以固定阶段标记当前 Span 并记录，保留原有错误值，不输出 SQL 或驱动错误对象。
+		span.Fail("User profile update execution failed")
 		lg.Error(ctx, "Update user profile failed", logger.Fields{
 			Error: "User profile update execution failed",
 		})
@@ -623,16 +662,21 @@ func validateBatchQueryUserProfilesParams(params BatchQueryUserProfilesParams) e
 // 输入非法时原样返回公共检查错误，查询故障记录操作上下文后原样返回。
 // 部分或全部缺失仍属于正常查询结果，空集合始终返回非 nil 切片。
 func (s *UserProfileService) BatchQueryUserProfiles(ctx context.Context, params BatchQueryUserProfilesParams) (*BatchQueryUserProfilesResult, error) {
-	// 1. 沿用入口的标准 Context，建立当前批量查询的 Service 操作作用域并保留 TraceId。
+	// 1. 沿用入口的标准 Context，建立当前批量查询的 Service 操作作用域和子 Span，保留 TraceId。
 	// 调用方负责提供非 nil Context；本方法不保存请求状态或创建新的根 Context。
 	if ctx != nil {
 		// 1.1. 操作名从具名业务方法识别，不拼接实际用户 ID 或其他业务输入。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
+	// 1.2. 用自动识别的 operation 创建本次 Service Span，日志和后续调用使用派生 Context。
+	// 直接 defer 收尾，覆盖正常、错误返回及 panic；不增加业务日志状态或额外计时变量。
+	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
+	defer span.End()
 	// 2. 在去重前检查提交数量及每个 ID，继续保留既有输入顺序和数量口径。
 	lg := logger.Current()
 	if err := validateBatchQueryUserProfilesParams(params); err != nil {
-		// 2.1. 输入不符合契约时直接记录固定说明并原样返回，不查询仓储或记录实际 ID 列表。
+		// 2.1. 输入不符合契约时标记当前 Span 并直接记录固定说明，原样返回，不查询仓储或记录 ID 列表。
+		span.Fail("User profile batch query parameters are invalid")
 		lg.Warn(ctx, "Batch query user profiles rejected", logger.Fields{
 			Error: "User profile batch query parameters are invalid",
 		})
@@ -641,7 +685,8 @@ func (s *UserProfileService) BatchQueryUserProfiles(ctx context.Context, params 
 	// 3. 沿用原有批量查询及结果整理流程，不因 Context 首参改变仓储 API 或 SQL 执行方式。
 	result, err := batchQueryUserProfiles(params.UserIDs, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
-		// 3.1. 查询故障直接记录执行阶段并原样返回，不把失败当作全部用户缺失。
+		// 3.1. 查询故障以固定阶段标记当前 Span 并直接记录，原样返回，不把失败当作全部用户缺失。
+		span.Fail("User profile batch query execution failed")
 		lg.Error(ctx, "Batch query user profiles failed", logger.Fields{
 			Error: "User profile batch query execution failed",
 		})

@@ -125,7 +125,7 @@ python-service-template:
 
 Client 不自行生成 TraceId；Context 没有值时不附加该头。独立后台任务需要链路关联时，由任务入口通过 `tracing.NewTraceID()` 生成一次，再用 `tracing.WithTraceID(ctx, id)` 保存并贯穿一次任务的所有调用；外来标识先用 `tracing.IsValidTraceID(id)` 校验。保存标识不创建 Span 或伪造 SpanId，已有有效标准上下文时沿用其 TraceId。不得在调用过程中用 `context.Background()` 替换已有的执行 Context。
 
-公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP 和用户资料 Controller 已创建 Span，公司 Client 日志沿用调用方传入的当前节点；公司调用仍只透传自定义 `TraceId`，尚未创建独立 Client Span 或注入标准追踪头。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
+公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP 和用户资料 Controller、Service 已分别创建 Span，公司 Client 日志沿用调用方传入的当前节点；公司调用仍只透传自定义 `TraceId`，尚未创建独立 Client Span 或注入标准追踪头。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 

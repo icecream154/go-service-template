@@ -108,7 +108,7 @@ MySQL 组件为每个启用的命名连接创建独立连接池，完成连通�
 
 `logger.Current()` 返回已经发布的 Logger 指针，初始化前调用会 panic，重复初始化返回错误。包级 `logger.Sync()` 未初始化时直接返回 nil，因此进程入口可以在初始化前登记最终同步；Logger 没有关闭 stdout 或替换全局标准库日志的隐式行为。
 
-`tracing.Current()` 返回 Logger 初始化之后创建的共享 Tracer。Resource 复用服务名、实例标识和已有部署环境，未设置全局 Provider 或导出器。HTTP 入口已创建 SERVER Span，用户资料六个 Controller 方法自动识别 operation 后创建 INTERNAL 子 Span，Service、Client 当前沿用 Controller 节点。包级 `tracing.Shutdown(ctx)` 在业务排空后、日志同步前调用，具体约定见[追踪初始化](application-log.md#tracing-初始化与共享实例)。
+`tracing.Current()` 返回 Logger 初始化之后创建的共享 Tracer。Resource 复用服务名、实例标识和已有部署环境，未设置全局 Provider 或导出器。HTTP 入口已创建 SERVER Span，用户资料六个 Controller 方法和对应 Service 业务方法自动识别 operation 后分别创建 INTERNAL 子 Span，Client 当前沿用 Service 节点。包级 `tracing.Shutdown(ctx)` 在业务排空后、日志同步前调用，具体约定见[追踪初始化](application-log.md#tracing-初始化与共享实例)。
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
@@ -143,7 +143,7 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 4. **Controller、Service 和 Client 显式传递执行 Context。** 所有 Service 公开业务方法统一以 `ctx context.Context` 为首参，Controller 使用内部 `ctx.Request.Context()`，Service 入口建立自己的日志操作作用域，再将派生 Context 继续传给其他 Service、具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个执行 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
 
-现有 `context.WithoutCancel` 保留 TraceId 和标准 SpanContext，HTTP 超时不取消内部工作。已进入用户资料 Controller 时，其日志和下游 Service、Client 使用 Controller SpanId；HTTP 结束日志独立使用 HTTP SpanId。Controller 可以晚于 HTTP Span 结束，晚到结果不改写父节点的响应状态。HTTP 模板绑定不能替换业务的取消隔离 Context；其他日志尚未全部迁移，当前也未配置导出器。日志字段及操作作用域见[请求日志规范](application-log.md)。
+现有 `context.WithoutCancel` 保留 TraceId 和标准 SpanContext，HTTP 超时不取消内部工作。用户资料 Controller 日志使用 Controller SpanId，进入 Service 后，其日志和下游 Client 使用独立的 Service SpanId；HTTP 结束日志独立使用 HTTP SpanId。Controller、Service 可以晚于 HTTP Span 结束，晚到结果不改写父节点的响应状态。HTTP 模板绑定不能替换业务的取消隔离 Context；其他日志尚未全部迁移，当前也未配置导出器。日志字段及操作作用域见[请求日志规范](application-log.md)。
 
 ## 3. 跟随一次 createUser 请求
 
