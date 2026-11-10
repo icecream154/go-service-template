@@ -20,9 +20,10 @@ import (
 	"go-service-template/internal/logger"
 	appruntime "go-service-template/internal/runtime"
 	"go-service-template/internal/snowflake"
+	"go-service-template/internal/tracing"
 )
 
-// Init 按部署环境、Logger、公司及第三方 Client、JWT、雪花、数据库和业务服务的顺序初始化应用依赖。
+// Init 按部署环境、Logger、tracing、公司及第三方 Client、JWT、雪花、数据库和业务服务的顺序初始化应用依赖。
 //
 // ctx 必须非 nil，启动入口负责为它设置初始化时限，并在初始化结束后释放计时器。
 // 此 context 会传递给数据库连接建立与连接检查，用于取消启动或限制等待时间；
@@ -39,8 +40,9 @@ import (
 // 随后由 composition.Init 创建默认服务；该步骤失败时关闭已经创建的连接池。
 // company.Init、thirdparty.Init 自行加载配置并装配 Client，本入口只管理调用顺序和失败清理。
 // logger.Init 自行读取日志配置、生成实例标识并发布共享 Logger；本入口不构造日志输出器。
+// tracing.Init 复用日志元信息和部署环境，自行构造并发布 SDK Provider 与共享 Tracer。
 // 成功返回后，调用方负责数据库及各 Client 空闲连接的最终清理。
-// Logger 在后续初始化失败时仍可使用，日志同步统一交给进程入口处理，不在这里提前结束。
+// Logger 和 tracing 在后续初始化失败时仍保留，追踪关闭和日志同步统一交给进程入口处理。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
 func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultErr error) {
 	// 1. 已取消的启动无需继续读取配置或尝试联网；保留错误链供上层区分取消与普通故障。
@@ -60,6 +62,13 @@ func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultE
 	if err := logger.Init(filepath.Join(configDir, "logger"), deployment); err != nil {
 		// 4.1. Logger 尚未成功发布时停止启动，保留初始化错误供进程入口报告。
 		return nil, fmt.Errorf("initialize application logger: %w", err)
+	}
+	// 4.2. 取得已发布 Logger 的配置副本，仅复用服务名和进程实例标识，不在启动层重新生成。
+	loggerConfig := logger.Current().Config()
+	// 4.3. 只调用 tracing 公共初始化入口；Resource、Provider、采样及共享实例发布均由其内部完成。
+	if err := tracing.Init(loggerConfig.ServiceName, loggerConfig.InstanceID, deployment); err != nil {
+		// 4.3.1. 追踪未完成初始化时停止装配，已经可用的 Logger 由进程入口在最终退出时同步。
+		return nil, fmt.Errorf("initialize application tracing: %w", err)
 	}
 	// 5. 构造公司内部 HTTP Client；这里只传入配置叶子目录和已确认的环境名称。
 	if err := company.Init(filepath.Join(configDir, "integrations", "company"), deployment.Environment); err != nil {

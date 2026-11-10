@@ -1,6 +1,6 @@
 // Package tracing 封装 HTTP、Controller、Service、公司 HTTP Client 和第三方 SDK Client 的 Span 边界。
 // 同时提供 TraceId 的生成、校验、Context 存储及统一读取，兼容尚未接入 Span 的现有调用。
-// 本包通过参数接收 OpenTelemetry TracerProvider，不设置全局实例、不读取配置，也不启动导出器。
+// New 接收外部 Provider；Init 构造进程共享 Provider，不设置 OpenTelemetry 全局实例或启动导出器。
 package tracing
 
 import (

@@ -225,7 +225,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | 位置 | 职责 |
 | --- | --- |
 | `cmd/web` | 参数、信号、调用顺序、HTTP 监听与关闭、退出结果 |
-| `bootstrap` | 管理依赖初始化顺序，调用 logger 初始化入口及 company、thirdparty Client 装配入口，处理启动失败时的资源清理 |
+| `bootstrap` | 管理依赖初始化顺序，调用 logger、tracing 初始化及 company、thirdparty Client 装配入口，处理启动失败时的资源清理 |
 | `internal/logger` | 加载所选环境日志配置、生成实例标识、发布共享 Logger，提供操作作用域及同步 JSON 写入 |
 | `app/integrations/company` | 加载公司服务配置、创建共享 Transport 和具体 Client、发布默认实例并提供获取入口 |
 | `app/integrations/thirdparty` | 选择环境目录，经 AI、LLM 分组逐层装配已注册 Client；根层发布共享实例，清理按功能分组逐层执行 |
@@ -235,7 +235,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 | `app/domains/*/service/*_service.go` | 顶部声明自身错误，按用例组织 Params、可选 Result、输入常量、校验和处理，尾部保存共享实现 |
 | `routers/web.go` | 接收认证器，创建 Gin Engine，在 `/api` 挂载可选认证，再注册版本及领域路由 |
 | `routers/http_handler.go` | 集中配置默认及接口覆盖的响应等待时间，选择一个包装后的 Gin Handler，汇总内部处理收尾 |
-| `internal/tracing` | 提供 TraceId 生成、校验、存储及统一读取，声明自定义 HTTP 头名；封装五类 Span 与标准上下文传播，Span 能力尚未接入启动和实际业务 |
+| `internal/tracing` | 提供 TraceId 生成、校验、存储及统一读取，声明自定义 HTTP 头名；启动时创建共享 SDK Provider，封装五类 Span 与标准传播，实际业务尚未接入 Span，未配置导出器 |
 | `app/http/middleware/trace_id.go` | 在响应等待前确定 TraceId，保存到请求 Context，并写入同名响应头 |
 | `app/http/middleware/response_timeout.go` | 适配标准库响应等待超时，隔离业务取消、丢弃晚到响应并跟踪内部工作 |
 | `app/http/middleware/authentication.go`、`principal.go` | 可选认证；按请求保存、读取可信身份，认证失败时统一输出 |

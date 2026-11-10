@@ -101,7 +101,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 ## Span 与调用链规范
 
-本节约定链路追踪的固定边界。`internal/tracing` 已提供独立构造的公共 Span 与标准上下文封装，Span 能力尚未接入进程启动、HTTP 中间件、Controller、Service 或 Client；TraceId 工具及统一读取入口已被现有流程使用。生产流程仍使用 TraceId、operation 作用域及关联日志，尚未采集或导出 Span。`logger.WithCurrentOperation` 继续只管理操作身份，当前也不能查询调用树。
+本节约定链路追踪的固定边界。`internal/tracing` 已提供公共 Span 与标准上下文封装，并在进程启动时构造 SDK Provider、发布共享 Tracer；HTTP 中间件、Controller、Service 和 Client 尚未接入 Span 创建。TraceId 工具及统一读取入口已被现有流程使用，生产流程尚未采集或导出业务 Span。`logger.WithCurrentOperation` 继续只管理操作身份，当前也不能查询调用树。
 
 日志时间线按时间展示发生了什么，调用树通过 Span 的父子关系展示谁调用了谁，耗时瀑布图结合 Span 的开始、结束时间展示串行、并行及等待过程。Span 表示一次具体操作的执行区间，可以关联多条日志；`started`、`finished` 日志本身不是 Span，也不通过配对日志来推导 Span。
 
@@ -178,9 +178,9 @@ HTTP 入口 Span
 
 Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通道。只增加日志字段不会自动获得调用树；后续仍需由追踪基础设施导出 Span，并由集中查询系统保存和展示。本节先固定采集边界，不代表已经选定或部署收集服务、存储及前端。
 
-### 公共 tracing 包（已实现，Span 尚未接入）
+### 公共 tracing 包（已初始化，业务 Span 尚未接入）
 
-公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。`New(provider trace.TracerProvider)` 显式接收调用方提供的 Provider，构造可并发复用的 `Tracer`；不读取配置、不创建或修改全局 Provider、不启动导出器，也不接管 Provider 的关闭责任。实际标识生成、采样和数据处理由注入的 Provider 决定；实际采集需要 SDK Provider，显式注入 no-op Provider 时沿用其不采集行为。
+公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。独立构造方法 `New(provider trace.TracerProvider)` 接收外部 Provider，其关闭责任仍属于调用方。进程启动通过 `Init(serviceName, instanceID, deployment)` 在包内创建真实 SDK Provider，并通过 `tracing.Current()` 获取共享 Tracer，包级 `Shutdown(ctx)` 管理该 Provider。两种方式均不设置 OpenTelemetry 全局 Provider 或传播器，也不启动导出器；具体启动和退出约定见[tracing 初始化与共享实例](#tracing-初始化与共享实例)。
 
 | 创建入口 | 名称来源 | 固定 kind |
 | --- | --- | --- |
@@ -198,7 +198,7 @@ operation 参数供后续统一入口和公共调用层传递识别结果，不�
 
 `Extract(ctx, carrier)`、`Inject(ctx, carrier)` 使用标准 `propagation.TraceContext` 处理 W3C `traceparent`、`tracestate`，不默认传播 Baggage。提取合法远端上下文只派生 Context、不创建 Span；无合法头时沿用传入 Context。注入由公司 HTTP 公共请求层在发送前显式触发，载体须可写且没有其他请求遗留的追踪头，不自动影响任何现有 HTTP 或 SDK 请求。
 
-`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。将仅有旧 `TraceId` 的 Context 交给 SDK 创建根 Span 时，仍需后续兼容适配，不能认为保存私有 key 就已使 SDK 沿用该 TraceId。进程级 Provider 装配和各实际 Span 边界接入仍留待后续完成。
+`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。将仅有旧 `TraceId` 的 Context 交给 SDK 创建根 Span 时，仍需后续兼容适配，不能认为保存私有 key 就已使 SDK 沿用该 TraceId。进程级 Provider 已完成装配，各实际 Span 边界仍留待后续接入。
 
 ## Service 上下文与业务流程日志
 
@@ -375,4 +375,26 @@ min_level: INFO
 
 初始化全部成功后才一次性发布共享实例，后续通过 `logger.Current()` 获取。初始化前调用 `Current()` 会 panic，重复成功调用 `Init` 返回错误，运行中不重新加载配置或替换实例。包级 `logger.Sync()` 在尚未初始化时返回 nil；已初始化时先取得共享实例快照、释放共享锁，再执行实例同步。
 
-进程入口 `run` 在初始化前登记最终日志同步，覆盖初始化失败、主动取消及正常退出路径；成功启动后，先等待 HTTP 和内部工作结束，再清理 Client 和数据库，最后调用 `logger.Sync()`。未完全排空时沿用异常退出流程，跳过共享资源清理及日志同步，避免等待仍在写日志的后台工作；同步不关闭 stdout，也不代表采集平台已持久化数据。最终故障报告继续使用现有标准库日志兜底，不递归写入发生故障的 Logger。
+### tracing 初始化与共享实例
+
+Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取得配置值副本，将其中的服务名称、实例标识及已有部署配置传给 `tracing.Init(serviceName, instanceID, deployment)`。bootstrap 只负责调用顺序及传值，SDK Resource、Provider、采样策略和共享实例发布均在 [internal/tracing/runtime.go](../../internal/tracing/runtime.go) 内完成，不新增 tracing YAML，不重复读取环境变量，也不生成另一份实例标识。Logger 已依赖 tracing 的 Context 方法，因此 tracing 不反向依赖 Logger。
+
+| 标准 Resource 属性 | 来源 | 与日志的对应关系 |
+| --- | --- | --- |
+| `service.name` | 已初始化 Logger 的 `Config().ServiceName` | 与日志 `service_name` 相同 |
+| `service.instance.id` | 已初始化 Logger 的 `Config().InstanceID` | 与日志 `instance_id` 相同，同一进程保持一致 |
+| `deployment.environment.name` | 已有 `env.Current().Environment` | 与日志 `environment` 相同，不另设环境配置 |
+
+`Init` 校验这些显式元信息后创建不可变 Resource，再创建 SDK TracerProvider 并复用已有 `New(provider)` 完成封装。采样固定为 `ParentBased(AlwaysSample)`：根链路全量采样，子节点尊重父节点决定；不在本步增加采样配置。SDK 自动记录原始 panic 的行为关闭，沿用边界 `End` 的固定说明和原值传播。Provider 和 Resource 的标准行为参考 [OpenTelemetry SDK API](https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace)。
+
+当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 输出到 stdout、文件或远端服务；SDK 初始化本身不会创建 Span。实际五类边界尚未接入，因此普通请求仍只有既有 TraceId 日志，不能据此查看调用树或认定数据已上报。
+
+全部构造成功后，`Init` 在锁保护下一次性发布共享 Tracer 和本包拥有的 Provider；失败不发布部分实例。`tracing.Current()` 初始化前调用会 panic，重复成功初始化返回错误；关闭后不清空指针，也不支持运行中重建。包级 `tracing.Shutdown(ctx)` 未初始化时安全返回 nil，只关闭本包 `Init` 创建的 Provider，不接管独立 `New` 注入的外部 Provider。
+
+### 追踪关闭与最终日志同步
+
+进程入口 `run` 在 bootstrap 之前登记最终清理，覆盖初始化失败、主动取消及正常退出路径。成功启动后先停止 HTTP 并等待内部工作结束，再清理 Client 和数据库，随后调用 `tracing.Shutdown(ctx)`，最后执行 `logger.Sync()`。尚未开始处理请求的启动或监听失败同样可以安全关闭已创建的 Provider。
+
+追踪关闭使用独立的非 nil Context，其超时时长复用 `-shutdown-timeout`，不使用已经取消的进程 Context 或已经释放的启动 Context。该预算在业务排空及共享资源清理后单独创建，与 HTTP 和内部处理共用的原排空预算分开。关闭错误并入原始退出错误，仍继续同步 Logger；当前未配置处理器或导出器，关闭不意味着已有数据被远端保存。
+
+未完全排空时沿用异常退出流程，跳过共享资源清理、Provider 关闭及日志同步，避免后台工作仍在执行时提前终止追踪或等待日志写锁。最终故障报告继续使用现有标准库日志兜底；Logger 同步不关闭 stdout，也不代表采集平台已持久化数据。

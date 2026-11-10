@@ -56,6 +56,7 @@ main → run
   → bootstrap.Init
       → env.Init：读取部署环境和区域
       → logger.Init：读取日志配置、生成实例标识并发布共享 Logger
+      → tracing.Init：复用日志元信息和部署环境，创建 SDK Provider 并发布共享 Tracer
       → company.Init：读取公司服务配置、创建共享 Transport 和 Image Client
       → thirdparty.Init：选择环境目录，经 AI、LLM 分组装配 Qwen、MiniMax 并发布共享实例
       → 加载 JWT 配置、校验密钥并初始化共享签发与认证组件
@@ -106,6 +107,8 @@ MySQL 组件为每个启用的命名连接创建独立连接池，完成连通�
 `thirdparty.Current()` 返回分组集合的值副本，各 SDK Client 指针仍指向同一共享实例；重复初始化报错，配置及实例发布后只读。修改配置通过重启生效；单次调用的模型由 Params 指定，不改变共享 Client。
 
 `logger.Current()` 返回已经发布的 Logger 指针，初始化前调用会 panic，重复初始化返回错误。包级 `logger.Sync()` 未初始化时直接返回 nil，因此进程入口可以在初始化前登记最终同步；Logger 没有关闭 stdout 或替换全局标准库日志的隐式行为。
+
+`tracing.Current()` 返回 Logger 初始化之后创建的共享 Tracer。Resource 复用 Logger 配置副本中的服务名、实例标识和已有部署环境，初始化细节封装在 `internal/tracing`；未设置全局 Provider，未配置导出器，也未接入实际 Span 边界。包级 `tracing.Shutdown(ctx)` 由进程入口在业务排空后、最终日志同步前调用，具体约定见[追踪初始化](application-log.md#tracing-初始化与共享实例)。
 
 当前 Controller 和 Service 都不保存单次请求的数据。Request DTO、Service 参数、操作结果和 Response DTO 在每次请求中独立创建。
 
@@ -545,9 +548,9 @@ HTTP JSON
 
 3. **共享资源只在 HTTP 和内部处理均确认结束后正常关闭。** 两部分收尾均成功时，入口才调用 company、thirdparty 集合的 `CloseIdleConnections()` 清理 HTTP 空闲连接，并关闭数据库。thirdparty 按 AI、LLM 分组逐层清理 Qwen、MiniMax 的空闲连接，不取消在途调用；装配后续实例失败时也清理已创建的实例。启动装配、路由或监听失败、尚未开始处理请求时，应正常释放已创建的资源。HTTP 收尾失败可以强制关闭 HTTP 连接，但这不能取消内部跟踪，更不能据此提前关闭仍被业务使用的连接池。
 
-   `run` 在应用初始化前登记最终 `logger.Sync()`，在已有 Client、数据库清理后同步日志；初始化失败或取消时也会同步已经创建的 Logger，尚未初始化时同步为空操作。共享 Logger 没有内部缓冲，stdout 只暴露写入能力，同步不关闭 stdout，也不调用终端或管道不支持的文件系统同步。
+   `run` 在应用初始化前登记最终追踪关闭和日志同步，在已有 Client、数据库清理后调用 `tracing.Shutdown(ctx)`，随后执行 `logger.Sync()`；初始化失败或取消时也清理已经创建的组件，尚未初始化的组件为空操作。追踪关闭另建独立 Context，时长复用 `-shutdown-timeout`，不使用已经取消的进程或启动 Context，错误合并后仍继续同步日志。共享 Logger 没有内部缓冲，stdout 只暴露写入能力，同步不关闭 stdout，也不调用终端或管道不支持的文件系统同步。
 
-4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭 company、thirdparty 和数据库的共享资源，并跳过 Logger 同步，避免等待仍在写日志的内部工作；随后以失败状态退出。进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
+4. **预算耗尽后仍有内部工作时，按异常停机处理，不报告业务已完成。** 入口记录未完成工作，跳过主动关闭 company、thirdparty 和数据库的共享资源，并跳过 tracing Provider 关闭及 Logger 同步，避免后台工作尚未完成时提前终止追踪或等待日志写锁；随后以失败状态退出。进程退出会释放连接，但不保证执行中的业务完成，也不证明事务已回滚。有限停机预算无法保证内部业务在进程终止后继续执行，客户端仍需按结果未知处理。`HTTPHandler` 同时提供请求处理和收尾入口，进程必须持有同一个装配对象，不能只保存其处理函数后遗失收尾责任。
 
 ## 8. 第一次看代码时的阅读顺序
 

@@ -1,6 +1,6 @@
 // web 是 HTTP 服务的进程入口，负责参数解析、退出信号和应用资源生命周期。
 // 环境、Logger 与数据库等依赖的创建交给 bootstrap；本入口负责在初始化成功后启动服务，
-// 正常退出先结束 HTTP 访问及内部业务，再释放共享资源并同步日志。运行时日志统一使用英文。
+// 正常退出先结束 HTTP 访问及内部业务，再释放共享资源、关闭追踪并同步日志。运行时日志统一使用英文。
 package main
 
 import (
@@ -22,6 +22,7 @@ import (
 	"go-service-template/bootstrap"
 	"go-service-template/env"
 	"go-service-template/internal/logger"
+	"go-service-template/internal/tracing"
 	"go-service-template/routers"
 )
 
@@ -43,7 +44,7 @@ func main() {
 	}
 }
 
-// run 持有资源生命周期：全部依赖初始化成功后监听，HTTP 和内部业务均结束后清理资源，最后同步日志。
+// run 持有资源生命周期：初始化后监听，HTTP 和内部业务均结束后清理资源、关闭追踪，最后同步日志。
 //
 // ctx 是进程级停止通知，args 仅包含命令行参数，不包含可执行文件名。
 // 返回错误交给 main 记录并转换为非零退出码；本函数自身不终止进程。
@@ -88,16 +89,23 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 5. 在 bootstrap 前登记最终日志同步，使 Logger 成功但后续依赖失败的路径也能收尾。
-	// 与现有共享资源共用关闭条件；后登记的 Client/数据库清理 defer 会先执行，Logger 最后同步。
+	// 5. 在 bootstrap 前登记最终追踪关闭和日志同步，覆盖部分初始化成功后的失败退出路径。
+	// 与现有共享资源共用关闭条件；后登记的 Client/数据库清理 defer 先执行，最后关闭追踪并同步日志。
 	closeRuntime := true
 	defer func() {
-		// 5.1. 内部工作未排空时可能仍在写日志，跳过同步以免等待写锁而延长已经耗尽的收尾预算。
-		// Logger 不拥有 stdout，跳过同步也不会关闭或取消后台任务正在使用的输出器。
+		// 5.1. 内部工作未排空时可能仍在结束 Span 或写日志，不能提前关闭 Provider 或等待输出锁。
+		// 跳过主动收尾不会取消后台业务，进程最终失败退出仍由原有 main 流程处理。
 		if !closeRuntime {
 			return
 		}
-		// 5.2. 尚未初始化 Logger 时 Sync 安全返回 nil；成功初始化后同步错误并入进程返回值。
+		// 5.2. 使用独立的有限预算关闭追踪，不复用已取消的进程 Context 或已释放的启动 Context。
+		// 未初始化时 Shutdown 安全返回 nil；关闭错误并入原始错误，之后仍继续同步 Logger。
+		tracingCtx, cancelTracing := context.WithTimeout(context.Background(), *shutdownTimeout)
+		if err := tracing.Shutdown(tracingCtx); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("shut down application tracing: %w", err))
+		}
+		cancelTracing()
+		// 5.3. 尚未初始化 Logger 时 Sync 安全返回 nil；成功初始化后同步错误并入进程返回值。
 		// 最终由 main 的既有错误输出报告，避免用同一个故障 Logger 递归记录同步错误。
 		if err := logger.Sync(); err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("sync application logs: %w", err))
@@ -106,14 +114,14 @@ func run(ctx context.Context, args []string) (resultErr error) {
 
 	// 6. 从进程通知 Context 派生独立启动预算，使初始化同时响应系统停止信号和启动超时。
 	startupCtx, cancelStartup := context.WithTimeout(ctx, *startupTimeout)
-	// 6.1. 统一调用 bootstrap 完成环境、Logger、各 Client、认证和数据库等资源装配，入口不展开组件内部逻辑。
+	// 6.1. 统一调用 bootstrap 完成环境、Logger、tracing、各 Client、认证和数据库装配，不展开内部逻辑。
 	runtime, err := bootstrap.Init(startupCtx, *configDir)
 	// 6.2. 初始化返回后立即释放计时器；成功创建的连接池不会持续使用这个短生命周期 Context。
 	cancelStartup()
 	// 6.3. 初始化没有交付完整 Runtime 时结束启动；bootstrap 负责自身部分资源的失败清理。
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			// 6.3.1. 进程停止通知导致的初始化取消视为正常退出，仍会执行前面登记的 Logger 同步。
+			// 6.3.1. 进程停止通知导致的初始化取消视为正常退出，仍执行已登记的 tracing 关闭和 Logger 同步。
 			return nil
 		}
 		// 6.3.2. 独立启动超时、配置错误或连接故障保留错误链，最终以失败状态退出供部署平台识别。
@@ -125,7 +133,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	thirdpartyClients := thirdparty.Current()
 	defer func() {
 		// 7.1. 未排空时资源可能仍被内部工作使用，保留既有错误输出并跳过主动清理；
-		// 同一个 closeRuntime 标志也会使更外层 Logger defer 跳过同步，最终交由失败退出释放进程资源。
+		// 同一个 closeRuntime 标志也会跳过外层 tracing 关闭和 Logger 同步，最终交由失败退出释放进程资源。
 		if !closeRuntime {
 			log.Printf("Skip shared resource cleanup: HTTP or internal work was not fully drained; process will exit")
 			return
@@ -135,7 +143,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		thirdpartyClients.CloseIdleConnections()
 		companyClients.CloseIdleConnections()
 		if err := runtime.Close(); err != nil {
-			// 7.3. 数据库关闭错误与启动或服务错误合并，不覆盖原有失败原因；之后仍继续执行 Logger defer。
+			// 7.3. 数据库关闭错误与原始错误合并；之后仍继续关闭 tracing 并执行 Logger 同步。
 			resultErr = errors.Join(resultErr, fmt.Errorf("close database connections: %w", err))
 		}
 	}()
@@ -167,7 +175,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	// 12. 持续服务并统一收尾；第一个返回值仅在 HTTP 与内部工作均排空时为 true。
 	// 该值决定两个 defer 是否可以安全执行共享资源清理及 Logger 同步，不由某次请求状态推断。
 	closeRuntime, resultErr = serve(ctx, listener, handler, *shutdownTimeout)
-	// 13. 返回服务与收尾结果，随后逆序执行共享资源清理、Logger 同步；最终错误由 main 报告。
+	// 13. 返回结果，随后逆序执行共享资源清理、tracing 关闭、Logger 同步；最终错误由 main 报告。
 	return resultErr
 }
 

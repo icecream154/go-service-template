@@ -77,6 +77,13 @@ func New(config Config, deployment env.Config, output io.Writer) (*Logger, error
 	}, nil
 }
 
+// Config 返回构造时保存的日志配置值副本，供装配方复用服务名和进程实例标识。
+// 配置发布后只读，修改返回副本不会改变 Logger；不读取文件或生成新的元信息。
+func (l *Logger) Config() Config {
+	// 1. 从已经构造的实例按值复制配置，不暴露内部可变字段，也不反向调用 tracing 初始化。
+	return l.config
+}
+
 // Debug 输出调试日志。fields 可省略或提供一项；低于最低级别时不产生输出。
 // 各级打印方法不返回错误，参数、编码或写入故障在 Logger 内部通过独立 stderr 报告。
 func (l *Logger) Debug(ctx context.Context, message string, fields ...Fields) {
