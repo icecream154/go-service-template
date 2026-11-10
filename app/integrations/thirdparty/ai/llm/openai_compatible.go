@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go-service-template/internal/logger"
+	"go-service-template/internal/tracing"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -62,18 +63,31 @@ func (c *openAICompatibleClient) closeIdleConnections() {
 	}
 }
 
-// generateText 按顺序完成校验、SDK 调用、供应商检查和文本提取，在各结果分支直接记录日志。
+// generateText 统一创建一次第三方 Client Span，完成校验、SDK 调用、供应商检查和文本提取。
 // 具体 Client 提供操作 Context、模型范围及可选的响应校验；不在这里重新识别 operation。
-// 超时、错误链和无重试约定保持原样，HTTP 状态只采用 SDK 实际提供的值。
+// 各结果分支直接结束 Span 并记录原有日志，超时、错误链和无重试约定保持原样。
 func (c *openAICompatibleClient) generateText(ctx context.Context, provider string, params GenerateTextParams, validateResponse func(*openai.ChatCompletion) error, supportedModels ...string) (*GenerateTextResult, error) {
-	// 1. 取得共享 Logger 并记录开始；计时覆盖完整调用，Context 和实参不存入共享 Client。
+	// 1. 取得共享 Logger 并开始计时，覆盖校验、SDK 执行和结果处理，不保存请求状态到共享 Client。
 	lg := logger.Current()
 	startedAt := time.Now()
+	// 1.1. 复用具体入口自动识别的 operation 创建唯一的 Client Span，日志和 SDK 共用派生 Context。
+	// nil Context 不补造 Background，继续保留初始化、模型、Context 的原有检查顺序及参数错误。
+	var span *tracing.Span
+	if ctx != nil {
+		ctx, span = tracing.Current().StartSDKClient(ctx, logger.Operation(ctx))
+	}
+	// 1.2. 直接登记 Span 的异常退出兜底，panic 使用固定说明标记并按原值继续传播。
+	// 业务日志仍在各结果分支直接输出，不使用日志 defer、完成标志或额外生命周期日志。
+	defer span.End()
+	// 1.3. 开始日志使用本次 Client SpanId，不预填耗时或结果，也不重复建立操作作用域。
 	lg.Info(ctx, "LLM text generation started", logger.Fields{Event: logger.EventStarted})
 	// 2. 首先检查初始化，保持优先于模型及 Context 检查的错误顺序，并在失败位置直接打印。
 	if c == nil {
-		// 2.1. 未发出请求时不填状态码；日志为固定阶段说明，返回错误保留原有供应商文案。
-		durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+		// 2.1. 未发出请求时不填状态码；先以相同结束时刻标记 Span 失败，再直接打印原有日志。
+		// 固定阶段说明不包含供应商实参，返回错误继续保留原有供应商文案。
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
+		span.EndSDKClient(0, "LLM client is not initialized", finishedAt)
 		lg.Error(ctx, "LLM text generation finished", logger.Fields{
 			Event:      logger.EventFinished,
 			DurationMS: &durationMS,
@@ -83,8 +97,10 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 	}
 	// 3. 按供应商提供的模型范围精确校验，不改写实参或补充默认模型。
 	if err := params.validate(supportedModels...); err != nil {
-		// 3.1. 输入失败直接记录并原样返回，不把模型实参、提示词或任意错误文本写入日志。
-		durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+		// 3.1. 输入失败先以固定说明结束 Span，再直接记录并原样返回，不保存模型实参或提示词。
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
+		span.EndSDKClient(0, "LLM text generation parameters are invalid", finishedAt)
 		lg.Error(ctx, "LLM text generation finished", logger.Fields{
 			Event:      logger.EventFinished,
 			DurationMS: &durationMS,
@@ -92,10 +108,12 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 		})
 		return nil, err
 	}
-	// 4. 模型校验通过后要求调用方提供 Context，不创建 Background 或生成 TraceId。
+	// 4. 模型校验通过后要求调用方提供 Context；缺少时不创建 Background 或补造根 Span。
 	if ctx == nil {
-		// 4.1. 此时仍未调用 SDK，直接记录缺少上下文并沿用原有错误文案。
-		durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+		// 4.1. 此时仍未调用 SDK，也没有创建 Span；空句柄安全跳过收尾，保留原日志和错误文案。
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
+		span.EndSDKClient(0, "LLM request context is required", finishedAt)
 		lg.Error(ctx, "LLM text generation finished", logger.Fields{
 			Event:      logger.EventFinished,
 			DurationMS: &durationMS,
@@ -103,8 +121,8 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 		})
 		return nil, errors.New("LLM request context is required")
 	}
-	// 5. 派生 SDK 的有限请求预算，保留 TraceId、操作作用域及更早的取消期限。
-	// defer 仅释放 Context 计时资源，日志在实际结果分支打印，不使用延迟日志收尾。
+	// 5. 从本次 Client Context 派生 SDK 请求预算，保留 TraceId、Client SpanId、operation 和更早期限。
+	// cancel 的 defer 只释放计时资源；追踪与日志在各结果分支收尾，不增加 SDK 或 Transport 子 Span。
 	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
 	// 6. 调用 SDK 并取得实际 HTTP 响应；只读取状态，正文读取和关闭仍由 SDK 负责。
@@ -139,20 +157,25 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 				fields.StatusCode = &statusCode
 			}
 		}
-		// 8.4. 即时计算耗时并记录失败，日志输出故障由 Logger 内部处理，返回错误不受影响。
-		durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+		// 8.4. 共用一个结束时刻保存耗时及 Span 结果，再直接记录原有失败日志，不输出原始异常。
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
 		fields.DurationMS = &durationMS
 		fields.Error = "LLM SDK request failed"
+		span.EndSDKClient(statusCode, fields.Error, finishedAt)
 		lg.Error(ctx, "LLM text generation finished", fields)
 		return nil, failure
 	}
 	// 9. 提取文本前执行可选供应商校验，保留 MiniMax 的 base_resp 检查和 ProviderCode。
 	if validateResponse != nil {
-		// 9.1. HTTP 成功但供应商协议或业务状态失败时，直接记录失败，不提前输出成功日志。
+		// 9.1. HTTP 成功但供应商协议或业务状态失败时，仍标记 Span Error 并保留真实 HTTP 状态。
+		// MiniMax 的业务状态由原有钩子判断，公共层不把 HTTP 200 或 SDK 无错误直接当作成功。
 		if err := validateResponse(completion); err != nil {
-			durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+			finishedAt := time.Now()
+			durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
 			fields.DurationMS = &durationMS
 			fields.Error = "LLM provider response validation failed"
+			span.EndSDKClient(statusCode, fields.Error, finishedAt)
 			lg.Error(ctx, "LLM text generation finished", fields)
 			return nil, err
 		}
@@ -160,16 +183,21 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 	// 10. 复用已有候选和 content 检查，协议错误原样返回，合法空字符串仍沿用原有成功语义。
 	result, err := c.textResult(completion)
 	if err != nil {
-		// 10.1. HTTP 200 后的文本协议错误仍记录为失败，保留已知状态且不记录生成内容。
-		durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+		// 10.1. 文本协议错误以固定说明标记 Span 并直接记录，保留已知状态，不记录生成内容。
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
 		fields.DurationMS = &durationMS
 		fields.Error = "LLM text generation response is invalid"
+		span.EndSDKClient(statusCode, fields.Error, finishedAt)
 		lg.Error(ctx, "LLM text generation finished", fields)
 		return nil, err
 	}
-	// 11. 所有处理完成后直接记录成功并返回结果，耗时不含结束日志自身的输出开销。
-	durationMS := float64(time.Since(startedAt)) / float64(time.Millisecond)
+	// 11. 全部协议处理完成后，先按实际结束时刻结束 Span，再直接记录成功并返回原结果。
+	// 成功不强制写 OK，日志耗时与 Span 使用同一结束时刻，不含结束日志自身的输出开销。
+	finishedAt := time.Now()
+	durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
 	fields.DurationMS = &durationMS
+	span.EndSDKClient(statusCode, "", finishedAt)
 	lg.Info(ctx, "LLM text generation finished", fields)
 	return result, nil
 }

@@ -40,7 +40,7 @@ TraceId 的生成、校验、存储与标准 Span 追踪统一位于 [internal/t
 
 生成失败继续返回统一 HTTP 500，不进入业务处理。成功确定标识后，响应头 `TraceId`、Request Context、日志 `trace_id` 及公司 HTTP 请求头使用同一个值。`tracing.WithTraceID` 只负责保存标准上下文缺失时的兼容值，调用方必须通过 `NewTraceID` 取得标识，或先用 `IsValidTraceID` 校验外来值；已有标准 SpanContext 不会被该存储方法覆盖，也不会伪造 SpanId。后台任务同样遵守这个约定，自定义 HTTP 头名统一由 `tracing.TraceIDHeaderName` 声明。
 
-生产 HTTP 入口已接入标准上下文提取和 HTTP Span 创建，同名 `TraceId` 响应头继续兼容既有调用方。有效上游标准上下文建立真正的远端父子关系；只有合法旧 TraceId 时，本地创建同一 TraceId 的根 Span，不伪造上游父 Span。用户资料六个 Controller 接口方法及对应六个 Service 业务方法已接入独立子 Span，公司 HTTP 公共请求层已创建 Client Span 并注入标准追踪头；其他 Controller、Service 及第三方 SDK 的独立 Span 仍待后续接入。
+生产 HTTP 入口已接入标准上下文提取和 HTTP Span 创建，同名 `TraceId` 响应头继续兼容既有调用方。有效上游标准上下文建立真正的远端父子关系；只有合法旧 TraceId 时，本地创建同一 TraceId 的根 Span，不伪造上游父 Span。用户资料六个 Controller 接口方法及对应六个 Service 业务方法已接入独立子 Span，公司 HTTP 公共请求层已创建 Client Span 并注入标准追踪头，Qwen、MiniMax 的文本调用在 llm 公共层创建独立 Client Span；其他 Controller、Service 及其他第三方 SDK 的独立 Span 仍待后续接入。
 
 ## operation 自动识别与 Context 作用域
 
@@ -101,7 +101,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 ## Span 与调用链规范
 
-本节约定链路追踪的固定边界。生产 HTTP 公共入口创建 SERVER Span，用户资料六个 Controller 接口方法及对应六个 Service 业务方法已创建各自的 INTERNAL 子 Span，公司 HTTP 公共请求层创建 CLIENT 子 Span，形成 HTTP → Controller → Service → 公司 HTTP Client 的父子关系。其他尚未接入的 Controller、Service 及第三方 SDK 仍沿用传入 Context 中的当前 Span，同时保留各层 operation。`logger.WithCurrentOperation` 继续只管理操作身份，`logger.Operation(ctx)` 只读已有识别结果。当前未配置导出器，仍不能通过集中查询系统展示调用树。
+本节约定链路追踪的固定边界。生产 HTTP 公共入口创建 SERVER Span，用户资料六个 Controller 接口方法及对应六个 Service 业务方法已创建各自的 INTERNAL 子 Span，公司 HTTP 公共请求层与 Qwen、MiniMax 的 llm 公共调用层分别创建 CLIENT 子 Span；Service 调用两个 Client 时，各自的 Client Span 都以 Service 为父节点。其他尚未接入的 Controller、Service 及其他第三方 SDK 仍沿用传入 Context 中的当前 Span，同时保留各层 operation。`logger.WithCurrentOperation` 继续只管理操作身份，`logger.Operation(ctx)` 只读已有识别结果。当前未配置导出器，仍不能通过集中查询系统展示调用树。
 
 日志时间线按时间展示发生了什么，调用树通过 Span 的父子关系展示谁调用了谁，耗时瀑布图结合 Span 的开始、结束时间展示串行、并行及等待过程。Span 表示一次具体操作的执行区间，可以关联多条日志；`started`、`finished` 日志本身不是 Span，也不通过配对日志来推导 Span。
 
@@ -178,7 +178,7 @@ HTTP 入口 Span
 
 Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通道。只增加日志字段不会自动获得调用树；后续仍需由追踪基础设施导出 Span，并由集中查询系统保存和展示。本节先固定采集边界，不代表已经选定或部署收集服务、存储及前端。
 
-### 公共 tracing 包（已初始化，HTTP、用户资料方法与公司 Client 已接入）
+### 公共 tracing 包（已初始化，HTTP、用户资料方法与现有 Client 已接入）
 
 公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。独立构造方法 `New(provider trace.TracerProvider)` 接收外部 Provider，其关闭责任仍属于调用方。进程启动通过 `Init(serviceName, instanceID, deployment)` 在包内创建真实 SDK Provider，并通过 `tracing.Current()` 获取共享 Tracer，包级 `Shutdown(ctx)` 管理该 Provider。两种方式均不设置 OpenTelemetry 全局 Provider 或传播器，也不启动导出器；具体启动和退出约定见[tracing 初始化与共享实例](#tracing-初始化与共享实例)。
 
@@ -194,11 +194,11 @@ Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通�
 
 operation 参数由入口和公共调用层传递自动识别结果，业务不手写名称。Logger 的操作解析保留原位置，新增只读 `logger.Operation(ctx)` 供追踪边界复用，不重新解析调用栈、不创建作用域或 Span，nil 或识别失败时返回空字符串。tracing 不依赖 Logger，避免重复解析或循环依赖。`StartHTTP` 创建的句柄支持 `SetHTTPRoute` 更新同一 Span 的名称，HTTP 路由层负责沿用已有模板冻结规则；该方法对其他边界不生效。
 
-创建后由边界直接使用 `defer span.End()` 收尾。`span.Fail(description)` 仅设置错误状态和受控说明，不产生新日志、不记录原始 Go error，也不提前结束；日志仍由发生位置的 `lg` 调用输出。正常结束不强制写入 OK，保留已经标记的失败。`End` 的重复调用遵循 SDK 幂等约定；直接作为 defer 执行时，panic 只写入固定的异常退出说明，结束后重新抛出同一值，不记录原始 panic 内容。HTTP 外层使用受限的 `EndHTTP(statusCode, failureDescription, finishedAt)`，公司 HTTP 公共层使用 `EndCompanyHTTP(statusCode, failureDescription, finishedAt)`，分别保存本边界的真实结果及结束时间，再写结束日志；两者仅接受对应创建入口返回的句柄，直接 defer 的 `End` 继续保障意外退出。其他通过额外闭包间接调用 `End` 的边界仍须自行标记异常，本包不根据业务返回值自动推断错误。
+创建后由边界直接使用 `defer span.End()` 收尾。`span.Fail(description)` 仅设置错误状态和受控说明，不产生新日志、不记录原始 Go error，也不提前结束；日志仍由发生位置的 `lg` 调用输出。正常结束不强制写入 OK，保留已经标记的失败。`End` 的重复调用遵循 SDK 幂等约定；直接作为 defer 执行时，panic 只写入固定的异常退出说明，结束后重新抛出同一值，不记录原始 panic 内容。HTTP 外层使用受限的 `EndHTTP(statusCode, failureDescription, finishedAt)`，公司 HTTP 公共层使用 `EndCompanyHTTP(statusCode, failureDescription, finishedAt)`，llm 公共层使用 `EndSDKClient(statusCode, failureDescription, finishedAt)`，分别保存本边界的真实结果及结束时间，再写结束日志；各方法仅接受对应创建入口返回的句柄，直接 defer 的 `End` 继续保障意外退出。其他通过额外闭包间接调用 `End` 的边界仍须自行标记异常，本包不根据业务返回值自动推断错误。
 
 `Extract(ctx, carrier)`、`Inject(ctx, carrier)` 使用标准 `propagation.TraceContext` 处理 W3C `traceparent`、`tracestate`，不默认传播 Baggage。入站 `TraceID` 中间件已调用提取方法，合法远端上下文只派生 Context、不创建 Span；无合法头时沿用传入 Context。公司 HTTP 公共请求层已在新请求的可写 Header 上调用 `Inject`，传入本次 Client 子 Context，不复用其他请求的头部，不自动作用于第三方 SDK。
 
-`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。共享 `Init` 已配置根标识兼容桥，独立 `New(provider)` 仍由调用方负责 Provider 策略；用户资料 Controller、对应 Service 及公司 HTTP Client 已接入独立 Span，其他 Controller、Service 及第三方 SDK 的独立 Span 仍待后续接入。
+`tracing.TraceID(ctx)` 统一读取标准上下文或 `WithTraceID` 保存的兼容值，HTTP 响应头、Logger 正常输出与故障兜底、公司 Client 透传均使用该入口；`tracing.SpanID(ctx)` 只读取有效标准 SpanContext，无标准节点时返回空字符串，不为兼容值补造 SpanId。Logger 的 JSON 写入已自动读取 `span_id`，独立 stderr 故障兜底继续使用原有 TraceId 文本格式。共享 `Init` 已配置根标识兼容桥，独立 `New(provider)` 仍由调用方负责 Provider 策略；用户资料 Controller、对应 Service、公司 HTTP Client 及 Qwen、MiniMax 文本 Client 已接入独立 Span，其他 Controller、Service 及其他第三方 SDK 的独立 Span 仍待后续接入。
 
 ### 用户资料 Controller Span 接入（已实现）
 
@@ -227,7 +227,7 @@ ctx.Request = ctx.Request.WithContext(requestCtx)
 
 `defer span.End()` 只管理追踪生命周期，不集中输出业务日志，不维护业务日志结束状态。正常返回、提前失败和 panic 均结束本次 Controller Span；panic 继续按原值传播。已知的十四个失败分支在发生位置调用 `span.Fail`，覆盖身份或业务权限拒绝、Service 返回错误以及凭证签发失败，仅记录固定阶段说明，不传原始 error 或敏感参数，不增加重复日志。Controller Span 的 Error 表示本次方法未成功完成目标，包含已知业务拒绝；原有 WARN/ERROR 日志级别、业务错误分类及 HTTP 响应保持不变，HTTP 父 Span 仍按自己的边界判断结果。
 
-只有实际进入 Controller 方法才创建该子 Span，认证或 Validator 提前拒绝、未匹配路由等路径仍只有 HTTP Span。纯 DTO 映射、批量列表循环及私有响应辅助函数不创建节点。进入已接入的 Service 业务方法时再创建子 Span，公司 HTTP Client 调用另建子节点，第三方 SDK 当前沿用 Service 节点；Service 返回后 Controller 继续使用自己的 Context，外层 HTTP 日志也独立保存自己的 Context，因此各层后续日志仍属于各自的 Span。
+只有实际进入 Controller 方法才创建该子 Span，认证或 Validator 提前拒绝、未匹配路由等路径仍只有 HTTP Span。纯 DTO 映射、批量列表循环及私有响应辅助函数不创建节点。进入已接入的 Service 业务方法时再创建子 Span，公司 HTTP Client 和 Qwen、MiniMax 文本调用分别在各自公共层另建子节点；Service 返回后 Controller 继续使用自己的 Context，外层 HTTP 日志也独立保存自己的 Context，因此各层后续日志仍属于各自的 Span。
 
 ### 用户资料 Service Span 接入（已实现）
 
@@ -259,7 +259,7 @@ defer span.End()
 
 十九个明确的错误返回分支在发生位置调用 `span.Fail`，覆盖参数错误、权限拒绝、查询未命中、账户冲突、状态或版本冲突、数据库执行故障及头像生成各阶段失败。说明复用该分支已有日志的固定 `Error` 文本，不记录原始错误或用户数据，不改变日志级别、错误返回及响应分类；正常返回和 panic 由直接登记的 `End` 收尾。`Fail` 只更新 Span 状态，不额外输出日志，业务日志仍直接写在原有发生位置，不新增方法级 started/finished、计时变量或日志完成状态。
 
-构造方法、`validate...`、模型转换及私有 `createUser`、分页、批量查询和事务辅助函数不创建 Span；需要日志的辅助函数沿用本次 Service Context，其他辅助函数保持现有签名。私有流程返回的错误由公开业务方法标记 Service 失败。Qwen、MiniMax 当前尚未接入独立 Span，接收 `(T,S)` 时继续使用 `S`，只切换自己的 operation；公司 HTTP Client 在 base 公共层创建子节点 `K`，返回后 Service 仍使用 `(T,S)`。数据库会话、事务、取消和重试行为保持原有约定。
+构造方法、`validate...`、模型转换及私有 `createUser`、分页、批量查询和事务辅助函数不创建 Span；需要日志的辅助函数沿用本次 Service Context，其他辅助函数保持现有签名。私有流程返回的错误由公开业务方法标记 Service 失败。Qwen、MiniMax 的文本调用在 llm 公共层创建子节点 `L`，公司 HTTP Client 在 base 公共层创建子节点 `K`；接收 `(T,S)` 时，两类 Client 分别派生为 `(T,L)`、`(T,K)`，其父节点都为 `S`，返回后 Service 仍使用 `(T,S)`。数据库会话、事务、取消和重试行为保持原有约定。
 
 ## Service 上下文与业务流程日志
 
@@ -279,7 +279,7 @@ Controller 接收请求、处理完成及 Service 正常结果使用 `INFO`；�
 
 ### GenerateUserAvatar 接入示例
 
-Controller 入口自动识别 operation 后创建 HTTP Span 的子节点 `C`，将新 Context 保存回 `ctx.Request`；Service 基于该 Context 识别自己的 operation 并创建子节点 `S`。两层日志的 TraceId 保持一致，SpanId 分别为 `C` 和 `S`，操作身份分别为 `user.UserProfileController.GenerateUserAvatar` 和 `user.UserProfileService.GenerateUserAvatar`。当前 Qwen 日志沿用 `S`，公司图片 Client 的日志使用本次调用独立创建的子节点 `K`，HTTP 开始与结束日志仍使用 HTTP 节点 `H` 的 SpanId。图片 Client 返回后 Service 仍使用 `S`；Service 返回后，Controller 后续日志继续使用 `C`。
+Controller 入口自动识别 operation 后创建 HTTP Span 的子节点 `C`，将新 Context 保存回 `ctx.Request`；Service 基于该 Context 识别自己的 operation 并创建子节点 `S`。两层日志的 TraceId 保持一致，SpanId 分别为 `C` 和 `S`，操作身份分别为 `user.UserProfileController.GenerateUserAvatar` 和 `user.UserProfileService.GenerateUserAvatar`。当前 Qwen 日志使用本次文本调用的独立子节点 `L`，公司图片 Client 的日志使用独立子节点 `K`，两者父节点均为 `S`；HTTP 开始与结束日志仍使用 HTTP 节点 `H` 的 SpanId。任一 Client 返回后 Service 仍使用 `S`；Service 返回后，Controller 后续日志继续使用 `C`。
 
 | 日志边界 | component | level、event | 记录内容 |
 | --- | --- | --- | --- |
@@ -349,7 +349,7 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 })
 ```
 
-当前已实现 Logger 基础写入、操作识别、只读 `Operation(ctx)` 及追踪字段自动填充。HTTP 入口、用户资料六个 Controller、六个 Service 方法及公司 HTTP 公共调用已创建独立 Span，第三方 SDK 暂沿用传入 Context 中的当前节点，在头像用例中为 Service Span。公司 HTTP、Qwen、MiniMax、用户资料六个用例及头像 Validator 的未知校验故障日志已统一使用共享 Logger；其他日志尚未全部迁移，本次未新增测试用例或发起实际调用。
+当前已实现 Logger 基础写入、操作识别、只读 `Operation(ctx)` 及追踪字段自动填充。HTTP 入口、用户资料六个 Controller、六个 Service 方法、公司 HTTP 公共调用及 Qwen、MiniMax 文本调用已创建独立 Span；其他尚未接入的第三方 SDK 沿用传入 Context 中的当前节点。公司 HTTP、Qwen、MiniMax、用户资料六个用例及头像 Validator 的未知校验故障日志已统一使用共享 Logger；其他日志尚未全部迁移，本次未新增测试用例或发起实际调用。
 
 ## HTTP 请求与响应日志
 
@@ -357,9 +357,9 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 
 ### 一次请求的完整流程（当前实现）
 
-进程启动时创建可复用的 TracerProvider 和 Tracer；每次 HTTP 请求进入时创建独立的 HTTP Span。**当前用户资料六个接口实际进入 Controller 后创建 Controller 子 Span，进入对应 Service 业务方法后再创建 Service 子 Span；公司 HTTP Client 调用创建自己的子 Span，第三方 SDK 暂时沿用 Service Span。认证或 Validator 提前拒绝、未匹配等没有进入 Controller 的路径只有 HTTP Span；Controller 内拒绝且未调用 Service 时只有 HTTP 与 Controller 节点。** 下图以头像生成接口的调用顺序为例，未调用 Client 的其他用例省略对应节点。
+进程启动时创建可复用的 TracerProvider 和 Tracer；每次 HTTP 请求进入时创建独立的 HTTP Span。**当前用户资料六个接口实际进入 Controller 后创建 Controller 子 Span，进入对应 Service 业务方法后再创建 Service 子 Span；公司 HTTP Client 调用和 Qwen、MiniMax 文本调用分别创建自己的子 Span。认证或 Validator 提前拒绝、未匹配等没有进入 Controller 的路径只有 HTTP Span；Controller 内拒绝且未调用 Service 时只有 HTTP 与 Controller 节点。** 下图以头像生成接口的调用顺序为例，未调用 Client 的其他用例省略对应节点。
 
-以下使用简写说明标识，真实 TraceId 为 32 个小写十六进制字符，SpanId 为 16 个；`T`、`P`、`H`、`C`、`S`、`K`、`D` 不能直接作为实际请求头值：
+以下使用简写说明标识，真实 TraceId 为 32 个小写十六进制字符，SpanId 为 16 个；`T`、`P`、`H`、`C`、`S`、`L`、`K`、`D` 不能直接作为实际请求头值：
 
 | 简写 | 含义 |
 | --- | --- |
@@ -368,6 +368,7 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 | `H` | 本服务为这次 HTTP 请求新创建的 SpanId |
 | `C` | 用户资料 Controller 方法新创建的 SpanId，其父节点为 `H` |
 | `S` | 用户资料 Service 业务方法新创建的 SpanId，由 Controller 调用时父节点为 `C` |
+| `L` | llm 公共层为本次 Qwen 或 MiniMax 文本调用新创建的 SpanId，由 Service 调用时父节点为 `S` |
 | `K` | 公司 HTTP Client 公共请求层为本次调用新创建的 SpanId，由 Service 调用时父节点为 `S` |
 | `D` | 下游服务提取标准追踪头后新创建的 HTTP SpanId，其父节点为 `K`；要求下游也接入标准追踪 |
 
@@ -380,15 +381,17 @@ flowchart TD
     W -->|"启动内部处理"| E["④ Gin 匹配路由<br/>确定 Span 名称和日志 operation<br/>打印 started 日志"]
     E -->|"进入已接入接口"| F["⑤ Controller 自动识别 operation<br/>创建子 Span C，父节点=H"]
     F --> S["Service 自动识别 operation<br/>创建子 Span S，父节点=C"]
-    S --> I["先调用 Qwen SDK<br/>当前沿用 Service Span S"]
-    I --> K["再调用公司图片 Client<br/>base 创建子 Span K，父节点=S"]
+    S --> L["先调用 Qwen SDK<br/>llm 创建子 Span L，父节点=S"]
+    L --> I["文本调用完成或明确失败<br/>结束 L，打印 finished(T,L)"]
+    I -->|"优化结果可用"| K["Service 以自己的 Context 调用公司图片 Client<br/>base 创建子 Span K，父节点=S"]
     K -->|"发出请求时"| O["注入 traceparent(T,K) 和兼容 TraceId=T<br/>下游支持标准追踪时创建 HTTP Span D，父节点=K"]
     O --> N["公司调用返回或异常退出<br/>结束 K，打印 finished(T,K)"]
     K -->|"发送前失败"| N
-    N --> J["Service 方法返回<br/>结束 S"]
-    I -->|"SDK 失败"| J
+    N --> J["Service 方法返回或异常退出<br/>结束 S"]
+    I -->|"SDK 失败或优化文本为空"| J
+    L -->|"panic，结束 L 后继续传播"| J
     S -->|"Service 内提前返回"| J
-    J --> R["⑥ Controller 方法返回<br/>结束 C"]
+    J --> R["⑥ Controller 方法退出<br/>结束 C"]
     F -->|"Controller 内提前返回"| R
     R -->|"等待期限内完成"| G["外层响应处理结束"]
     E -->|"未匹配或认证、Validator 提前拒绝"| G
@@ -410,32 +413,33 @@ flowchart TD
 
 **② 创建本服务的 HTTP Span。** [HTTPLogging](../../app/http/middleware/http_logging.go) 调用 `StartHTTP` 创建 `H`：有上游 `P` 时，`H` 是 `P` 的子节点；没有父节点时，`H` 是本地根节点。两种情况均使用已经确定的 `T`，本地 `H` 每次独立生成，不直接沿用上游的 SpanId。共享 Provider 的兼容桥保证合法旧 TraceId 不会在创建根 Span 时被替换成另一个值。
 
-**③ 通过 Context 逐层传递。** HTTP 先将 `(T,H)` 传给等待层和 Gin；进入用户资料 Controller 后派生为 `(T,C)`，进入 Service 业务方法后再派生为 `(T,S)`，公司 HTTP 公共调用派生为 `(T,K)`，Qwen 等尚未接入独立 Span 的 SDK 当前沿用 `(T,S)`。派生不修改父 Context，Service 仍持有 `(T,S)`，Controller 仍持有 `(T,C)`，外层 HTTP 状态仍独立持有 `(T,H)`。Logger 按每条日志传入的 Context 读取标识，不在共享实例中保存当前请求身份。Context 在进程内传递，跨进程由公司 HTTP 公共层编码到标准请求头。
+**③ 通过 Context 逐层传递。** HTTP 先将 `(T,H)` 传给等待层和 Gin；进入用户资料 Controller 后派生为 `(T,C)`，进入 Service 业务方法后再派生为 `(T,S)`，Qwen、MiniMax 文本公共调用派生为 `(T,L)`，公司 HTTP 公共调用派生为 `(T,K)`。派生不修改父 Context，Service 仍持有 `(T,S)`，Controller 仍持有 `(T,C)`，外层 HTTP 状态仍独立持有 `(T,H)`。Logger 按每条日志传入的 Context 读取标识，不在共享实例中保存当前请求身份。Context 在进程内传递，跨进程由公司 HTTP 公共层编码到标准请求头。
 
 **④ 路由匹配后确定名称。** HTTP Span 创建时通常还不知道注册模板，名称暂为 `POST <unresolved>`。Gin 匹配头像接口后，更新为 `POST /api/v1/user/userProfile/generateUserAvatar`，同步确定 HTTP 日志的 operation 并打印 `started`。因此 Span 早于开始日志启动，不能把 `started` 日志的打印时刻当成 Span 创建时刻。
 
-**⑤ Controller、Service 和公司 HTTP Client 分别创建子 Span。** 具体具名方法入口通过 `WithCurrentOperation` 自动取得方法身份，追踪边界再用只读 `logger.Operation(ctx)` 作为 Span 名称，无须填写字符串。公司 Client 的创建责任统一放在 base 公共请求层，不从底座方法重新识别 operation。以头像生成流程为例，下表 operation 为阅读简写：
+**⑤ Controller、Service 和已接入的 Client 分别创建子 Span。** 具体具名方法入口通过 `WithCurrentOperation` 自动取得方法身份，追踪边界再用只读 `logger.Operation(ctx)` 作为 Span 名称，无须填写字符串。公司 Client 的创建责任统一放在 base 公共请求层，Qwen、MiniMax 的创建责任放在 llm 公共层；公共层均复用已有 operation，不从底座方法重新识别。以头像生成流程为例，下表 operation 为阅读简写：
 
 | 写日志的位置 | trace_id | span_id | operation 简写 |
 | --- | --- | --- | --- |
 | HTTP 请求开始 | `T` | `H` | `POST .../generateUserAvatar` |
 | Controller | `T` | `C` | `UserProfileController.GenerateUserAvatar` |
 | Service | `T` | `S` | `UserProfileService.GenerateUserAvatar` |
-| Qwen Client | `T` | `S` | `QwenClient.GenerateText` |
+| Qwen Client | `T` | `L` | `QwenClient.GenerateText` |
+| Qwen Client 返回后，Service 继续处理 | `T` | `S` | `UserProfileService.GenerateUserAvatar` |
 | 公司图片 Client | `T` | `K` | `ImageGenClient.GenerateImage` |
 | 公司图片 Client 返回后，Service 继续处理 | `T` | `S` | `UserProfileService.GenerateUserAvatar` |
 | Service 返回后，Controller 继续处理 | `T` | `C` | `UserProfileController.GenerateUserAvatar` |
 | HTTP 响应结束 | `T` | `H` | `POST .../generateUserAvatar` |
 
-operation 说明日志来自哪个操作，SpanId 说明关联哪一次执行。`WithCurrentOperation` 本身仍只更新身份，Controller 另由 `StartController` 创建 `C`，Service 由 `StartService` 创建 `S`，公司 HTTP 公共层由 `StartCompanyClient` 创建 `K`。Qwen、MiniMax 尚未创建 SDK Span，因此继续使用传入的 `S`。
+operation 说明日志来自哪个操作，SpanId 说明关联哪一次执行。`WithCurrentOperation` 本身仍只更新身份，Controller 另由 `StartController` 创建 `C`，Service 由 `StartService` 创建 `S`，llm 公共层由 `StartSDKClient` 创建 `L`，公司 HTTP 公共层由 `StartCompanyClient` 创建 `K`。`L` 和 `K` 各自基于 Service 的 Context 创建，属于同一父节点下的两次独立调用；Qwen 返回后不会让公司调用变成 `L` 的子节点。
 
 发出公司请求时，`tracing.Inject` 把 `(T,K)` 编码为 `traceparent`，其中父节点字段是本次 Client 的 `K`，不是 Service 的 `S`。有值时一并透传 `tracestate`，旧 `TraceId` 头为同一个 `T`；代码不手工拼接标准头。下游正确提取后创建新的 SERVER Span `D`，形成 `S → K → D`，不会直接沿用 `K` 作为自己的执行节点。
 
-**⑥⑦ 各边界分别结束。** 公司 HTTP 公共调用在响应读取、解码及关闭完成后保存实际结果、结束 `K` 并写自己的 `finished`；随后 Service 方法返回或异常退出时结束 `S`，Controller 方法退出时结束 `C`。正常路径由 HTTP 外层保存实际响应状态和结束时刻、结束 `H`，再打印 HTTP 的 `finished`。超时路径可以先结束 `H`，内部稍后再分别结束 `K`、`S` 和 `C`。结束 Span 不删除 Context 标识；Client 返回后 Service 仍使用 `(T,S)`，Service 返回后 Controller 仍使用 `(T,C)`，HTTP 结束日志始终使用自己的 `(T,H)`。HTTP 的 5xx、写入或异常故障按原规则判断，普通 4xx 不仅凭状态标记服务端故障；公司 Client 则沿用只接受 HTTP 200 且成功处理正文的结果规则。
+**⑥⑦ 各边界分别结束。** llm 公共调用完成 SDK 执行、供应商校验及文本提取后，保存实际结果、结束 `L` 并在明确结果分支写自己的 `finished`；公司 HTTP 公共调用在响应读取、解码及关闭完成后保存实际结果、结束 `K` 并写自己的 `finished`。两类 Client 若发生 panic，由直接登记的 `End` 结束节点并继续传播，llm 不额外补写结束日志。随后 Service 方法返回或异常退出时结束 `S`，Controller 方法退出时结束 `C`。正常路径由 HTTP 外层保存实际响应状态和结束时刻、结束 `H`，再打印 HTTP 的 `finished`。超时路径可以先结束 `H`，内部仍在执行的 `L` 或 `K` 可以稍后结束，随后再结束 `S` 和 `C`。结束 Span 不删除 Context 标识；Client 返回后 Service 仍使用 `(T,S)`，Service 返回后 Controller 仍使用 `(T,C)`，HTTP 结束日志始终使用自己的 `(T,H)`。HTTP 的 5xx、写入或异常故障按原规则判断，普通 4xx 不仅凭状态标记服务端故障；公司 Client 则沿用只接受 HTTP 200 且成功处理正文的结果规则。
 
 ### 等待超时后的 Span 与日志
 
-HTTP Span 结束不表示内部业务已经结束。下面假设某个已接入 Controller、Service 和公司 HTTP Client Span 的接口等待预算为 3 秒，并且已经发出公司 HTTP 请求，仅用于解释时间顺序；实际预算按路由配置，头像接口不是本例中的 3 秒。下游 `D` 节点仅在对方也支持标准追踪时存在。
+HTTP Span 结束不表示内部业务已经结束。下面假设某个已接入 Controller、Service、llm 和公司 HTTP Client Span 的接口等待预算为 3 秒，Qwen 已成功返回并发出公司 HTTP 请求，仅用于解释时间顺序；实际预算按路由配置，头像接口不是本例中的 3 秒。下游 `D` 节点仅在对方也支持标准追踪时存在。
 
 ```mermaid
 sequenceDiagram
@@ -443,6 +447,7 @@ sequenceDiagram
     participant H as HTTP入口
     participant C as Controller
     participant S as Service
+    participant L as LLM Client
     participant K as 公司HTTP Client
     participant D as 下游HTTP服务
     U->>H: 发起请求
@@ -451,6 +456,11 @@ sequenceDiagram
     Note over C: 创建 Controller Span C，父节点=H
     C->>S: 传入 Context(T,C)
     Note over S: 创建 Service Span S，父节点=C
+    S->>L: 传入 Context(T,S)
+    Note over L: 创建 Client Span L，父节点=S
+    L->>L: SDK 使用 Context(T,L)，不注入内部追踪头
+    Note over L: SDK 与结果处理完成，结束 L，打印 finished(T,L)
+    L-->>S: 返回优化文本，Service 继续使用 Context(T,S)
     S->>K: 传入 Context(T,S)
     Note over K: 创建 Client Span K，父节点=S
     K->>D: traceparent(T,K)，TraceId=T
@@ -467,7 +477,7 @@ sequenceDiagram
     Note over C: 记录方法处理结果，结束 C
 ```
 
-响应等待层隔离业务取消并保留 Context 值，超时不会自动取消内部工作。晚到的公司 Client 日志关联 `K`，Service 日志及尚未接入独立 Span 的 SDK 日志关联 `S`，Service 返回后的 Controller 日志仍关联 `C`；未进入 Service 的 Controller 日志使用 `C`，尚未接入 Controller 的路径继续沿用 `H`。公司 Client 仍受自己的原有请求超时控制，不因入站等待超时而放宽预算。超时后才进入 Controller 时也可基于保留的 `H` 创建子节点，随后进入 Service 和公司 Client 再创建 `S`、`K`，父节点无需仍在执行。晚到处理不会重启或延长 `H`，也不会改写已选定的 503；响应写出不保证调用方已完整接收正文。
+响应等待层隔离业务取消并保留 Context 值，超时不会自动取消内部工作。若等待期限在 LLM 调用期间结束，`H` 同样可先结束，而 `L` 继续执行至其实际结果或自身预算到期。晚到的 Qwen、MiniMax 调用日志关联各自的 `L`，公司 Client 日志关联 `K`，Service 日志关联 `S`，其他未接入 SDK 继续沿用传入的节点，Service 返回后的 Controller 日志仍关联 `C`；未进入 Service 的 Controller 日志使用 `C`，尚未接入 Controller 的路径继续沿用 `H`。各 Client 仍受自己的原有请求超时控制，不因入站等待超时而放宽预算。超时后才进入 Controller 时也可基于保留的 `H` 创建子节点，随后进入 Service、llm 和公司 Client 再创建 `S`、`L`、`K`，父节点无需仍在执行。晚到处理不会重启或延长 `H`，也不会改写已选定的 503；响应写出不保证调用方已完整接收正文。
 
 当前 stdout JSON 日志能够显示上述标识，但没有配置 SpanProcessor 或 Exporter；完整 Span 数据未被集中保存，前端调用树也尚未具备。创建 Span、关联日志、导出和查询是分别需要接入的能力。
 
@@ -540,28 +550,60 @@ Header 为本次请求独立创建，不携带其他调用遗留的追踪头，�
 
 ## LLM 文本调用日志
 
-Qwen、MiniMax 的 `GenerateText` 在入口对非 nil Context 调用 `logger.WithCurrentOperation`，自动建立 `component=client` 和具体方法的操作身份，再将派生 Context 传给现有 `openai_compatible.go` 中的公共 `generateText` 方法。具体 Client 不手写操作名，也不重复维护日志计时或结束状态。
+Qwen、MiniMax 的 `GenerateText` 在入口对非 nil Context 调用 `logger.WithCurrentOperation`，自动建立 `component=client` 和具体方法的操作身份，再将派生 Context 传给现有 `openai_compatible.go` 中的公共 `generateText` 方法。公共层通过 `logger.Operation(ctx)` 读取已有身份，创建本次调用唯一的 `CLIENT` Span；不重新扫描调用栈，也不把公共底座或供应商 SDK 的方法名当成 operation。具体 Client 不手写操作名，不重复创建 Span、维护日志计时或结束状态。
 
-| Client | operation |
+| Client | operation 与 Span 名称 |
 | --- | --- |
 | Qwen | `thirdparty.ai.llm.QwenClient.GenerateText` |
 | MiniMax | `thirdparty.ai.llm.MiniMaxClient.GenerateText` |
 
+`SDK` 表示第三方调用的实现方式，当前两者统一属于标准 `CLIENT` kind。Span 名称继续复用项目 operation 约定，单次调用的模型不进入名称。后续其他功能的 SDK 在各自公共适配层接入同一套 tracing 能力，不强制复用 OpenAI 兼容协议。
+
+### Span 创建与 Context
+
+公共方法取得共享 Logger 并记录日志计时起点后，在开始日志之前，对非 nil Context 调用 `tracing.Current().StartSDKClient(ctx, logger.Operation(ctx))`。返回的 Client 子 Context 用于开始、结束日志及 `context.WithTimeout`，有限预算的 Context 再交给 `c.sdk.New`，从而让日志、SDK 执行和结果处理属于同一次 Client 调用。Span 覆盖初始化检查、参数校验、SDK 执行、供应商响应检查及文本提取；SDK 内部方法、HTTP Transport 和内部重试不额外创建节点。
+
+Service 传入 `(T,S)` 时，本次文本调用得到 `(T,L)`，`L` 的父节点是 `S`；每次调用生成独立 SpanId，并发调用也不共享请求状态。方法返回后，Service 仍使用 `(T,S)` 及自己的 operation；随后调用公司图片 Client 时，以 `S` 创建另一个子节点 `K`，不会把 `K` 挂到已经结束的 `L` 下。非 nil Context 没有有效父节点时，共享 Provider 沿用合法兼容 TraceId 创建根 Span，或在没有合法标识时生成新值；读取日志标识的方法本身不生成值。
+
+nil Context 跳过 Span 创建，保留原有的初始化、Params、Context 检查顺序及对应错误优先级，仍在明确返回分支记录失败日志，不补造 Background。公开入口也不使用 `WithCurrentOperation(nil)` 将参数错误转换成可执行的后台请求。请求 Context、单次 Span、计时和响应状态只保存在本次调用的局部变量，不写入共享 Client。
+
+### 生命周期日志与结果收尾
+
 | 日志边界 | level | event | 结果字段 |
 | --- | --- | --- | --- |
-| 进入公共文本调用流程 | `INFO` | `started` | 沿用具体 Client 的操作作用域和 TraceId，不预填耗时或状态 |
+| 进入公共文本调用流程 | `INFO` | `started` | 使用具体 Client operation、同一 TraceId 和本次独立 Client SpanId，不预填耗时或状态 |
 | 文本调用全部处理成功 | `INFO` | `finished` | 记录 `duration_ms`，SDK 提供实际 HTTP 状态时记录 `status_code`，省略 `error` |
 | 参数、执行或协议失败返回 | `ERROR` | `finished` | 记录 `duration_ms`、固定失败阶段说明；保留 SDK 已提供的实际 HTTP 状态 |
 
-公共方法按顺序执行 Client 已初始化检查、供应商支持模型校验、Context 检查、SDK 调用、供应商特有响应校验及公共文本提取，并在成功或失败返回的位置直接打印日志。调用和日志集中在这一个方法中，不再拆分额外执行层或单独维护日志状态结构。提前失败也记录结束；MiniMax 的 `base_resp` 校验和无有效候选文本等协议错误属于本次调用失败，不能仅凭 SDK 返回 HTTP 200 就记录成功。原有参数错误、`ClientError`、错误链及 MiniMax `ProviderCode` 的返回语义保持一致，不补模型默认值、不额外重试，也不改变 Client 的超时控制。
+公共方法继续按顺序执行 Client 初始化检查、供应商支持模型校验、Context 检查、SDK 调用、供应商特有响应校验及公共文本提取，在成功或失败返回的位置直接打印原有日志。调用、Span 接入和日志集中在这一个方法中，不新增执行层、日志状态结构或延迟日志收尾；一次正常调用仍是原有的一条 started、一条 finished。提前失败同样记录结束。原有参数错误、`ClientError`、错误链及 MiniMax `ProviderCode` 的返回语义保持一致，不补模型默认值、不额外重试，也不改变 Client 的超时控制。
 
-`duration_ms` 从进入公共方法起计算，覆盖校验、SDK 执行、供应商响应检查和文本提取；开始日志同步输出的开销可能计入，结束日志自身的输出开销不计入。日志不使用 defer 收尾或完成标志：正常成功和已知错误返回各自在返回前记录 `finished`；panic 沿原有异常处理路径传播，不额外补写 LLM 结束日志。SDK 调用预算仍使用原有的 `defer cancel()` 清理计时资源。Controller、Service 的业务流程日志同样在发生位置直接打印。
+各明确结果分支先取得 `finishedAt`，用该时刻计算 `duration_ms`，再调用 `span.EndSDKClient(statusCode, failureDescription, finishedAt)`，最后直接输出 finished 日志。这个受限方法仅接受 `StartSDKClient` 返回的句柄，将已知的 HTTP 状态写入 `http.response.status_code`，并使用固定失败说明标记 Error、按指定时刻结束 Span。无响应时传 0，日志与 Span 均省略 HTTP 状态；成功不强制写 OK，也不覆盖已有错误。nil Context 路径没有 Span，结束方法安全跳过，不隐式创建节点或产生日志。
 
-公共 SDK 适配通过逐次调用的 `option.WithResponseInto` 读取实际响应状态，SDK 返回 HTTP 错误时也可使用 `openai.Error.StatusCode` 提供的状态。HTTP 200 后的 SDK 读取或解码失败、MiniMax 扩展状态失败、公共文本提取失败，结束日志仍保留已知的 HTTP 状态并记录失败。未取得状态或 SDK 因取消等原因未提供状态时省略 `status_code`，不推断为 200。MiniMax 的 `base_resp.status_code` 是供应商业务状态，不写入 HTTP `status_code`；供应商错误码继续保留在返回的错误对象中，不新增日志字段。
+下表的 Error 标记适用于已创建 Span 的调用。传入 nil Context 时，无论最终先命中初始化、Params 还是缺少 Context 的错误分支，都不会创建 Span，仍按原顺序返回对应错误并记录日志。
 
-日志仅记录固定阶段说明，不输出提示词、生成文本、目标 URL、密钥、凭证、SDK 对象、远端正文或原始错误文本。具体方法及 SDK 派生 Context 保留同一个 TraceId，不在 Client 中生成标识，也不向第三方发送自定义 `TraceId` 请求头。请求 Context 与单次日志状态不保存在共享 Client 字段中。
+| 结果分支 | Span 结果与受控说明 |
+| --- | --- |
+| Client 未初始化 | Error，`LLM client is not initialized` |
+| Params 不符合供应商模型范围或其他输入约束 | Error，`LLM text generation parameters are invalid` |
+| 缺少 Context | 保留原参数错误，没有创建 Span |
+| SDK 请求错误、取消或超时 | Error，`LLM SDK request failed` |
+| 供应商响应校验失败 | Error，`LLM provider response validation failed` |
+| 无有效候选或文本结构不符合协议 | Error，`LLM text generation response is invalid` |
+| SDK、供应商检查及文本提取均成功 | 正常结束，保留默认 Unset，不额外设置 OK |
 
-公共日志使用启动时初始化的共享 Logger，局部变量统一命名为 `lg`，直接调用无返回值的四级打印方法；输出故障由 Logger 内部使用独立 stderr 兜底。发起文本调用前必须完成 Logger 初始化，未初始化时沿用 `logger.Current()` 的 panic 契约。本节只覆盖 Qwen、MiniMax 当前的单轮非流式文本调用，不代表其他 SDK 或其他调用方式已经接入。
+公共 SDK 适配继续通过逐次调用的 `option.WithResponseInto` 读取实际响应状态，SDK 返回 HTTP 错误时也可使用 `openai.Error.StatusCode` 提供的状态。HTTP 200 后的 SDK 读取或解码失败、MiniMax 扩展状态失败、公共文本提取失败，日志和 Span 都保留已知的 HTTP 200，同时标记本次调用失败，不能只凭 HTTP 状态判断成功。MiniMax 的 `base_resp.status_code` 是供应商业务状态，不写入 HTTP `status_code` 或 `http.response.status_code`；非零业务状态使本次 Span 为 Error，供应商错误码继续保留在返回的错误对象中，不新增日志字段。
+
+`duration_ms` 从公共方法开始计算，覆盖校验、SDK 执行、供应商响应检查和文本提取，开始日志同步输出的开销可能计入；结果分支的 Span 结束时间与日志耗时共用同一 `finishedAt`，结果整理和结束日志输出时间不计入。Span 的开始时间由 SDK 在创建时记录，与日志计时起点是相邻实际时刻，不能用日志时间反推。SDK 调用预算仍由原有 `defer cancel()` 清理。
+
+公共方法直接登记 `defer span.End()`，仅保障意外退出及 panic 的追踪收尾，不把业务日志放进 defer。正常结果分支已提前结束 Span，重复 End 由 SDK 幂等处理，不延长执行区间；panic 使用固定异常退出说明标记 Error 并继续传播原值，不记录原始 panic，也不额外补写 LLM finished 日志。Controller、Service 的流程日志仍在实际业务位置直接打印。
+
+### 字段边界与初始化
+
+日志及 Span 仅保存固定失败阶段说明，不输出提示词、生成文本、目标 URL、密钥、凭证、SDK 对象、远端正文或原始错误文本；本次不新增模型、提示词或供应商业务状态属性。Span 的错误状态和日志 ERROR 分别由公共结果分支设置，`span.Fail` 和结束方法不额外打印日志，Logger 也不根据级别自动改变 Span 状态。
+
+第三方调用仅建立本项目的 Client 节点，不默认向供应商发送 `TraceId`、`traceparent` 或 `tracestate`，供应商内部调用过程不在本次可观测范围内。公司 HTTP 公共请求层仍按前文注入标准追踪头，两类调用的传播约定分别保留。
+
+公共层使用启动时初始化的共享 Logger 和 Tracer，Logger 局部变量统一命名为 `lg`，直接调用无返回值的四级打印方法；输出故障由 Logger 内部使用独立 stderr 兜底。发起调用前必须完成 Logger 初始化，非 nil Context 的调用还必须完成 tracing 初始化，未初始化按共享实例契约 panic，不在请求时补造实例。日志级别过滤不影响 Span 创建和结果记录。当前没有 SpanProcessor 或 Exporter，独立 Span 的创建不代表已上报或集中保存；本节只覆盖 Qwen、MiniMax 当前的单轮非流式文本调用，其他 SDK 和其他调用方式按各自公共层另行接入。
 
 ## 启动初始化与共享实例
 
@@ -594,7 +636,7 @@ Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取
 
 共享 Provider 通过私有 `contextIDGenerator` 兼容根 TraceId：只有缺少有效父节点时才读取已校验的兼容值，没有合法值则生成随机 TraceId；根与子 Span 的 SpanId 始终独立随机生成并排除全零。有效上游父链路由 SDK 原样继承，不伪造父 Span 或将外来 TraceId 声明为必然随机，独立 `New(provider)` 的策略不变。
 
-当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 数据输出到 stdout、文件或远端服务。HTTP 入口、用户资料六个 Controller、六个 Service 方法及公司 HTTP Client 已创建 Span，JSON 日志可看到各自标识；初始化本身不创建 Span，第三方 SDK 尚未建立独立节点，也不能据此查看集中调用树或认定数据已上报。
+当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 数据输出到 stdout、文件或远端服务。HTTP 入口、用户资料六个 Controller、六个 Service 方法、公司 HTTP Client 及 Qwen、MiniMax 文本调用已创建 Span，JSON 日志可看到各自标识；初始化本身不创建 Span，其他第三方 SDK 尚未建立独立节点，也不能据此查看集中调用树或认定数据已上报。
 
 全部构造成功后，`Init` 在锁保护下一次性发布共享 Tracer 和本包拥有的 Provider；失败不发布部分实例。`tracing.Current()` 初始化前调用会 panic，重复成功初始化返回错误；关闭后不清空指针，也不支持运行中重建。包级 `tracing.Shutdown(ctx)` 未初始化时安全返回 nil，只关闭本包 `Init` 创建的 Provider，不接管独立 `New` 注入的外部 Provider。
 

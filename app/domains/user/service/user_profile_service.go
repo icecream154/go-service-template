@@ -423,7 +423,7 @@ func (s *UserProfileService) GenerateUserAvatar(ctx context.Context, params Gene
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 1.2. 用自动识别的 operation 创建本次 Service Span，将派生 Context 交给后续两个 Client。
-	// 直接 defer 收尾，覆盖所有返回与 panic；Client 当前沿用该节点，不额外创建自定义步骤 Span。
+	// 直接 defer 收尾，覆盖所有返回与 panic；各 Client 基于此 Context 创建子 Span，不额外创建步骤 Span。
 	ctx, span := tracing.Current().StartService(ctx, logger.Operation(ctx))
 	defer span.End()
 	// 2. 取得共享 Logger 并校验业务输入；日志直接写在发生位置，不维护额外的完成状态。

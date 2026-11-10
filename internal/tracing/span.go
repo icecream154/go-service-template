@@ -18,6 +18,8 @@ type Span struct {
 	httpMethod string
 	// companyHTTP 仅由 StartCompanyClient 设置，限制公司 HTTP 结果只能提交到对应的调用节点。
 	companyHTTP bool
+	// sdkClient 仅由 StartSDKClient 设置，限制第三方 SDK 结果只能提交到对应的 Client 节点。
+	sdkClient bool
 }
 
 // Fail 将本次执行标记为失败，description 必须是调用边界提供的受控说明。
@@ -91,16 +93,37 @@ func (s *Span) EndCompanyHTTP(statusCode int, failureDescription string, finishe
 	if s == nil || s.span == nil || !s.companyHTTP {
 		return
 	}
-	// 2. 保存真实响应状态；没有收到响应时不写入 0，也不从网络错误中推测 HTTP 状态。
+	// 2. 将已经确认的结果交给 Client 公共收尾，保留公司协议自身的成功和失败判断。
+	s.endClient(statusCode, failureDescription, finishedAt)
+}
+
+// EndSDKClient 保存项目封装的一次第三方 SDK 调用结果，按功能公共层取得的结束时刻结束 Span。
+// statusCode 仅在 SDK 提供真实 HTTP 状态时填写，否则传 0；供应商业务错误码不写入 HTTP 属性。
+// failureDescription 由功能公共层按完整协议提供固定说明，包括 HTTP 成功后的供应商校验失败。
+// 不输出日志、不 recover 或向供应商注入追踪头；调用边界仍直接 defer End 保障异常退出。
+func (s *Span) EndSDKClient(statusCode int, failureDescription string, finishedAt time.Time) {
+	// 1. 只接收 StartSDKClient 创建的句柄；nil Context 路径没有 Span，原有参数错误继续返回。
+	// 不允许借用 Service、Controller、公司 HTTP 或入站 HTTP 节点提交第三方调用结果。
+	if s == nil || s.span == nil || !s.sdkClient {
+		return
+	}
+	// 2. 与公司 Client 复用结果记录和结束机制，各功能层继续负责自己的协议及结果判定。
+	s.endClient(statusCode, failureDescription, finishedAt)
+}
+
+// endClient 由已校验边界的受限收尾方法调用，统一记录 Client 结果，不向业务开放任意结束类型。
+// 调用方已保证句柄有效；HTTP 状态可缺省，成功与失败由所属公共调用层判断。
+func (s *Span) endClient(statusCode int, failureDescription string, finishedAt time.Time) {
+	// 1. 保存真实响应状态；SDK 未提供响应或本次并非 HTTP 交互时不写入 0，不推测状态。
 	if statusCode != 0 {
 		s.span.SetAttributes(attribute.Int("http.response.status_code", statusCode))
 	}
-	// 3. 公共请求层已经按完整 JSON 协议确定成败，只使用其固定说明，不记录原始异常或远端正文。
+	// 2. 公共调用层已经按完整协议确定成败，只使用其固定说明，不记录原始异常或远端正文。
 	// 正常结束不强制设置 OK，保留此前已有的错误；失败标记本身不产生额外日志。
 	if failureDescription != "" {
 		s.Fail(failureDescription)
 	}
-	// 4. 与调用耗时共用同一结束时刻，在输出 finished 日志前结束，排除结束日志写入的开销。
+	// 3. 与调用耗时共用同一结束时刻，在输出 finished 日志前结束，排除结束日志写入的开销。
 	// SDK 对重复 End 幂等，直接登记的 defer End 不会延长已完成的调用节点。
 	s.span.End(trace.WithTimestamp(finishedAt))
 }

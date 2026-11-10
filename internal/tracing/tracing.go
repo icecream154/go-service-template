@@ -101,7 +101,11 @@ func (t *Tracer) StartSDKClient(ctx context.Context, operation string) (context.
 		operation = "sdk_client <unresolved>"
 	}
 	// 2. 只创建本项目可观测的调用边界，不隐式向第三方发送追踪头或推测其内部调用关系。
-	return t.start(ctx, operation, trace.SpanKindClient)
+	ctx, span := t.start(ctx, operation, trace.SpanKindClient)
+	// 3. 返回前登记第三方 SDK 边界，供受限收尾方法记录功能公共层确认的状态和结束时刻。
+	// 标记之后保持只读，不把 SDK 内部方法、HTTP 发送或重试变成额外的执行节点。
+	span.sdkClient = true
+	return ctx, span
 }
 
 // start 是五类固定入口共用的内部创建流程，不对业务层开放任意 Span kind 或附加创建选项。

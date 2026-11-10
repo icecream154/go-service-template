@@ -125,7 +125,7 @@ python-service-template:
 
 有有效父 Span 时沿用其 TraceId 并独立生成 Client SpanId；没有父节点时，共享 SDK 沿用合法兼容 TraceId，或在没有合法标识时为本次根调用生成新值。独立后台任务需要多个调用归属同一链路时，由任务入口准备允许边界的父 Span，或通过 `tracing.NewTraceID()` 生成一次，再用 `tracing.WithTraceID(ctx, id)` 保存并贯穿任务；外来标识先用 `tracing.IsValidTraceID(id)` 校验。只保存标识不创建父 Span，多个根调用仅凭同一 TraceId 不能还原彼此调用关系。nil Context 保留原有参数错误，不创建 Span 或后台请求；不得在调用过程中用 `context.Background()` 替换已有执行 Context。
 
-公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取和标准传播入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP、用户资料 Controller/Service 及公司 HTTP Client 已分别创建 Span，Client 结果写入实际 HTTP 状态及受控失败说明，结束后调用方仍使用自己的 Context。第三方 SDK Span 和导出器尚未接入，标准头本次仅注入公司请求。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
+公共生成、校验和存储方法位于 [internal/tracing/trace_id.go](../../internal/tracing/trace_id.go)，统一读取和标准传播入口位于 [internal/tracing/context.go](../../internal/tracing/context.go)，入站规则见[接口处理流程](api-handle.md#24-traceid-的生成保存与透传)。HTTP、用户资料 Controller/Service、公司 HTTP Client 及 Qwen、MiniMax 已分别创建 Span，Client 结果写入实际 HTTP 状态及受控失败说明，结束后调用方仍使用自己的 Context。其他第三方 SDK Span 和导出器尚未接入，内部追踪头仅注入公司请求。操作作用域和现有日志覆盖范围见[请求日志规范](application-log.md#operation-自动识别与-context-作用域)。
 
 ## thirdparty：第三方 HTTP 与 SDK 调用
 
@@ -264,7 +264,7 @@ HTTP 型 SDK 使用项目构造的 HTTP Client 和 Transport，通过 `option.Wi
 
 ### 调用上下文、重试与错误
 
-Controller、Service 和第三方 Client 继续传递标准 `context.Context`。两个 LLM Client 均在传入 Context 上派生带 `request_timeout` 的执行 Context，保留其中的 TraceId 等值，并将该 Context 交给 SDK；总预算覆盖一次完整调用。
+Controller、Service 和第三方 Client 继续传递标准 `context.Context`。Qwen、MiniMax 在具体方法入口自动识别 operation，llm 公共层复用该名称创建一次独立 CLIENT Span，再从其派生 Context 建立带 `request_timeout` 的执行 Context 交给 SDK，保留 TraceId、Client SpanId 和更早的执行期限。公共层在原有各结果分支先记录 Span 结果及结束时刻，再直接输出原日志；参数错误、SDK 失败、供应商校验及文本协议错误都按固定说明标记失败，已知 HTTP 状态才写入。nil Context 仍沿用原校验顺序及参数错误，不补造 Background；异常由直接登记的 `defer span.End()` 收尾后继续传播，不增加 SDK、Transport 或重试节点，也不增加日志条数。
 
 首期显式使用 `option.WithMaxRetries(0)` 关闭 SDK 自动重试。后续需要重试时，再明确次数及完整操作预算，避免 SDK 与业务层重复重试。HTTP Client 注入和重试选项见[OpenAI Go SDK 官方文档](https://developers.openai.com/api/reference/go)。
 
@@ -272,4 +272,4 @@ SDK 或远端协议错误统一适配为 `llm.ClientError`，包含 `Provider`�
 
 缺失有效候选文本或供应商响应字段格式非法时，错误链包含公共 `llm.ErrInvalidResponse`，可用 `errors.Is` 统一识别。MiniMax 仍在自己的 Client 边界检查 `base_resp`：标准 OpenAI 响应可以省略该字段，存在时必须含整数状态码；即使 HTTP 为 200，`base_resp.status_code` 非零也返回 `ClientError` 并记录 `ProviderCode`，在公共文本提取之前结束调用，不转换成成功文本。
 
-第三方调用保留 Context 中的 TraceId 供本地关联，默认不向供应商发送 company 使用的自定义 `TraceId` 请求头。供应商明确支持并需要某种关联头时，再在对应 Client 内适配。
+第三方调用使用独立 Client Span 供本地关联，TraceId 沿用有效父链路，SDK 调用返回后上层的 Span 和 operation 保持不变。没有父节点时，共享 Provider 沿用合法兼容标识或为根调用生成新值。默认不向供应商发送 `TraceId`、`traceparent`、`tracestate` 等内部追踪头；供应商明确支持并需要某种关联头时，再在对应 Client 内适配。
