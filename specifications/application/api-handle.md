@@ -134,8 +134,8 @@ Controller 共用的身份要求和主体标识转换位于 [app/http/authz](../
 
 ### 2.4 TraceId 的生成、保存与透传
 
-1. **入站统一使用 `TraceId` 请求头。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行。头不存在或值为空时，通过 `traceid.New()` 生成 16 字节随机数并编码为 32 位小写十六进制字符串；非空时原样沿用，不要求上游值也符合本服务的生成格式。生成失败返回统一 HTTP 500，不继续业务处理。
-2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
+1. **入站统一使用 `TraceId` 请求头并严格校验格式。** [TraceId 中间件](../../app/http/middleware/trace_id.go) 在响应等待中间件之前运行，通过 `traceid.IsValid()` 检查值是否恰好为 32 个小写十六进制字符且不全为零。合法值原样沿用；头不存在、为空或非法时，通过 `traceid.New()` 生成 16 字节密码学随机数并编码，排除全零值后取得新的合法标识。格式非法不拒绝业务请求，也不修剪、转换或回显原值。生成失败返回统一 HTTP 500，不继续业务处理。当前只规范自定义头中的标识，标准 `traceparent` 的提取、注入及 Span 接入仍属规划。
+2. **值保存在标准 `context.Context` 中。** `traceid.WithContext(ctx, id)` 使用私有类型的 key 保存已经确定的合法值，中间件将新 Context 放回 Request；后续通过 `traceid.FromContext(ctx)` 读取。该存储方法不隐式校验或生成标识，其他入口应先通过 `New` 生成或 `IsValid` 校验。仅写 `gin.Context.Set` 无法供现有 Service 和 company Client 读取，因此不作为 TraceId 的保存方式。
 3. **成功确定 TraceId 后，通过同名响应头返回。** 该头在外层设置，校验失败、认证失败、404、响应等待超时和停机拒绝仍可返回同一值；现有 `data/error` JSON 结构保持不变。TraceId 只用于链路关联，不参与认证或授权。
 4. **Controller、Service 和 Client 显式传递执行 Context。** 所有 Service 公开业务方法统一以 `ctx context.Context` 为首参，Controller 使用内部 `ctx.Request.Context()`，Service 入口建立自己的日志操作作用域，再将派生 Context 继续传给其他 Service、具体 company 或 thirdparty Client；不向 DTO、Params、领域模型或共享实例字段添加 TraceId。现有 `GenerateUserAvatar` 先使用 Qwen 的 `QwenModel38Flash` 优化提示词，再调用 company 图片生成 Client，两次顺序调用沿用同一个执行 Context；Qwen 失败或优化结果为空白时立即结束，不发起图片生成。每个 Client 独立控制请求超时，头像路由按当前两个 60 秒预算加 5 秒处理余量设置为 125 秒响应等待。
 5. **company 请求统一在公共层注入。** `base.Client.requestJSON` 读取 Context 中的 TraceId，非空时设置出站 `TraceId` 请求头，覆盖全部 `GetJSON`、`PostJSON` 调用。无值时不设置，也不在每次远调时生成；后台任务需要关联时由任务入口生成一次并写入 Context，贯穿该任务所有调用。
