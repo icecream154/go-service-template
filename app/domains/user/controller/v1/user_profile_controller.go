@@ -3,7 +3,6 @@ package v1
 
 import (
 	"errors"
-	"log"
 	"strconv"
 
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
@@ -52,69 +51,92 @@ func NewUserProfileController() *UserProfileController {
 // 仅允许已认证的 user/member 查询本人，身份或权限不满足时不调用 Service。
 // 查询成功返回 200 和用户资料；未找到返回 404，其他查询错误记录日志并返回 500。
 func (c *UserProfileController) QueryUserProfileByUserID(ctx *gin.Context, request *userprofiledto.QueryUserProfileByUserIDRequest) {
-	// 1. 将 Validator 已确认格式、int64 范围和正数要求的文本转换为内部标识，允许忽略转换错误。
+	// 1. 为当前 Controller 方法建立操作作用域，保存回请求并直接记录请求到达。
+	// 派生 Context 保留 TraceId 和内部执行控制，不记录用户标识或请求正文。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	lg := logger.Current()
+	lg.Info(requestCtx, "User profile query request received")
+	// 2. 将 Validator 已确认格式、int64 范围和正数要求的文本转换为内部标识，允许忽略转换错误。
 	userID, _ := strconv.ParseInt(request.UserID, 10, 64)
-	// 2. 从可信 Principal 取得成员标识；身份不满足时输出原有错误响应，不进入 Service。
+	// 3. 从可信 Principal 取得成员标识；身份不满足时记录固定拒绝原因，不进入 Service。
 	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
 	if err != nil {
-		// 2.1. 身份故障由 Controller 统一映射，响应输出后立即结束本次业务方法。
+		// 3.1. 不记录凭证、主体文本或原始错误，响应继续沿用现有分类和文案。
+		lg.Warn(requestCtx, "User profile query request rejected", logger.Fields{
+			Error: "User profile query access denied",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 3. 本用例只允许查询本人；公共身份转换不决定业务目标的访问范围。
+	// 4. 本用例只允许查询本人；公共身份转换不决定业务目标的访问范围。
 	if operatorUserID != userID {
-		// 3.1. 拒绝查询他人资料，保持现有权限错误和响应契约。
+		// 4.1. 在越权分支直接记录受控说明，保持现有权限错误和响应契约。
+		lg.Warn(requestCtx, "User profile query request rejected", logger.Fields{
+			Error: "Querying another user's profile is not permitted",
+		})
 		failUserProfileOperation(ctx, errUserProfileAccessDenied)
 		return
 	}
-	// 4. 将内部 Request Context 作为 Service 首参，保留 TraceId、操作作用域及已有执行控制。
+	// 5. 将当前 Controller Context 传给 Service，Service 在自己的派生节点建立操作作用域。
 	// 查询得到的领域模型仅保存在本次请求中，不将 Context 或结果存入共享 Controller。
-	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(ctx.Request.Context(), userservice.QueryUserProfileByUserIDParams{
+	profile, err := composition.Current().UserProfile.QueryUserProfileByUserID(requestCtx, userservice.QueryUserProfileByUserIDParams{
 		OperatorUserID: operatorUserID, UserID: userID,
 	})
 	if err != nil {
-		// 4.1. Service 返回错误时沿用现有分类和响应，不在此替换错误文案。
+		// 5.1. Service 负责对应失败日志，此处仅沿用现有分类和响应，不重复输出故障摘要。
 		failUserProfileOperation(ctx, err)
 		return
 	}
 
-	// 5. 将领域模型转换为当前版本 DTO，继续使用公共成功响应组件。
+	// 6. 将领域模型转换为当前版本 DTO 并处理响应，随后记录本方法已完成处理。
+	// HTTP 对外状态由公共入口记录，不把方法返回等同于客户端已收到正文。
 	result := userprofiledto.QueryUserProfileByUserIDResponse(userProfileDTO(profile))
 	response.Success(ctx, result)
+	lg.Info(requestCtx, "User profile query request handled")
 }
 
 // QueryUserProfilePage 使用页码分页读取资料，支持昵称精确匹配和启用状态筛选。
 // 仅允许已认证的 service/admin 调用；默认值和输入校验由 Validator 完成。
 func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *userprofiledto.QueryUserProfilePageRequest) {
-	// 1. 要求可信的 service/admin 身份，未满足接口调用资格时不发起分页查询。
+	// 1. 建立当前 Controller 操作作用域并直接记录请求到达，保留已有 TraceId 和执行控制。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	lg := logger.Current()
+	lg.Info(requestCtx, "User profile page request received")
+	// 2. 要求可信的 service/admin 身份，未满足接口调用资格时不发起分页查询。
 	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
-		// 1.1. 身份失败沿用统一错误响应，输出后立即返回。
+		// 2.1. 记录固定拒绝原因，不打印凭证或主体文本，响应仍采用原有错误。
+		lg.Warn(requestCtx, "User profile page request rejected", logger.Fields{
+			Error: "User profile page access denied",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 2. 将已校验的可选布尔文本转换为 Service 参数；未提供时保留 nil 的筛选语义。
+	// 3. 将已校验的可选布尔文本转换为 Service 参数；未提供时保留 nil 的筛选语义。
 	var isEnabled *bool
 	if request.IsEnabled != nil {
-		// 2.1. Validator 已确认合法布尔文本，这里只执行无歧义映射，不重新校验或补默认值。
+		// 3.1. Validator 已确认合法布尔文本，这里只执行无歧义映射，不重新校验或补默认值。
 		value := *request.IsEnabled == "true"
 		isEnabled = &value
 	}
-	// 3. 传递当前内部 Request Context，分页参数继续通过显式 Params 提供。
-	serviceResult, err := composition.Current().UserProfile.QueryUserProfilePage(ctx.Request.Context(), userservice.QueryUserProfilePageParams{
+	// 4. 传递当前 Controller Context，分页参数继续通过显式 Params 提供，不进入日志字段。
+	serviceResult, err := composition.Current().UserProfile.QueryUserProfilePage(requestCtx, userservice.QueryUserProfilePageParams{
 		PageNumber: request.PageNumber, PageSize: request.PageSize,
 		UserName: request.UserName, IsEnabled: isEnabled,
 	})
 	if err != nil {
-		// 3.1. 查询失败保持 Service 原有错误分类，交给公共响应路径处理。
+		// 4.1. Service 已记录对应失败，此处保持原有错误分类和响应，避免重复故障摘要。
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 4. 将领域模型集合与分页统计映射为响应 DTO，不改变列表、页码或总数语义。
+	// 5. 将领域模型集合与分页统计映射为响应 DTO，完成处理后记录步骤，不输出资料正文。
 	result := userprofiledto.QueryUserProfilePageResponse{
 		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), PageNumber: request.PageNumber,
 		PageSize: request.PageSize, TotalCount: serviceResult.TotalCount,
 	}
 	response.Success(ctx, result)
+	lg.Info(requestCtx, "User profile page request handled")
 }
 
 // CreateUser 允许匿名或已认证调用，创建成功后为本次生成的内部用户 ID 签发 user/member 凭证。
@@ -123,35 +145,43 @@ func (c *UserProfileController) QueryUserProfilePage(ctx *gin.Context, request *
 // 外部账户字段仅为调用方声明，不核验外部身份，也不据此为已有用户补发凭证。
 // 签发失败返回 500，但不会回滚已经完成的创建；仅在创建和签发均成功时输出成功响应。
 func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofiledto.CreateUserRequest) {
-	// 1. 本接口的成功响应包含敏感凭证，要求 HTTP 缓存不保存响应。
+	// 1. 建立当前 Controller 操作作用域并直接记录请求到达，不输出账户输入或用户资料。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	lg := logger.Current()
+	lg.Info(requestCtx, "User creation request received")
+	// 2. 本接口的成功响应包含敏感凭证，要求 HTTP 缓存不保存响应。
 	ctx.Header("Cache-Control", "no-store")
-	// 2. 将当前内部 Request Context 作为 Service 首参，业务字段仍由 Request DTO 显式映射。
-	profile, err := composition.Current().UserProfile.CreateUser(ctx.Request.Context(), userservice.CreateUserParams{
+	// 3. 将当前 Controller Context 作为 Service 首参，业务字段仍由 Request DTO 显式映射。
+	profile, err := composition.Current().UserProfile.CreateUser(requestCtx, userservice.CreateUserParams{
 		AccountSource: request.AccountSource, ExternalAccountID: request.ExternalAccountID,
 		UserName: request.UserName, AvatarURL: request.AvatarURL,
 	})
 	if err != nil {
-		// 2.1. 创建失败立即返回原有错误响应，重复注册等情况不会继续签发凭证。
+		// 3.1. 创建失败由 Service 记录，此处输出原有错误响应，重复注册等情况不继续签发凭证。
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 3. 身份类别和命名空间由服务端固定，主体只能取本次成功创建的内部 ID。
+	// 4. 身份类别和命名空间由服务端固定，主体只能取本次成功创建的内部 ID。
 	principal := authn.Principal{
 		Kind:      authn.PrincipalKindUser,
 		Namespace: identity.UserNamespaceMember,
 		SubjectID: strconv.FormatInt(profile.ID, 10),
 	}
-	// 4. 沿用本次请求的 Context。外层响应等待中间件已隔离取消，超过 10 秒等待时间
+	// 5. 将当前 Controller Context 传给签发组件，保留同一 TraceId 和操作作用域。
+	// 外层响应等待中间件已隔离取消，超过 10 秒等待时间
 	// 仍会继续内部处理；晚到的凭证响应由外层丢弃，不表示创建已回滚。
-	issued, err := authnjwt.Current().Issue(ctx.Request.Context(), principal)
+	issued, err := authnjwt.Current().Issue(requestCtx, principal)
 	if err != nil {
-		// 4.1. 签发发生在 Controller，故障也在此处记录；不打印凭证或完整响应 DTO。
+		// 5.1. 签发发生在 Controller，直接记录固定失败阶段，不打印用户 ID、凭证或原始错误。
 		// 创建已经完成，保留原有返回错误的语义，不在这里声称回滚。
-		log.Printf("Issue user credential failed: user_id=%d error=%v", profile.ID, err)
+		lg.Error(requestCtx, "Issue user credential failed", logger.Fields{
+			Error: "User credential issuance failed",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 5. 组合已创建的资料和签发结果，仅在这两个阶段均成功后输出成功响应。
+	// 6. 组合已创建的资料和签发结果，处理成功响应后只记录阶段完成，不记录敏感响应内容。
 	result := userprofiledto.CreateUserResponse{
 		UserProfile: userProfileDTO(profile),
 		AccessToken: issued.Credential.Value,
@@ -159,6 +189,7 @@ func (c *UserProfileController) CreateUser(ctx *gin.Context, request *userprofil
 		ExpiresAt:   issued.ExpiresAt,
 	}
 	response.Success(ctx, result)
+	lg.Info(requestCtx, "User creation request handled")
 }
 
 // GenerateUserAvatar 仅允许已认证的 user/member 生成头像，不修改用户资料。
@@ -187,10 +218,7 @@ func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *us
 		Prompt: request.Prompt,
 	})
 	if err != nil {
-		// 4.1. 在失败分支直接记录 Service 调用结果，具体阶段由 Service 日志表达，原错误继续用于响应。
-		lg.Error(requestCtx, "User avatar request failed", logger.Fields{
-			Error: "User avatar generation service failed",
-		})
+		// 4.1. Service 已记录具体失败阶段，此处只沿用原有错误响应，不重复输出故障摘要。
 		failUserProfileOperation(ctx, err)
 		return
 	}
@@ -205,71 +233,92 @@ func (c *UserProfileController) GenerateUserAvatar(ctx *gin.Context, request *us
 // 仅允许已认证的 user/member 修改本人，发起方 ID 来自 Principal，不接收请求自行声明。
 // Service 继续独立检查本人关系、用户状态和实际版本冲突。
 func (c *UserProfileController) UpdateUserProfile(ctx *gin.Context, request *userprofiledto.UpdateUserProfileRequest) {
-	// 1. 从可信 Principal 取得当前成员标识，不采用请求自行声明的操作人。
+	// 1. 建立当前 Controller 操作作用域并记录请求到达，沿用 TraceId 和内部执行控制。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	lg := logger.Current()
+	lg.Info(requestCtx, "User profile update request received")
+	// 2. 从可信 Principal 取得当前成员标识，不采用请求自行声明的操作人。
 	operatorUserID, err := httpauthz.RequireMemberUserID(ctx)
 	if err != nil {
-		// 1.1. 身份不满足时直接输出原有错误响应，不进入资料修改流程。
+		// 2.1. 在拒绝位置记录固定说明，原有身份错误继续用于响应，不输出凭证或主体信息。
+		lg.Warn(requestCtx, "User profile update request rejected", logger.Fields{
+			Error: "User profile update access denied",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 2. 本用例只允许修改本人；发起方已由公共身份转换确定，目标仍由请求表达。
+	// 3. 本用例只允许修改本人；发起方已由公共身份转换确定，目标仍由请求表达。
 	if operatorUserID != request.UserID {
-		// 2.1. 越权目标在调用 Service 前拒绝，继续沿用原有权限错误。
+		// 3.1. 越权目标在调用 Service 前拒绝，日志不记录实际用户标识，响应沿用原有权限错误。
+		lg.Warn(requestCtx, "User profile update request rejected", logger.Fields{
+			Error: "Updating another user's profile is not permitted",
+		})
 		failUserProfileOperation(ctx, errUserProfileAccessDenied)
 		return
 	}
-	// 3. 以内部 Request Context 为首参传入 Service，资料、版本和可信操作人仍使用显式 Params。
-	profile, err := composition.Current().UserProfile.UpdateUserProfile(ctx.Request.Context(), userservice.UpdateUserProfileParams{
+	// 4. 将当前 Controller Context 传入 Service，资料、版本和可信操作人仍使用显式 Params。
+	profile, err := composition.Current().UserProfile.UpdateUserProfile(requestCtx, userservice.UpdateUserProfileParams{
 		OperatorUserID: operatorUserID, UserID: request.UserID, ExpectedVersion: *request.ExpectedVersion,
 		UserName: request.UserName, AvatarURL: &request.AvatarURL,
 	})
 	if err != nil {
-		// 3.1. Service 继续独立检查业务状态和并发版本，失败时使用既有错误响应。
+		// 4.1. Service 负责业务状态检查及对应失败日志，此处仅输出既有错误响应。
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 4. 成功后将更新后的领域模型映射为当前版本 DTO，不改变公共响应格式。
+	// 5. 将更新后的领域模型映射为当前版本 DTO，响应处理后直接记录阶段完成，不输出资料正文。
 	result := userprofiledto.UpdateUserProfileResponse(userProfileDTO(profile))
 	response.Success(ctx, result)
+	lg.Info(requestCtx, "User profile update request handled")
 }
 
 // BatchQueryUserProfiles 批量读取明确的一组用户资料，返回已找到的资料和缺失 ID。
 // 仅允许已认证的 service/admin 调用，不将服务身份解释为某个用户或要求其主体为数字。
 // 数量和 ID 格式由 Validator 校验；Service 对重复 ID 去重并保留首次出现的顺序。
 func (c *UserProfileController) BatchQueryUserProfiles(ctx *gin.Context, request *userprofiledto.BatchQueryUserProfilesRequest) {
-	// 1. 要求可信的 service/admin 身份，不将服务主体解释为用户数字标识。
+	// 1. 建立当前 Controller 操作作用域，记录请求到达并沿用已有 TraceId，不输出 ID 列表。
+	requestCtx := logger.WithCurrentOperation(ctx.Request.Context())
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+	lg := logger.Current()
+	lg.Info(requestCtx, "User profile batch query request received")
+	// 2. 要求可信的 service/admin 身份，不将服务主体解释为用户数字标识。
 	if _, err := httpauthz.RequirePrincipal(ctx, authn.PrincipalKindService, identity.ServiceNamespaceAdmin); err != nil {
-		// 1.1. 身份失败时保持现有错误分类，立即输出响应并返回。
+		// 2.1. 身份失败直接记录固定拒绝原因，保持现有错误分类和响应。
+		lg.Warn(requestCtx, "User profile batch query request rejected", logger.Fields{
+			Error: "User profile batch query access denied",
+		})
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 2. 将已校验的 ID 文本列表逐个转换为 Service 使用的整数，保留提交顺序和重复项。
+	// 3. 将已校验的 ID 文本列表逐个转换为 Service 使用的整数，保留提交顺序和重复项。
 	userIDs := make([]int64, 0, len(request.UserIDList))
 	for _, value := range request.UserIDList {
-		// 2.1. Validator 已确认正 int64 文本，这里只做参数映射，允许忽略转换错误。
+		// 3.1. Validator 已确认正 int64 文本，这里只做参数映射，允许忽略转换错误。
 		userID, _ := strconv.ParseInt(value, 10, 64)
 		userIDs = append(userIDs, userID)
 	}
-	// 3. 将内部 Request Context 与显式 ID 参数一同传给 Service，由业务层负责去重及缺失项整理。
-	serviceResult, err := composition.Current().UserProfile.BatchQueryUserProfiles(ctx.Request.Context(), userservice.BatchQueryUserProfilesParams{
+	// 4. 将当前 Controller Context 与显式 ID 参数一同传给 Service，由业务层负责去重及缺失项整理。
+	serviceResult, err := composition.Current().UserProfile.BatchQueryUserProfiles(requestCtx, userservice.BatchQueryUserProfilesParams{
 		UserIDs: userIDs,
 	})
 	if err != nil {
-		// 3.1. 查询失败时交给原有响应路径，不把故障当作全部用户缺失。
+		// 4.1. 查询失败由 Service 记录，此处沿用原有响应，不把故障当作全部用户缺失。
 		failUserProfileOperation(ctx, err)
 		return
 	}
-	// 4. 将缺失的内部数字 ID 转回接口使用的十进制文本，维持 Service 给出的顺序。
+	// 5. 将缺失的内部数字 ID 转回接口使用的十进制文本，维持 Service 给出的顺序。
 	missing := make([]string, 0, len(serviceResult.MissingUserIDs))
 	for _, userID := range serviceResult.MissingUserIDs {
-		// 4.1. 每个缺失项只做表示形式转换，不重新查询或补造资料。
+		// 5.1. 每个缺失项只做表示形式转换，不重新查询或补造资料。
 		missing = append(missing, strconv.FormatInt(userID, 10))
 	}
-	// 5. 映射已找到的资料与缺失列表，继续使用公共成功响应组件。
+	// 6. 映射已找到的资料与缺失列表，处理成功响应后直接记录完成，不输出完整结果。
 	result := userprofiledto.BatchQueryUserProfilesResponse{
 		UserProfileList: userProfileDTOList(serviceResult.UserProfiles), MissingUserIDList: missing,
 	}
 	response.Success(ctx, result)
+	lg.Info(requestCtx, "User profile batch query request handled")
 }
 
 // userProfileDTO 只选择接口约定的业务字段，保留头像的 nil 与空字符串语义。

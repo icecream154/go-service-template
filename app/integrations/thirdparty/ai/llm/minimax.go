@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"go-service-template/internal/logger"
+
 	"github.com/openai/openai-go/v3"
 	"gopkg.in/yaml.v3"
 )
@@ -107,20 +109,20 @@ const (
 // 传入 Context 的值和更早的取消期限继续生效，request_timeout 限制本次完整操作。
 // 不向 MiniMax 发送自定义 TraceId 请求头，不裁剪输入或生成文本。
 func (c *MiniMaxClient) GenerateText(ctx context.Context, params GenerateTextParams) (*GenerateTextResult, error) {
-	if c == nil || c.client == nil {
-		return nil, errors.New("MiniMax client is not initialized")
+	// 1. 从具体 Client 方法识别 operation，派生 Context 保留调用方的 TraceId 和执行控制。
+	// nil 不派生为 Background，继续保留原有公共层拒绝无 Context 请求的契约。
+	if ctx != nil {
+		// 1.1. 日志由公共层输出，但操作身份始终属于当前 MiniMaxClient.GenerateText。
+		ctx = logger.WithCurrentOperation(ctx)
 	}
-	if err := params.validate(MiniMaxModelM31Flash, MiniMaxModelM3); err != nil {
-		return nil, err
+	// 2. 安全取得当前实例的底座，未初始化时也交给公共层统一记录失败并返回原有文案。
+	var client *openAICompatibleClient
+	if c != nil {
+		// 2.1. 底座在初始化后只读复用，不在 Client 字段保存请求或日志状态。
+		client = c.client
 	}
-	completion, err := c.client.createCompletion(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateMiniMaxBaseResponse(completion); err != nil {
-		return nil, err
-	}
-	return c.client.textResult(completion)
+	// 3. 注入已有模型范围和 MiniMax 响应检查，后者在文本提取前执行，结果参与同一次调用日志。
+	return client.generateText(ctx, miniMaxProvider, params, validateMiniMaxBaseResponse, MiniMaxModelM31Flash, MiniMaxModelM3)
 }
 
 // validateMiniMaxBaseResponse 仅解析 SDK 已接收的 MiniMax 扩展字段。

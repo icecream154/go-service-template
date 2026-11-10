@@ -4,7 +4,6 @@ package service
 import (
 	"context"
 	"errors"
-	"log"
 	"math"
 	"strings"
 
@@ -98,34 +97,48 @@ func (s *UserProfileService) QueryUserProfileByUserID(ctx context.Context, param
 	// 1. 在业务入口建立当前 Service 方法的操作作用域，沿用父 Context 的 TraceId 和执行控制。
 	// 调用方负责提供非 nil Context；此处不创建 Background，也不把请求上下文写入共享实例。
 	if ctx != nil {
-		// 1.1. 自动解析具名方法，不手写操作标识；本阶段仅准备日志作用域，不改变数据库会话。
+		// 1.1. 自动解析具名方法，日志使用本方法身份，数据库继续使用原有会话。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 2. 独立校验业务 Params，保证非 HTTP 入口同样遵守用户标识的格式与范围要求。
+	lg := logger.Current()
 	if err := validateQueryUserProfileByUserIDParams(params); err != nil {
-		// 2.1. 输入错误原样返回，不继续访问仓储或替换公共检查错误。
+		// 2.1. 在输入失败位置直接记录固定说明，原样返回检查错误，不读取或打印用户标识。
+		lg.Warn(ctx, "Query user profile rejected", logger.Fields{
+			Error: "User profile query parameters are invalid",
+		})
 		return nil, err
 	}
 	// 3. 在访问仓储前保障本人访问约束；发起方身份真实性仍由各调用入口负责确认。
 	if params.OperatorUserID != params.UserID {
-		// 3.1. 无权访问时返回明确的业务错误，不读取目标资料。
+		// 3.1. 无权访问时直接记录拒绝并返回原有业务错误，不读取目标资料。
+		lg.Warn(ctx, "Query user profile rejected", logger.Fields{
+			Error: "User profile access denied",
+		})
 		return nil, ErrUserProfilePermissionDenied
 	}
 
-	// 4. 从已初始化的 Runtime 取得普通连接仓储；仅增加 Context 契约，不创建事务或绑定 SQL 取消。
+	// 4. 从已初始化的 Runtime 取得普通连接仓储，沿用原有查询和 SQL 执行控制。
 	profile, err := appruntime.Current().Repositories.UserProfile.GetProfileByID(params.UserID)
-	// 5. 区分明确未命中与技术故障，保持原有错误映射及日志方式。
+	// 5. 区分明确未命中与技术故障，在各分支直接记录受控说明并保持原有错误映射。
 	if err != nil {
 		// 5.1. 仓储明确未命中时，按本用例语义解释为用户资料不存在。
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			lg.Warn(ctx, "User profile not found", logger.Fields{
+				Error: "User profile was not found",
+			})
 			return nil, ErrUserProfileNotFound
 		}
-		// 5.2. 其他错误仍使用原有日志并原样返回；业务日志迁移不在本次 Context 改造中进行。
-		log.Printf("Query user profile failed: error=%v", err)
+		// 5.2. 技术故障只记录执行阶段，原错误继续返回调用方，避免日志带入 SQL 或驱动细节。
+		lg.Error(ctx, "Query user profile failed", logger.Fields{
+			Error: "User profile query execution failed",
+		})
 		return nil, err
 	}
 	// 6. 查询成功后还原领域模型，业务数据继续通过显式返回值交给调用方。
-	return profileModel(profile), nil
+	result := profileModel(profile)
+	lg.Info(ctx, "User profile queried")
+	return result, nil
 }
 
 // use case: QueryUserProfilePage
@@ -191,22 +204,29 @@ func (s *UserProfileService) QueryUserProfilePage(ctx context.Context, params Qu
 	// 1. 沿用入口传入的标准 Context，在当前方法建立 Service 操作作用域，不修改父节点。
 	// 非 nil Context 由调用方保证；这里不生成 TraceId、不创建执行期限或替换为 Background。
 	if ctx != nil {
-		// 1.1. 自动取得当前具名业务方法的信息，供后续接入共享 Logger 时使用。
+		// 1.1. 自动取得当前具名业务方法的信息，后续日志沿用本次 Service 的操作身份。
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 2. 检查分页与筛选 Params，保留输入默认值由调用方显式准备的契约。
+	lg := logger.Current()
 	if err := validateQueryUserProfilePageParams(params); err != nil {
-		// 2.1. 输入非法时立即原样返回，不执行总数或分页查询。
+		// 2.1. 输入非法时直接记录固定说明并原样返回，不执行总数或分页查询。
+		lg.Warn(ctx, "Query user profile page rejected", logger.Fields{
+			Error: "User profile page query parameters are invalid",
+		})
 		return nil, err
 	}
 	// 3. 沿用现有仓储及分页处理流程；Context 不写入共享仓储，也不隐式绑定 GORM 会话。
 	result, err := queryUserProfilePage(params, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
-		// 3.1. 保持原有故障日志和错误返回，不因引入 Context 改写查询结果或错误链。
-		log.Printf("Query user profile page failed: error=%v", err)
+		// 3.1. 当前分支直接记录查询阶段失败，错误原样返回，日志不输出筛选实参或数据库错误对象。
+		lg.Error(ctx, "Query user profile page failed", logger.Fields{
+			Error: "User profile page query execution failed",
+		})
 		return nil, err
 	}
 	// 4. 返回包含资料页和总数的业务结果；空页仍按原有成功语义处理。
+	lg.Info(ctx, "User profile page queried")
 	return result, nil
 }
 
@@ -272,52 +292,74 @@ func (s *UserProfileService) CreateUser(ctx context.Context, params CreateUserPa
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 2. 独立校验创建 Params，使 HTTP、后台任务等入口遵守相同业务输入约束。
+	lg := logger.Current()
 	if err := validateCreateUserParams(params); err != nil {
-		// 2.1. 输入失败原样返回，不发号或访问数据库。
+		// 2.1. 输入失败直接记录并原样返回，不输出账户、昵称或头像等原始字段。
+		lg.Warn(ctx, "Create user rejected", logger.Fields{
+			Error: "User creation parameters are invalid",
+		})
 		return nil, err
 	}
-	// 3. 沿用现有发号、写入和重复账户确认流程，不因新增 Context 改变数据库执行契约。
-	profile, err := createUser(params, appruntime.Current().Repositories.UserProfile, snowflake.NextID)
+	// 3. 将当前 Service Context 传给创建辅助流程，其内部日志沿用同一 TraceId 和 operation。
+	// 发号、写入与重复账户确认仍按原顺序执行，不改变数据库契约。
+	profile, err := createUser(ctx, params, appruntime.Current().Repositories.UserProfile, snowflake.NextID)
 	if err != nil {
-		// 3.1. 已解释清楚的重复账户属于业务冲突，保持直接返回且不重复记录技术故障。
+		// 3.1. 已确认的重复账户属于已知业务冲突，记录为警告后返回原有业务错误。
 		if errors.Is(err, ErrAccountAlreadyExists) {
+			lg.Warn(ctx, "Create user rejected", logger.Fields{
+				Error: "User account already exists",
+			})
 			return nil, err
 		}
-		// 3.2. 其他故障继续沿用原有日志并原样返回，后续迁移 Logger 时使用本方法的派生 Context。
-		log.Printf("Create user failed: error=%v", err)
+		// 3.2. 其他发号或持久化故障记录固定阶段，原错误继续交给调用方，不打印数据库细节。
+		lg.Error(ctx, "Create user failed", logger.Fields{
+			Error: "User creation execution failed",
+		})
 		return nil, err
 	}
 	// 4. 仅在创建完成后返回领域模型，凭证签发及 HTTP 响应仍由调用入口负责。
+	lg.Info(ctx, "User created")
 	return profile, nil
 }
 
 // createUser 按次接收仓储和发号函数，不将依赖或单次注册状态保存在 Service 上。
-// 确认账户已存在时返回本层业务错误；技术故障保持原始错误值。
-func createUser(params CreateUserParams, profiles *repository.UserProfileRepository, nextID func() (int64, error)) (*models.UserProfile, error) {
+// Context 沿用 CreateUser 的操作作用域，不在私有辅助函数中重新识别；技术故障保持原始错误值。
+func createUser(ctx context.Context, params CreateUserParams, profiles *repository.UserProfileRepository, nextID func() (int64, error)) (*models.UserProfile, error) {
+	// 1. 使用调用方提供的发号函数生成内部 ID，失败时保持原错误，不尝试数据库写入。
 	id, err := nextID()
 	if err != nil {
+		// 1.1. 本层不包装发号错误，公开业务方法会在同一操作作用域记录创建失败。
 		return nil, err
 	}
 	if id <= 0 {
+		// 1.2. 发号没有报错但结果不满足业务约束时，沿用原有内部 ID 错误。
 		return nil, errInvalidGeneratedUserID
 	}
+	// 2. 按已校验 Params 构造表数据，保留头像可空、初始启用及版本值的既有语义。
 	profile := &tables.UserProfile{
 		ID: id, AccountSource: params.AccountSource, ExternalAccountID: params.ExternalAccountID,
 		UserName: params.UserName, AvatarURL: sqlvalue.ToNullString(params.AvatarURL), IsEnabled: true, Version: 0,
 	}
+	// 3. 持久化失败时只解释已确认的账户冲突，无法确认含义的技术错误仍原样返回。
 	if err := profiles.CreateProfile(profile); err != nil {
+		// 3.1. 重复键本身不能确定业务原因，仅在确认违反唯一约束时继续按账户查询复核。
 		if dbmysql.IsDuplicateKey(err) {
-			// 重复键本身不能确定业务原因；复查只确认请求账户是否已存在，不声称识别了冲突索引。
+			// 3.2. 复查命中时返回既有重复账户错误，不声称识别了某个具体索引。
 			if _, accountErr := profiles.GetProfileByAccount(params.AccountSource, params.ExternalAccountID); accountErr == nil {
 				return nil, ErrAccountAlreadyExists
 			} else if !errors.Is(accountErr, gorm.ErrRecordNotFound) {
-				// 复查执行失败时保留该技术错误，两次操作的原因只在日志中关联。
-				log.Printf("Check account after duplicate key failed: create_error=%v account_error=%v", err, accountErr)
+				// 3.3. 复查自身失败时直接记录固定阶段，沿用上层 Service Context，不输出两次数据库错误。
+				lg := logger.Current()
+				lg.Error(ctx, "Check account after duplicate key failed", logger.Fields{
+					Error: "Account verification after a duplicate key failed",
+				})
 				return nil, accountErr
 			}
 		}
+		// 3.4. 无法进一步解释时返回最初的写入错误，保留原有错误优先级。
 		return nil, err
 	}
+	// 4. 写入成功后直接还原领域模型，不为日志额外查询、保存 Context 或改写创建结果。
 	return profileModel(profile), nil
 }
 
@@ -465,27 +507,40 @@ func (s *UserProfileService) UpdateUserProfile(ctx context.Context, params Updat
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 2. 检查完整替换所需的输入约束，参数错误原样交给入口处理。
+	lg := logger.Current()
 	if err := validateUpdateUserProfileParams(params); err != nil {
-		// 2.1. 参数非法时立即结束，不创建事务或读取目标记录。
+		// 2.1. 参数非法时直接记录并返回原错误，不创建事务、读取记录或输出资料字段。
+		lg.Warn(ctx, "Update user profile rejected", logger.Fields{
+			Error: "User profile update parameters are invalid",
+		})
 		return nil, err
 	}
 	// 3. 纯输入检查通过后再保障本人操作约束；身份真实性仍由认证入口负责。
 	if params.OperatorUserID != params.UserID {
-		// 3.1. 发起方与目标不一致时返回明确业务错误，不执行更新。
+		// 3.1. 发起方与目标不一致时直接记录拒绝，返回明确业务错误，不执行更新。
+		lg.Warn(ctx, "Update user profile rejected", logger.Fields{
+			Error: "User profile access denied",
+		})
 		return nil, ErrUserProfilePermissionDenied
 	}
 	// 4. 沿用既有锁读、版本检查和事务更新，不将本次 Context 写回共享数据库或仓储。
 	profile, err := updateUserProfile(params, appruntime.Current().DB.User)
 	if err != nil {
-		// 4.1. 目标缺失、停用和版本冲突保持既有业务语义，不当作未知技术错误记录。
+		// 4.1. 目标缺失、停用和版本冲突属于已知业务结果，记录为警告，错误继续原样返回。
 		if errors.Is(err, ErrUserProfileNotFound) || errors.Is(err, ErrUserDisabled) || errors.Is(err, ErrUserProfileVersionConflict) {
+			lg.Warn(ctx, "Update user profile rejected", logger.Fields{
+				Error: "User profile state does not allow this update",
+			})
 			return nil, err
 		}
-		// 4.2. 其他故障继续沿用原有日志及返回方式，不因增加上下文而包装原错误。
-		log.Printf("Update user profile failed: error=%v", err)
+		// 4.2. 技术故障直接记录事务执行阶段，保留原有错误值，不输出 SQL 或驱动错误对象。
+		lg.Error(ctx, "Update user profile failed", logger.Fields{
+			Error: "User profile update execution failed",
+		})
 		return nil, err
 	}
 	// 5. 事务提交成功后返回本次更新结果，响应等待是否结束不改变该业务事实。
+	lg.Info(ctx, "User profile updated")
 	return profile, nil
 }
 
@@ -576,18 +631,25 @@ func (s *UserProfileService) BatchQueryUserProfiles(ctx context.Context, params 
 		ctx = logger.WithCurrentOperation(ctx)
 	}
 	// 2. 在去重前检查提交数量及每个 ID，继续保留既有输入顺序和数量口径。
+	lg := logger.Current()
 	if err := validateBatchQueryUserProfilesParams(params); err != nil {
-		// 2.1. 输入不符合契约时原样返回错误，不查询仓储。
+		// 2.1. 输入不符合契约时直接记录固定说明并原样返回，不查询仓储或记录实际 ID 列表。
+		lg.Warn(ctx, "Batch query user profiles rejected", logger.Fields{
+			Error: "User profile batch query parameters are invalid",
+		})
 		return nil, err
 	}
 	// 3. 沿用原有批量查询及结果整理流程，不因 Context 首参改变仓储 API 或 SQL 执行方式。
 	result, err := batchQueryUserProfiles(params.UserIDs, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
-		// 3.1. 查询故障继续使用原有日志并原样返回，不把部分结果交给调用方。
-		log.Printf("Batch query user profiles failed: error=%v", err)
+		// 3.1. 查询故障直接记录执行阶段并原样返回，不把失败当作全部用户缺失。
+		lg.Error(ctx, "Batch query user profiles failed", logger.Fields{
+			Error: "User profile batch query execution failed",
+		})
 		return nil, err
 	}
 	// 4. 返回按首次出现顺序整理的已找到资料和缺失 ID；部分或全部缺失仍按成功处理。
+	lg.Info(ctx, "User profiles queried")
 	return result, nil
 }
 

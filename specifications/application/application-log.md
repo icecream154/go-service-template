@@ -53,7 +53,28 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 入口识别结果按函数符号缓存，缓存仅保存组件和操作标识，不保存 Context、实参或请求数据。识别失败时建立空操作作用域，遮蔽父 Context 中的操作身份，避免把上层操作误认为新操作；日志省略 `component`、`operation`，原有 TraceId 继续保留。
 
-辅助函数不重复调用入口封装，沿用所属操作的 Context；进入新的 Controller、Service、Client 或 Repository 操作时建立自己的派生 Context，并保留 TraceId、取消和截止时间。下游方法返回后，上层 Context 的操作信息保持原值。`WithCurrentOperation` 本身对 nil 使用 `context.Background()` 的兼容处理不代表业务方法可以补造执行上下文；Service 调用入口负责提供非 nil Context，当前 Service 方法仅对非 nil 参数建立作用域。请求级 Context 不存入共享实例字段。
+### Context 的派生与传递
+
+`logger.WithCurrentOperation(ctx)` 通过 `context.WithValue` 创建子 Context，将当前方法的 `component`、`operation` 写入新节点。父 Context 中的操作信息保持原值；各层将自己持有的 Context 显式传给下层，并在当前层打印日志时使用它。
+
+1. **同一次请求沿用同一个 TraceId。** HTTP 入口确定 TraceId 后，后续操作派生沿用已有 Context。TraceId 与操作信息使用不同的 key，子 Context 可以沿父链读取原有 TraceId，覆盖当前操作身份不会改写链路标识。方法入口不重新生成 TraceId；原 Context 没有标识时，操作派生也不会补造。
+2. **每个操作拥有自己的作用域。** Controller 将自己的 Context 传给 Service，Service 在入口派生自己的 Context，再传给 Client。Client 建立自己的作用域后，其日志使用 Client 的 operation；同一层内部的普通辅助函数沿用当前 Context，不重新识别辅助函数名称。
+3. **局部赋值不会改变上层 Context。** 方法参数 `ctx` 是当前方法的局部变量，执行 `ctx = logger.WithCurrentOperation(ctx)` 只让这个变量指向新节点。调用方仍持有原来的 Context，原来的 operation 从未被下层改写。
+4. **下层返回后，上层继续使用自己的 operation。** 无论下层成功还是返回错误，上层后续日志都从自己持有的 Context 读取操作身份，无须手动恢复。之后调用另一个 Client 时，再由那个 Client 基于传入的 Context 建立自己的作用域；各下层作用域不会互相覆盖。
+
+以下示例中的 `T` 表示同一次请求已有的 TraceId；各方法均已接入操作入口识别：
+
+| 执行位置 | 日志使用的 Context | trace_id | operation |
+| --- | --- | --- | --- |
+| Controller 调用 Service 前 | Controller 派生 Context | `T` | `example.ResourceController.QueryResource` |
+| 进入 Service | Service 派生 Context | `T` | `example.ResourceService.QueryResource` |
+| 进入 Client | Client 派生 Context | `T` | `company.example-service.resource.ResourceClient.QueryResource` |
+| Client 返回，Service 继续打印日志 | 原 Service Context | `T` | `example.ResourceService.QueryResource` |
+| Service 返回，Controller 继续打印日志 | 原 Controller Context | `T` | `example.ResourceController.QueryResource` |
+
+操作作用域派生保留父 Context 的取消信号和截止时间。执行控制仍由相应边界决定：SDK 的 `context.WithTimeout` 可增加更早的截止时间；HTTP 响应等待层的 `context.WithoutCancel` 隔离取消及截止时间，同时保留 TraceId 和其他值。这些执行控制不会将子操作身份回写到父 Context。
+
+`WithCurrentOperation` 本身对 nil 使用 `context.Background()` 的兼容处理不代表业务方法可以补造执行上下文；Service 调用入口负责提供非 nil Context，当前 Service 方法仅对非 nil 参数建立作用域。请求级 Context 不存入共享实例字段。
 
 方法入口封装只识别并携带操作信息，不自动记录 `started`、`finished` 或计算耗时；需要生命周期日志时由操作边界调用日志方法。HTTP 的请求与响应边界由下文的中间件统一记录。
 
@@ -67,7 +88,11 @@ HTTP Controller 将响应等待层隔离取消后的 `ctx.Request.Context()` 传
 
 Service 入口通过 `logger.WithCurrentOperation` 建立自己的派生作用域，后续共享 Logger 从中自动取得 `component=service` 和 `{领域名}.{Service 类型名}.{方法名}`。同一方法内部的流程日志保持同一 operation，使用 message 说明具体步骤，普通步骤省略 event。需要记录步骤或失败时，在对应业务位置直接调用日志方法；不要求业务方法维护日志状态、增加计时或 defer，也不要求配齐 started、finished。HTTP 和 Client 等公共边界仍可统一记录生命周期及耗时。调用其他 Service 或 Client 时继续传入当前 Context，由新入口建立自己的作用域，上层 Context 不变。需要流程日志的私有辅助函数显式接收并沿用该 Context，纯校验、转换和构造函数无需机械添加参数。
 
-当前用户资料 Service 的六个公开业务方法及 Controller 调用方已统一 Context 首参，Service 方法入口已建立作用域。其中 `GenerateUserAvatar` 已在 Controller、Service 的业务执行位置接入步骤与失败日志，其他用例的现有 `log.Printf` 仍待迁移。只有传入当前 Context 的共享 Logger 日志才会带上对应请求和操作信息。Repository 签名、SQL 取消及事务行为保持不变。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
+当前用户资料的六个 Controller 业务方法均在入口建立操作作用域，并将派生 Context 保存回 `ctx.Request`，供 Service、凭证签发及后续响应处理沿用。对应的六个 Service 公开业务方法统一接收 Context 首参，在各自入口建立 Service 作用域。`user_profile_controller.go`、`user_profile_service.go` 中的日志均已使用共享 Logger，局部变量统一为 `lg`，在业务执行位置直接打印。只有传入当前 Context 的日志才会带上对应请求和操作信息。完整调用约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
+
+Controller 接收请求、处理完成及 Service 正常结果使用 `INFO`；授权拒绝、输入不符合约束和已知业务结果使用 `WARN`；未知执行故障使用 `ERROR`。查询未命中、重复账户、用户停用及版本冲突仍按原有业务错误返回，不因为增加日志改变响应分类。六个用例的 Service 失败日志均由 Service 负责，Controller 继续完成错误映射和响应，不重复输出同一 Service 故障摘要；Controller 自身的授权拒绝和凭证签发故障在当前 Controller 记录，不输出凭证、用户字段或原始错误文本。
+
+需要打印流程日志的私有辅助函数显式接收所属 Service 的 Context。例如创建用户时，私有 `createUser` 在重复账户复查失败的位置记录阶段故障，沿用 `CreateUser` 的 operation，不将辅助函数名识别为新操作。纯校验、数据映射和其他无需日志上下文的辅助函数保持原有参数。Repository 签名、SQL 取消及事务行为保持不变；其他 Validator 的日志与 Repository 日志不在这两个文件的接入范围内。
 
 ### GenerateUserAvatar 接入示例
 
@@ -77,13 +102,13 @@ Controller 在方法入口通过 `WithCurrentOperation` 建立作用域，并将
 | --- | --- | --- | --- |
 | Controller 接收请求、处理完成 | `controller` | `INFO`，省略 event | 在实际处理位置记录普通说明，不推断客户端是否已收到响应 |
 | 输入或授权拒绝 | 对应的 `service`、`controller` | `WARN`，省略 event | 在失败分支直接记录固定说明，随后沿用原有错误返回或响应 |
-| Service 或远端调用失败 | 对应的 `controller`、`service` | `ERROR`，省略 event | 在失败分支直接记录固定阶段说明，不保存错误状态供其他位置统一输出 |
+| Service 或远端调用失败 | `service` | `ERROR`，省略 event | Service 在失败分支直接记录固定阶段说明，Controller 沿用错误响应，不重复输出故障摘要 |
 | 提示词优化前后、图片生成前后 | `service` | `INFO`，省略 event | 通过英文 message 说明业务步骤，operation 始终属于同一 Service 方法 |
 | Validator 遇到未知校验故障 | 沿用入站的 `http_entry` 作用域 | `ERROR`，省略 event | 固定的校验失败说明；Validator 不建立新的职责类别或操作身份 |
 
 Controller 和 Service 不为这些业务日志增加计时、状态变量或 defer，不输出方法级的成对生命周期或耗时。日志按业务顺序在发生位置直接记录，panic 继续交给原有异常处理流程。HTTP 状态和对外耗时仍由外层入口记录，公司 Client 的调用生命周期继续由公共层记录。HTTP 等待超时先返回 503 后，内部方法可能继续处理和输出同一 TraceId 的日志，其晚到结果不会改写外层响应日志。
 
-提示词、优化后的文本、图片地址、凭证、原始错误文本及远端正文不进入上述业务日志；业务错误仍原样返回，成功仍只返回头像地址，不更新用户资料。公司图片 Client 原有的调用日志继续保留。文本优化步骤由 Service 描述，Qwen SDK 自身的调用日志尚未接入，不能将业务步骤日志视为 SDK 层日志。
+提示词、优化后的文本、图片地址、凭证、原始错误文本及远端正文不进入上述业务日志；业务错误仍原样返回，成功仍只返回头像地址，不更新用户资料。公司图片 Client 原有的调用日志继续保留。文本优化步骤由 Service 描述，Qwen 的文本调用另由 `llm` 公共层记录 Client 生命周期；两者沿用同一 TraceId，分别使用 Service 和具体 Client 的操作身份。
 
 ## 当前数据结构与基础写入范围
 
@@ -141,7 +166,7 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 })
 ```
 
-当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client 调用，以及 `GenerateUserAvatar` 的 Controller、Service 和未知校验故障日志已统一使用共享 Logger；第三方 SDK、其他业务用例、数据库与其他异常日志尚未全部迁移，未新增测试用例。
+当前已实现基础 Logger 构造、四级日志方法、基础字段自动填充和 JSON 写入，以及 `WithCurrentOperation` 的方法入口识别和 Context 作用域。四级日志方法从 Context 自动读取 `component`、`operation`，未建立可识别作用域时省略。共享 Logger 已接入启动流程，生产 HTTP 请求与响应、公司 HTTP Client、Qwen 与 MiniMax 文本调用、用户资料六个用例的 Controller 和 Service 日志，以及头像生成 Validator 的未知校验故障日志已统一使用共享 Logger；其他 Validator、第三方 SDK、业务组件、数据库与其他异常日志尚未全部迁移，未新增测试用例。
 
 ## HTTP 请求与响应日志
 
@@ -184,7 +209,32 @@ lg.Info(ctx, "HTTP call completed", logger.Fields{
 
 公共请求层通过 `logger.Current()` 取得启动时发布的共享 Logger，输出仍为 stdout 单行 JSON，并遵循最低日志级别过滤。发起公司 HTTP 调用前必须完成 Logger 初始化；未初始化调用仍按共享实例契约 panic，不隐式创建日志器。公共层直接调用日志方法，日志编码或输出故障由 Logger 内部统一使用独立 stderr 兜底，TraceId 采用引用转义格式；Client 不重复报告或替换调用的业务结果。
 
-操作作用域应由具体 Client 入口建立。直接调用公共 `base.Client` 不会自动推断具体业务方法或生成 Client 操作名；公共层只使用传入 Context 中已有的作用域。Client 层目前仅覆盖公司 HTTP Client，第三方 SDK 的调用日志另行接入。
+操作作用域应由具体 Client 入口建立。直接调用公共 `base.Client` 不会自动推断具体业务方法或生成 Client 操作名；公共层只使用传入 Context 中已有的作用域。Client 层目前覆盖公司 HTTP Client 及下文的 Qwen、MiniMax 文本调用，其他第三方 SDK 按各自协议另行接入。
+
+## LLM 文本调用日志
+
+Qwen、MiniMax 的 `GenerateText` 在入口对非 nil Context 调用 `logger.WithCurrentOperation`，自动建立 `component=client` 和具体方法的操作身份，再将派生 Context 传给现有 `openai_compatible.go` 中的公共 `generateText` 方法。具体 Client 不手写操作名，也不重复维护日志计时或结束状态。
+
+| Client | operation |
+| --- | --- |
+| Qwen | `thirdparty.ai.llm.QwenClient.GenerateText` |
+| MiniMax | `thirdparty.ai.llm.MiniMaxClient.GenerateText` |
+
+| 日志边界 | level | event | 结果字段 |
+| --- | --- | --- | --- |
+| 进入公共文本调用流程 | `INFO` | `started` | 沿用具体 Client 的操作作用域和 TraceId，不预填耗时或状态 |
+| 文本调用全部处理成功 | `INFO` | `finished` | 记录 `duration_ms`，SDK 提供实际 HTTP 状态时记录 `status_code`，省略 `error` |
+| 参数、执行或协议失败返回 | `ERROR` | `finished` | 记录 `duration_ms`、固定失败阶段说明；保留 SDK 已提供的实际 HTTP 状态 |
+
+公共方法按顺序执行 Client 已初始化检查、供应商支持模型校验、Context 检查、SDK 调用、供应商特有响应校验及公共文本提取，并在成功或失败返回的位置直接打印日志。调用和日志集中在这一个方法中，不再拆分额外执行层或单独维护日志状态结构。提前失败也记录结束；MiniMax 的 `base_resp` 校验和无有效候选文本等协议错误属于本次调用失败，不能仅凭 SDK 返回 HTTP 200 就记录成功。原有参数错误、`ClientError`、错误链及 MiniMax `ProviderCode` 的返回语义保持一致，不补模型默认值、不额外重试，也不改变 Client 的超时控制。
+
+`duration_ms` 从进入公共方法起计算，覆盖校验、SDK 执行、供应商响应检查和文本提取；开始日志同步输出的开销可能计入，结束日志自身的输出开销不计入。日志不使用 defer 收尾或完成标志：正常成功和已知错误返回各自在返回前记录 `finished`；panic 沿原有异常处理路径传播，不额外补写 LLM 结束日志。SDK 调用预算仍使用原有的 `defer cancel()` 清理计时资源。Controller、Service 的业务流程日志同样在发生位置直接打印。
+
+公共 SDK 适配通过逐次调用的 `option.WithResponseInto` 读取实际响应状态，SDK 返回 HTTP 错误时也可使用 `openai.Error.StatusCode` 提供的状态。HTTP 200 后的 SDK 读取或解码失败、MiniMax 扩展状态失败、公共文本提取失败，结束日志仍保留已知的 HTTP 状态并记录失败。未取得状态或 SDK 因取消等原因未提供状态时省略 `status_code`，不推断为 200。MiniMax 的 `base_resp.status_code` 是供应商业务状态，不写入 HTTP `status_code`；供应商错误码继续保留在返回的错误对象中，不新增日志字段。
+
+日志仅记录固定阶段说明，不输出提示词、生成文本、目标 URL、密钥、凭证、SDK 对象、远端正文或原始错误文本。具体方法及 SDK 派生 Context 保留同一个 TraceId，不在 Client 中生成标识，也不向第三方发送自定义 `TraceId` 请求头。请求 Context 与单次日志状态不保存在共享 Client 字段中。
+
+公共日志使用启动时初始化的共享 Logger，局部变量统一命名为 `lg`，直接调用无返回值的四级打印方法；输出故障由 Logger 内部使用独立 stderr 兜底。发起文本调用前必须完成 Logger 初始化，未初始化时沿用 `logger.Current()` 的 panic 契约。本节只覆盖 Qwen、MiniMax 当前的单轮非流式文本调用，不代表其他 SDK 或其他调用方式已经接入。
 
 ## 启动初始化与共享实例
 

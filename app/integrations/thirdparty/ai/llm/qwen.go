@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"go-service-template/internal/logger"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -106,15 +108,18 @@ const (
 // 传入 Context 的值和更早的取消期限继续生效，request_timeout 限制本次完整操作。
 // 不向阿里云发送自定义 TraceId 请求头，不裁剪输入或生成文本。
 func (c *QwenClient) GenerateText(ctx context.Context, params GenerateTextParams) (*GenerateTextResult, error) {
-	if c == nil || c.client == nil {
-		return nil, errors.New("Qwen client is not initialized")
+	// 1. 在具体 Client 方法入口自动建立操作作用域，保留调用方的 TraceId、取消和截止时间。
+	// nil 仍交给公共调用流程报错，不通过入口封装将其改为 Background。
+	if ctx != nil {
+		// 1.1. 公共层直接沿用该 Context，不把底座方法名或供应商 SDK 方法名当成 operation。
+		ctx = logger.WithCurrentOperation(ctx)
 	}
-	if err := params.validate(QwenModel38Max, QwenModel37Plus, QwenModel38Flash); err != nil {
-		return nil, err
+	// 2. 安全取得底座，零值或 nil Client 同样进入公共流程，以便记录调用开始及初始化失败。
+	var client *openAICompatibleClient
+	if c != nil {
+		// 2.1. 只读取构造时保存的底座，不将单次 Context、结果或日志状态写回共享实例。
+		client = c.client
 	}
-	completion, err := c.client.createCompletion(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-	return c.client.textResult(completion)
+	// 3. 由公共层统一校验、调用 SDK、提取文本及记录日志；Qwen 使用已有模型范围，无额外响应钩子。
+	return client.generateText(ctx, qwenProvider, params, nil, QwenModel38Max, QwenModel37Plus, QwenModel38Flash)
 }
