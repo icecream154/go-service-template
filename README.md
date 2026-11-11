@@ -50,7 +50,7 @@ SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接�
 
 ### 用 Docker Compose 同时启动 Go 和日志 Agent
 
-构建和部署文件位于 `deploy/`。各环境的 Compose 一起运行 `app` 和 `log-agent`，应用业务配置从对应环境的 YAML 目录只读挂载。Go Logger 按 `file_path` 把日志写入共享卷，Agent 读取文件并通过 OTLP HTTP 发往中心 Collector。参见[部署说明](deploy/README.md)。
+构建和部署文件位于 `deploy/`。各环境的 Compose 一起运行 `app` 和 `log-agent`，直接只读挂载项目根目录的 `config/`，Go 按 `APP_ENV` 选择各组件的 YAML。Go Logger 按 `file_path` 把日志写入共享卷，Agent 读取文件并通过 OTLP HTTP 发往中心 Collector。参见[部署说明](deploy/README.md)。
 
 ## 雪花 ID
 

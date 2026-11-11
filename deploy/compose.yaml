@@ -7,11 +7,16 @@ services:
     environment:
       APP_REGION: cn
     ports:
-      - "${GO_BIND_ADDRESS:-127.0.0.1}:${GO_HTTP_PORT:-8080}:8080"
+      # 映射顺序为「宿主机地址:宿主机端口:容器端口」。Go 在容器里监听 8080。
+      # GO_BIND_ADDRESS=0.0.0.0 将 GO_HTTP_PORT 发布到宿主机的所有 IPv4 网卡。
+      # 其他机器使用宿主机实际可达的 IP 或域名及 GO_HTTP_PORT 访问。
+      # 跨机器访问还取决于路由、宿主机防火墙和云安全组是否允许该端口。
+      # 需要限制访问范围时，可以填具体网卡的 IP，或用 127.0.0.1 只开放给宿主机本机。
+      - "${GO_BIND_ADDRESS:-0.0.0.0}:${GO_HTTP_PORT:-8080}:8080"
     volumes:
-      # 应用运行时读取部署环境的 YAML。相对路径以本公共 Compose 所在的 deploy/ 为基准。
+      # 三套环境共用项目根目录的 config/。路径相对于 deploy/，Go 根据 APP_ENV 选择 YAML。
       - type: bind
-        source: ${GO_CONFIG_DIR:?请设置 GO_CONFIG_DIR 指向该环境的应用 YAML 目录}
+        source: ../config
         target: /app/config
         read_only: true
         bind:
@@ -23,12 +28,19 @@ services:
     image: otel/opentelemetry-collector-contrib:0.155.0
     command: ["--config=/etc/otelcol-contrib/go-logs.yaml"]
     restart: unless-stopped
-    # 先启动 app，让其镜像初始化日志卷目录和属主。Agent 可在中心暂时不可用时独立重试。
+    # 先启动 app，再由 Agent 读取共享卷中的日志并转发。
     depends_on:
       app:
         condition: service_started
-    # 状态卷的初始属主是容器内 root。Agent 写入状态卷，应用日志以只读方式挂载。
+    # user 的格式是「用户 ID:用户组 ID」。0:0 让 Agent 以容器内的 root 用户和 root 组运行。
+    # 官方 Agent 镜像默认用 10001:10001。这里指定 0:0 是为了写入新建的状态卷，
+    # 该卷挂载在 /var/lib/otelcol，初始归 root 所有。Agent 的 file_storage 在里面
+    # 保存各日志文件的读取位置，重启后可以接着读。换成普通用户时，须先给该用户写入权限。
     user: "0:0"
+    # Linux capabilities 是进程可以获得的额外权限。ALL 移除 Docker 分配的全部 capabilities。
+    # 例如移除 CAP_DAC_OVERRIDE 后，即便进程的 UID 为 0，读取其他用户的文件仍须遵守文件权限。
+    # Agent 作为状态卷目录的所有者，仍能写入采集进度。它通过文件的读权限读取应用日志，
+    # 应用日志卷本身以只读方式挂载。向中心 Collector 发送 HTTP 请求也只需要普通权限。
     cap_drop: [ALL]
     environment:
       # 中心 Collector 是外部服务。每套环境填写 Agent 可访问的地址和该中心的 token。

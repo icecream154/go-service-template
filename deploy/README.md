@@ -13,7 +13,11 @@
 | `environments/<env>/.env` | 纳入 Git 的环境部署参数，启动脚本直接读取 |
 | `compose.sh` | 选择 dev、test 或 prod 的配置并转交 Compose 命令 |
 
-`.env` 保存配置目录、宿主机监听地址和端口、Collector 地址，以及 test 和 prod 使用的 `GO_APP_IMAGE`。仓库里的 `OTLP_AUTH_TOKEN` 留空，由启动终端或部署系统注入同名环境变量，供 `log-agent` 使用。Go 应用的数据库、JWT 和第三方服务等配置来自 `GO_CONFIG_DIR` 指向的 YAML 目录，该目录只读挂载到 `/app/config`。部署时把所选环境 YAML 中的 `${NAME}` 占位替换为实际值。业务凭据保存在部署机的配置文件中。
+`.env` 保存宿主机监听地址和端口、Collector 地址，以及 test 和 prod 使用的 `GO_APP_IMAGE`。仓库里的 `OTLP_AUTH_TOKEN` 留空，由启动终端或部署系统注入同名环境变量，供 `log-agent` 使用。
+
+三套环境均使用 `GO_BIND_ADDRESS=0.0.0.0`，将 `GO_HTTP_PORT` 发布到宿主机的所有 IPv4 网卡。客户端通过宿主机实际可达的 IP 或域名和该端口访问，容器内部统一使用 `8080`。跨机器访问还取决于路由、防火墙和云安全组的放行规则。
+
+公共 `deploy/compose.yaml` 直接将 `../config` 只读挂载到 `/app/config`。`../config` 相对于 `deploy/`，指向项目根目录的 `config/`。三套环境共用这个目录，Go 根据 `APP_ENV` 选择 `dev.yml`、`test.yml` 或 `prod.yml`。部署时把所选环境 YAML 中的 `${NAME}` 占位替换为实际值。
 
 启动脚本加载公共 Compose 和一个环境覆盖文件。每个环境覆盖文件的 `name` 按「项目名-环境」设置，分别是 `go-service-template-dev`、`go-service-template-test` 和 `go-service-template-prod`，用来隔离容器、网络及卷。同一台机器上部署多个服务时，可在对应 `.env` 设置 `COMPOSE_PROJECT_NAME`，并为它们选择各自的 `GO_HTTP_PORT`。Compose 中的相对挂载路径以 `deploy/` 为基准。使用外部 `.env` 时，可通过 `DEPLOY_ENV_FILE` 指定绝对路径。终端已导出的同名变量优先于 `.env` 中的值。
 
@@ -25,15 +29,9 @@ Go 的工作目录为 `/app`。环境配置 `logger/<env>.yml` 中的 `file_path
 
 ## 本地 dev
 
-1. 从仓库根目录准备私有配置副本。
+1. 启动前在终端提供与中心 Collector 相同的 `OTLP_AUTH_TOKEN`。默认的 `GO_LOG_OTLP_ENDPOINT=http://host.docker.internal:4318` 适合同一台 Mac 上的 Docker Desktop 与已发布 4318 端口的中心。其他部署填写 Agent 可达的 OTLP HTTP 基础地址，Agent 会追加 `/v1/logs`。
 
-   ```sh
-   test -d deploy/environments/dev/config.local || cp -R config deploy/environments/dev/config.local
-   ```
-
-   `deploy/environments/dev/.env` 中的 `GO_CONFIG_DIR=./environments/dev/config.local` 指向这个副本。启动前在终端提供与中心 Collector 相同的 `OTLP_AUTH_TOKEN`。默认的 `GO_LOG_OTLP_ENDPOINT=http://host.docker.internal:4318` 适合同一台 Mac 上的 Docker Desktop 与已发布 4318 端口的中心。其他部署填写 Agent 可达的 OTLP HTTP 基础地址，Agent 会追加 `/v1/logs`。
-
-2. 在 `deploy/environments/dev/config.local/` 里配置业务依赖。MySQL 在 Mac 上运行时，将 `database/mysql/dev.yml` 的 `Write.Host` 配为 `host.docker.internal`，并为连接配置 `Write.TLS.Enabled: true`、受信任的 `CAFile` 和证书中的 `ServerName`。项目只允许本地回环连接关闭 MySQL TLS，容器访问宿主机的地址需要 TLS。配置 Python 客户端时，可在 `integrations/company/dev.yml` 中使用 `http://host.docker.internal:8000` 访问 Mac 上的服务。
+2. 在项目根目录的 `config/` 里配置业务依赖。MySQL 在 Mac 上运行时，将 `config/database/mysql/dev.yml` 的 `Write.Host` 配为 `host.docker.internal`，并为连接配置 `Write.TLS.Enabled: true`、受信任的 `CAFile` 和证书中的 `ServerName`。项目只允许本地回环连接关闭 MySQL TLS，容器访问宿主机的地址需要 TLS。配置 Python 客户端时，可在 `config/integrations/company/dev.yml` 中使用 `http://host.docker.internal:8000` 访问 Mac 上的服务。
 
 3. 确认中心服务和 MySQL 可用。在仓库根目录启动 Go 和 Agent。
 
@@ -47,7 +45,7 @@ Go 的工作目录为 `/app`。环境配置 `logger/<env>.yml` 中的 `file_path
 
 ## test 和 prod
 
-1. 在 `environments/test/.env` 或 `environments/prod/.env` 设置该环境的部署参数。`GO_CONFIG_DIR` 指向部署机上包含完整应用配置和 CA 证书的私有目录。把 `test.yml` 或 `prod.yml` 里的数据库和服务地址等占位填写为真实值，在 `.env` 填写 `GO_LOG_OTLP_ENDPOINT`，并由启动环境提供对应的 `OTLP_AUTH_TOKEN`。
+1. 在 `environments/test/.env` 或 `environments/prod/.env` 设置该环境的部署参数。在项目根目录的 `config/` 中，将所选环境 YAML 的数据库和服务地址等占位填写为实际值，并提供其引用的 CA 证书。在 `.env` 填写 `GO_LOG_OTLP_ENDPOINT`，并由启动环境提供对应的 `OTLP_AUTH_TOKEN`。
 2. 在发布流程中构建并推送 Go 镜像，将候选镜像 digest 填入 test 的 `GO_APP_IMAGE`。test 验证通过后，将同一 digest 填入 prod 的 `GO_APP_IMAGE`。
 
    ```sh
