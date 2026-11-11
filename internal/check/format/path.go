@@ -40,10 +40,8 @@ func FileName(value string, style PathStyle) error {
 		if strings.ContainsAny(value, `<>:"|?*`) || strings.HasSuffix(value, " ") || strings.HasSuffix(value, ".") {
 			return check.NewViolation("path.filename", "must not use reserved Windows characters or trailing spaces or dots")
 		}
-		for _, r := range value {
-			if r < 32 {
-				return check.NewViolation("path.filename", "must not contain Windows control characters")
-			}
+		if strings.ContainsFunc(value, func(r rune) bool { return r < 32 }) {
+			return check.NewViolation("path.filename", "must not contain Windows control characters")
 		}
 		stem, _, _ := strings.Cut(value, ".")
 		stem = strings.TrimRight(stem, " ")

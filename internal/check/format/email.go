@@ -2,6 +2,7 @@ package format
 
 import (
 	"net/mail"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -79,10 +80,11 @@ func MailboxDomainOneOf(value string, allowed ...string) error {
 	}
 	separator := strings.LastIndexByte(address.Address, '@')
 	if separator >= 0 {
-		for _, domain := range allowed {
-			if strings.EqualFold(address.Address[separator+1:], domain) {
-				return nil
-			}
+		domain := address.Address[separator+1:]
+		if slices.ContainsFunc(allowed, func(candidate string) bool {
+			return strings.EqualFold(domain, candidate)
+		}) {
+			return nil
 		}
 	}
 	return check.NewViolation("mailbox_domain", "must use an allowed mailbox domain")

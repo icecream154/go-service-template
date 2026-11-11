@@ -70,10 +70,8 @@ func NoControlCharacters(value string) error {
 	if err := ValidUTF8(value); err != nil {
 		return err
 	}
-	for _, r := range value {
-		if unicode.IsControl(r) {
-			return check.NewViolation("no_control_characters", "must not contain Unicode control characters")
-		}
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		return check.NewViolation("no_control_characters", "must not contain Unicode control characters")
 	}
 	return nil
 }

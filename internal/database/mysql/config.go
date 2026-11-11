@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -98,12 +99,7 @@ func containsFloat(node *yaml.Node) bool {
 	if node.Tag == "!!float" {
 		return true
 	}
-	for _, child := range node.Content {
-		if containsFloat(child) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(node.Content, containsFloat)
 }
 
 // expandConnection 显式列出允许插值的字符串，维护者可直接核对字段，不使用通用反射。

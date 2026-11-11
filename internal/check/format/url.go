@@ -3,6 +3,7 @@ package format
 
 import (
 	"net/url"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -57,12 +58,10 @@ func URLSchemeOneOf(value *url.URL, allowed ...string) error {
 			return check.NewRuleError("url_scheme", "allowed schemes must use URI scheme syntax")
 		}
 	}
-	if value != nil {
-		for _, scheme := range allowed {
-			if strings.EqualFold(value.Scheme, scheme) {
-				return nil
-			}
-		}
+	if value != nil && slices.ContainsFunc(allowed, func(scheme string) bool {
+		return strings.EqualFold(value.Scheme, scheme)
+	}) {
+		return nil
 	}
 	return check.NewViolation("url_scheme", "must use an allowed URL scheme")
 }

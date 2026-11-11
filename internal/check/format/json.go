@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"slices"
 	"unicode/utf8"
 
 	"go-service-template/internal/check"
@@ -72,14 +73,8 @@ func parseJSON(value []byte, options JSONOptions, build bool) (any, error) {
 	if _, err := decoder.Token(); err != io.EOF {
 		return nil, check.NewViolation("json.syntax", "must contain exactly one JSON value")
 	}
-	if len(options.AllowedKinds) > 0 {
-		allowed := false
-		for _, candidate := range options.AllowedKinds {
-			allowed = allowed || candidate == kind
-		}
-		if !allowed {
-			return nil, check.NewViolation("json.kind", "top-level JSON kind is not allowed")
-		}
+	if len(options.AllowedKinds) > 0 && !slices.Contains(options.AllowedKinds, kind) {
+		return nil, check.NewViolation("json.kind", "top-level JSON kind is not allowed")
 	}
 	return result, nil
 }

@@ -1,14 +1,16 @@
 // Package relation 组合调用方明确提供的存在性判断，不反射字段，也不把零值推断为缺失。
 package relation
 
-import "go-service-template/internal/check"
+import (
+	"slices"
+
+	"go-service-template/internal/check"
+)
 
 // AtLeastOne 要求至少一个条件为 true；没有条件时失败。
 func AtLeastOne(present ...bool) error {
-	for _, provided := range present {
-		if provided {
-			return nil
-		}
+	if slices.Contains(present, true) {
+		return nil
 	}
 	return check.NewViolation("relation.at_least_one", "at least one value must be provided")
 }
@@ -49,11 +51,8 @@ func AllOrNone(present ...bool) error {
 	if len(present) == 0 {
 		return nil
 	}
-	first := present[0]
-	for _, provided := range present[1:] {
-		if provided != first {
-			return check.NewViolation("relation.all_or_none", "values must be provided together or all omitted")
-		}
+	if slices.Contains(present[1:], !present[0]) {
+		return check.NewViolation("relation.all_or_none", "values must be provided together or all omitted")
 	}
 	return nil
 }

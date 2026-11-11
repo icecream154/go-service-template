@@ -1,6 +1,10 @@
 package collection
 
-import "go-service-template/internal/check"
+import (
+	"slices"
+
+	"go-service-template/internal/check"
+)
 
 // OneOf 按 Go == 语义检查值属于 allowed；空 allowed 表示没有任何允许值。
 // 不改变字符串大小写或解析别名；规则集合不支持不可比较动态值或 NaN。
@@ -11,10 +15,8 @@ func OneOf[T comparable](value T, allowed []T) error {
 	if err := comparableValue(value); err != nil {
 		return err
 	}
-	for _, candidate := range allowed {
-		if value == candidate {
-			return nil
-		}
+	if slices.Contains(allowed, value) {
+		return nil
 	}
 	return check.NewViolation("collection.one_of", "must belong to the allowed set")
 }
@@ -27,10 +29,8 @@ func NoneOf[T comparable](value T, forbidden []T) error {
 	if err := comparableValue(value); err != nil {
 		return err
 	}
-	for _, candidate := range forbidden {
-		if value == candidate {
-			return check.NewViolation("collection.none_of", "must not belong to the forbidden set")
-		}
+	if slices.Contains(forbidden, value) {
+		return check.NewViolation("collection.none_of", "must not belong to the forbidden set")
 	}
 	return nil
 }

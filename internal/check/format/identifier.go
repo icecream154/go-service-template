@@ -2,6 +2,7 @@ package format
 
 import (
 	"encoding/hex"
+	"slices"
 	"strings"
 
 	"go-service-template/internal/check"
@@ -56,10 +57,8 @@ func UUIDVersionOneOf(value string, allowed ...uint8) error {
 	if err != nil {
 		return err
 	}
-	for _, version := range allowed {
-		if parsed[6]>>4 == version {
-			return nil
-		}
+	if slices.Contains(allowed, parsed[6]>>4) {
+		return nil
 	}
 	return check.NewViolation("uuid_version", "must use an allowed UUID version")
 }
@@ -87,10 +86,8 @@ func UUIDVariantOneOf(value string, allowed ...UUIDVariant) error {
 	case parsed[8]&0xe0 == 0xc0:
 		variant = UUIDVariantMicrosoft
 	}
-	for _, accepted := range allowed {
-		if accepted == variant {
-			return nil
-		}
+	if slices.Contains(allowed, variant) {
+		return nil
 	}
 	return check.NewViolation("uuid_variant", "must use an allowed UUID variant")
 }
