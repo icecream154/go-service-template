@@ -66,7 +66,7 @@ func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultE
 	// 4.2. 取得已发布 Logger 的配置副本，仅复用服务名和进程实例标识，不在启动层重新生成。
 	loggerConfig := logger.Current().Config()
 	// 4.3. 只调用 tracing 公共初始化入口；Resource、Provider、采样及共享实例发布均由其内部完成。
-	if err := tracing.Init(loggerConfig.ServiceName, loggerConfig.InstanceID, deployment); err != nil {
+	if err := tracing.Init(ctx, loggerConfig.ServiceName, loggerConfig.InstanceID, deployment); err != nil {
 		// 4.3.1. 追踪未完成初始化时停止装配，已经可用的 Logger 由进程入口在最终退出时收尾。
 		return nil, fmt.Errorf("initialize application tracing: %w", err)
 	}

@@ -1,9 +1,15 @@
-# Go 服务的日志 Agent。由本项目的 Compose 启动，读取应用写入共享卷的 JSON 日志。
+# Go 服务的本地 Agent。读取共享卷的 JSON 日志，并接收应用通过 OTLP 发来的 Span。
 extensions:
   file_storage:
     directory: /var/lib/otelcol
 
 receivers:
+  # Go 容器通过服务名 log-agent 访问 4318，Compose 只在容器网络内使用该端口。
+  otlp/go-service:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
   # filelog 是接收器类型，斜杠后是实例名，由下方管道的 receivers 引用。
   filelog/go-service:
     # 实际绑定的是共享卷中的文件，对应 Go logger YAML 的 file_path。
@@ -48,7 +54,7 @@ receivers:
 
 exporters:
   otlp_http/central:
-    # Compose 提供中心 OTLP HTTP 的基础地址，导出器为日志追加 /v1/logs。
+    # Compose 提供中心 OTLP HTTP 的基础地址，导出器按信号追加 /v1/logs 或 /v1/traces。
     endpoint: '${env:GO_LOG_OTLP_ENDPOINT}'
     headers:
       authorization: 'Bearer ${env:OTLP_AUTH_TOKEN}'
@@ -59,4 +65,7 @@ service:
     # logs 指定数据类型，斜杠后为此管道的名字。
     logs/go-service:
       receivers: [filelog/go-service]
+      exporters: [otlp_http/central]
+    traces/go-service:
+      receivers: [otlp/go-service]
       exporters: [otlp_http/central]

@@ -101,7 +101,7 @@ func (s *ResourceService) QueryResource(ctx context.Context) {
 
 ## Span 与调用链规范
 
-本节约定链路追踪的固定边界。生产 HTTP 公共入口创建 SERVER Span，用户资料六个 Controller 接口方法及对应六个 Service 业务方法已创建各自的 INTERNAL 子 Span，公司 HTTP 公共请求层与 Qwen、MiniMax 的 llm 公共调用层分别创建 CLIENT 子 Span；Service 调用两个 Client 时，各自的 Client Span 都以 Service 为父节点。其他尚未接入的 Controller、Service 及其他第三方 SDK 仍沿用传入 Context 中的当前 Span，同时保留各层 operation。`logger.WithCurrentOperation` 继续只管理操作身份，`logger.Operation(ctx)` 只读已有识别结果。当前未配置导出器，仍不能通过集中查询系统展示调用树。
+本节约定链路追踪的固定边界。生产 HTTP 公共入口创建 SERVER Span，用户资料六个 Controller 接口方法及对应六个 Service 业务方法已创建各自的 INTERNAL 子 Span，公司 HTTP 公共请求层与 Qwen、MiniMax 的 llm 公共调用层分别创建 CLIENT 子 Span；Service 调用两个 Client 时，各自的 Client Span 都以 Service 为父节点。其他尚未接入的 Controller、Service 及其他第三方 SDK 仍沿用传入 Context 中的当前 Span，同时保留各层 operation。`logger.WithCurrentOperation` 继续只管理操作身份，`logger.Operation(ctx)` 只读已有识别结果。
 
 日志时间线按时间展示发生了什么，调用树通过 Span 的父子关系展示谁调用了谁，耗时瀑布图结合 Span 的开始、结束时间展示串行、并行及等待过程。Span 表示一次具体操作的执行区间，可以关联多条日志；`started`、`finished` 日志本身不是 Span，也不通过配对日志来推导 Span。
 
@@ -138,7 +138,7 @@ Controller 的接口处理方法创建 HTTP 入口 Span 的子 Span，调用 Ser
 | 结果状态 | 本次执行的结果，不由某条日志的级别直接推断 | 执行边界提供已确认的结果，公共追踪层写入 | 调用失败时标记错误状态 |
 | 受控错误信息 | 失败的固定阶段说明；遵守既有日志的敏感信息限制，不直接保存原始异常或远端正文 | 执行边界提供可记录的失败说明 | `Company HTTP request failed` |
 
-Span 与 SpanContext 复用 OpenTelemetry 标准 API，不在业务层另造数据模型、随机标识或父子关系；实际采集及导出方式由后续 Provider 和导出器配置确定。名称、上下文传递和 Span 生命周期参考 [OpenTelemetry Go 接入文档](https://opentelemetry.io/docs/languages/go/instrumentation/)。
+Span 与 SpanContext 复用 OpenTelemetry 标准 API，不在业务层另造数据模型、随机标识或父子关系。Provider 按启动时的 OTLP 追踪地址决定是否导出。名称、上下文传递和 Span 生命周期参考 [OpenTelemetry Go 接入文档](https://opentelemetry.io/docs/languages/go/instrumentation/)。
 
 单行 JSON 日志已包含自动字段 `span_id`，与首表中的其他字段共同组成 `Record` 的 15 个字段。共享 Logger 和独立构造的 Logger 使用相同写入流程，四级打印方法均自动读取 Context，调用方不修改现有日志调用方式。
 
@@ -176,11 +176,11 @@ HTTP 入口 Span
             └── 被调用服务的 HTTP 入口 Span
 ```
 
-Span 的采集和导出与现有 stdout JSON 日志是两条关联的数据通道。只增加日志字段不会自动获得调用树；后续仍需由追踪基础设施导出 Span，并由集中查询系统保存和展示。本节先固定采集边界，不代表已经选定或部署收集服务、存储及前端。
+Span 和 JSON 日志经不同的管道上传。Go 将已结束且被采样的 Span 通过 OTLP HTTP 发给本地 Agent，Agent 将它们转发到中心 Collector 并写入 `otel.otel_traces`。HyperDX 读取 Span 的父子关系和执行区间来展示调用瀑布图，并可通过 `TraceId` 查询同一请求的日志。参见[部署说明](../../deploy/README.md#span-导出)。
 
 ### 公共 tracing 包（已初始化，HTTP、用户资料方法与现有 Client 已接入）
 
-公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。独立构造方法 `New(provider trace.TracerProvider)` 接收外部 Provider，其关闭责任仍属于调用方。进程启动通过 `Init(serviceName, instanceID, deployment)` 在包内创建真实 SDK Provider，并通过 `tracing.Current()` 获取共享 Tracer，包级 `Shutdown(ctx)` 管理该 Provider。两种方式均不设置 OpenTelemetry 全局 Provider 或传播器，也不启动导出器；具体启动和退出约定见[tracing 初始化与共享实例](#tracing-初始化与共享实例)。
+公共封装位于 [internal/tracing](../../internal/tracing/)，使用 OpenTelemetry v1.47.0。独立构造方法 `New(provider trace.TracerProvider)` 接收外部 Provider，其关闭责任仍属于调用方。进程启动通过 `Init(ctx, serviceName, instanceID, deployment)` 在包内创建真实 SDK Provider，并通过 `tracing.Current()` 获取共享 Tracer，包级 `Shutdown(ctx)` 管理该 Provider。两种方式均不设置 OpenTelemetry 全局 Provider 或传播器。共享初始化可按 OTLP 追踪地址注册批处理器和导出器，具体启动和退出约定见[tracing 初始化与共享实例](#tracing-初始化与共享实例)。
 
 | 创建入口 | 名称来源 | 固定 kind |
 | --- | --- | --- |
@@ -479,7 +479,7 @@ sequenceDiagram
 
 响应等待层隔离业务取消并保留 Context 值，超时不会自动取消内部工作。若等待期限在 LLM 调用期间结束，`H` 同样可先结束，而 `L` 继续执行至其实际结果或自身预算到期。晚到的 Qwen、MiniMax 调用日志关联各自的 `L`，公司 Client 日志关联 `K`，Service 日志关联 `S`，其他未接入 SDK 继续沿用传入的节点，Service 返回后的 Controller 日志仍关联 `C`；未进入 Service 的 Controller 日志使用 `C`，尚未接入 Controller 的路径继续沿用 `H`。各 Client 仍受自己的原有请求超时控制，不因入站等待超时而放宽预算。超时后才进入 Controller 时也可基于保留的 `H` 创建子节点，随后进入 Service、llm 和公司 Client 再创建 `S`、`L`、`K`，父节点无需仍在执行。晚到处理不会重启或延长 `H`，也不会改写已选定的 503；响应写出不保证调用方已完整接收正文。
 
-当前 stdout JSON 日志能够显示上述标识，但没有配置 SpanProcessor 或 Exporter；完整 Span 数据未被集中保存，前端调用树也尚未具备。创建 Span、关联日志、导出和查询是分别需要接入的能力。
+stdout JSON 日志记录上述标识。启用 OTLP 导出后，各节点按自己的实际结束时刻进入批处理队列，HyperDX 可以按这些执行区间展示请求超时后仍在继续的业务节点。
 
 ### 生命周期日志与响应边界
 
@@ -605,7 +605,7 @@ nil Context 跳过 Span 创建，保留原有的初始化、Params、Context 检
 
 第三方调用仅建立本项目的 Client 节点，不默认向供应商发送 `TraceId`、`traceparent` 或 `tracestate`，供应商内部调用过程不在本次可观测范围内。公司 HTTP 公共请求层仍按前文注入标准追踪头，两类调用的传播约定分别保留。
 
-公共层使用启动时初始化的共享 Logger 和 Tracer，Logger 局部变量统一命名为 `lg`，直接调用无返回值的四级打印方法；输出故障由 Logger 内部使用独立 stderr 兜底。发起调用前必须完成 Logger 初始化，非 nil Context 的调用还必须完成 tracing 初始化，未初始化按共享实例契约 panic，不在请求时补造实例。日志级别过滤不影响 Span 创建和结果记录。当前没有 SpanProcessor 或 Exporter，独立 Span 的创建不代表已上报或集中保存；本节只覆盖 Qwen、MiniMax 当前的单轮非流式文本调用，其他 SDK 和其他调用方式按各自公共层另行接入。
+公共层使用启动时初始化的共享 Logger 和 Tracer，Logger 局部变量统一命名为 `lg`，直接调用无返回值的四级打印方法；输出故障由 Logger 内部使用独立 stderr 兜底。发起调用前必须完成 Logger 初始化，非 nil Context 的调用还必须完成 tracing 初始化，未初始化按共享实例契约 panic，不在请求时补造实例。日志级别过滤不影响 Span 创建和结果记录。启用导出时，被采样的 Client Span 结束后由共享 Provider 批量发送。本节只覆盖 Qwen、MiniMax 当前的单轮非流式文本调用，其他 SDK 和其他调用方式按各自公共层另行接入。
 
 ## 启动初始化与共享实例
 
@@ -627,7 +627,7 @@ file_path: .data/logs/app.jsonl
 
 ### tracing 初始化与共享实例
 
-Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取得配置值副本，将其中的服务名称、实例标识及已有部署配置传给 `tracing.Init(serviceName, instanceID, deployment)`。bootstrap 只负责调用顺序及传值，SDK Resource、Provider、采样策略和共享实例发布均在 [internal/tracing/runtime.go](../../internal/tracing/runtime.go) 内完成，不新增 tracing YAML，不重复读取环境变量，也不生成另一份实例标识。Logger 已依赖 tracing 的 Context 方法，因此 tracing 不反向依赖 Logger。
+Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取得配置值副本，将启动 Context、服务名称、实例标识及已有部署配置传给 `tracing.Init(ctx, serviceName, instanceID, deployment)`。bootstrap 负责调用顺序及传值。SDK Resource、Provider、采样、导出及共享实例发布均在 [internal/tracing/runtime.go](../../internal/tracing/runtime.go) 内完成。Logger 已依赖 tracing 的 Context 方法，因此 tracing 不反向依赖 Logger。
 
 | 标准 Resource 属性 | 来源 | 与日志的对应关系 |
 | --- | --- | --- |
@@ -639,7 +639,7 @@ Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取
 
 共享 Provider 通过私有 `contextIDGenerator` 兼容根 TraceId：只有缺少有效父节点时才读取已校验的兼容值，没有合法值则生成随机 TraceId；根与子 Span 的 SpanId 始终独立随机生成并排除全零。有效上游父链路由 SDK 原样继承，不伪造父 Span 或将外来 TraceId 声明为必然随机，独立 `New(provider)` 的策略不变。
 
-当前没有注册 SpanProcessor 或 Exporter，不创建批处理协程，也不把 Span 数据输出到 stdout、文件或远端服务。HTTP 入口、用户资料六个 Controller、六个 Service 方法、公司 HTTP Client 及 Qwen、MiniMax 文本调用已创建 Span，JSON 日志可看到各自标识；初始化本身不创建 Span，其他第三方 SDK 尚未建立独立节点，也不能据此查看集中调用树或认定数据已上报。
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` 有值时，共享 Provider 注册 OTLP HTTP 导出器及 SDK 批处理器，异步发送已结束且被采样的 Span。Compose 将地址设为 `http://log-agent:4318/v1/traces`，中心认证由 Agent 负责。未设置导出地址时，Provider 仍按上述规则创建 Span 并为日志提供标识。HTTP 入口、用户资料六个 Controller、六个 Service 方法、公司 HTTP Client 及 Qwen、MiniMax 文本调用的 Span 继续由现有业务边界创建。
 
 全部构造成功后，`Init` 在锁保护下一次性发布共享 Tracer 和本包拥有的 Provider；失败不发布部分实例。`tracing.Current()` 初始化前调用会 panic，重复成功初始化返回错误；关闭后不清空指针，也不支持运行中重建。包级 `tracing.Shutdown(ctx)` 未初始化时安全返回 nil，只关闭本包 `Init` 创建的 Provider，不接管独立 `New` 注入的外部 Provider。
 
@@ -647,6 +647,6 @@ Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取
 
 进程入口 `run` 在 bootstrap 之前登记最终清理，覆盖初始化失败、主动取消及正常退出路径。成功启动后先停止 HTTP 并等待内部工作结束，再清理 Client 和数据库，随后调用 `tracing.Shutdown(ctx)`，最后调用 `logger.Shutdown()` 同步并关闭日志文件。尚未开始处理请求的启动或监听失败同样可以安全释放已创建的资源。
 
-追踪关闭使用独立的非 nil Context，其超时时长复用 `-shutdown-timeout`，不使用已经取消的进程 Context 或已经释放的启动 Context。该预算在业务排空及共享资源清理后单独创建，与 HTTP 和内部处理共用的原排空预算分开。关闭错误并入原始退出错误，仍继续执行 Logger 收尾。当前 Span 的保存范围见上面的追踪初始化说明。
+追踪关闭使用独立的非 nil Context，其超时时长复用 `-shutdown-timeout`，不使用已经取消的进程 Context 或已经释放的启动 Context。该预算在业务排空及共享资源清理后单独创建，与 HTTP 和内部处理共用的原排空预算分开。启用导出时，Provider 在这个预算内尝试发送队列中剩余的 Span 并关闭导出器。关闭错误并入原始退出错误，仍继续执行 Logger 收尾。
 
 未完全排空时沿用异常退出流程，跳过共享资源清理、Provider 关闭及 Logger 收尾，避免后台工作仍在执行时提前终止追踪或等待日志写锁。最终故障报告继续使用现有标准库日志兜底。本地文件的同步和关闭由 Logger 完成，后续采集和远端存储由 Agent 与中心服务完成。

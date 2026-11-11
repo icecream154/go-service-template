@@ -1,6 +1,6 @@
 # Go 服务部署
 
-同一套 Compose 启动 Go 应用和日志 Agent。Go Logger 根据环境 YAML 中的 `file_path` 将 JSON 日志追加到共享卷的 `app.jsonl`，并继续输出到 stdout。Agent 读取文件并保存采集进度，再通过 OTLP HTTP 发往该环境的中心 Collector。中心写入 ClickHouse，HyperDX 从 `otel.otel_logs` 查询。
+同一套 Compose 启动 Go 应用和本地 Agent。Go Logger 将 JSON 日志写到 stdout 和共享卷的 `app.jsonl`，Agent 读取文件并保存采集进度。Go 的追踪 Provider 将已完成且被采样的 Span 批量发送给同一个 Agent。Agent 将两类数据转发到中心 Collector，由中心写入 ClickHouse。HyperDX 的 **Logs** 查询 `otel.otel_logs`，**Traces** 查询 `otel.otel_traces`。
 
 ## 目录与配置
 
@@ -8,7 +8,7 @@
 | --- | --- |
 | `Dockerfile`、`Dockerfile.dockerignore` | 从仓库根目录构建 `go-service` 二进制和镜像，应用配置在部署时挂载 |
 | `compose.yaml` | 公共的 `app`、`log-agent`、配置挂载、日志卷和采集进度卷 |
-| `collector/otelcol-go-logs.yaml` | 三套环境共用的日志采集与转发配置 |
+| `collector/otelcol-go-logs.yaml` | 三套环境共用的日志采集、Span 接收和转发配置 |
 | `environments/<env>/compose.yaml` | 固定 `APP_ENV`，选择本地构建或已发布镜像 |
 | `environments/<env>/.env` | 纳入 Git 的环境部署参数，启动脚本直接读取 |
 | `compose.sh` | 选择 dev、test 或 prod 的配置并转交 Compose 命令 |
@@ -27,9 +27,13 @@ Go 的工作目录为 `/app`。环境配置 `logger/<env>.yml` 中的 `file_path
 
 `filelog/go-service` 是接收器的实例名，供 `service.pipelines` 下的 `receivers` 引用。`logs/go-service` 是日志管道名。HyperDX 的 `ServiceName` 来自 Go 的 `logger/<env>.yml` 中的 `service_name`。Go 将该值写入每条 JSON，Agent 将它映射到 OpenTelemetry 的 `service.name`。
 
+## Span 导出
+
+公共 Compose 为 Go 设置 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://log-agent:4318/v1/traces`。Go 启动时为现有 TracerProvider 注册 OTLP HTTP 导出器和批处理器。`log-agent:4318` 通过 Compose 内部网络访问。Agent 的 Span 管道使用与日志相同的中心地址 `GO_LOG_OTLP_ENDPOINT` 和采集 token，并把 Span 发往中心的 `/v1/traces`。直接用 `go run` 启动且未设置该导出地址时，Go 仍创建 Span 并在日志中记录关联标识。
+
 ## 本地 dev
 
-1. 启动前在终端提供与中心 Collector 相同的 `OTLP_AUTH_TOKEN`。默认的 `GO_LOG_OTLP_ENDPOINT=http://host.docker.internal:4318` 适合同一台 Mac 上的 Docker Desktop 与已发布 4318 端口的中心。其他部署填写 Agent 可达的 OTLP HTTP 基础地址，Agent 会追加 `/v1/logs`。
+1. 启动前在终端提供与中心 Collector 相同的 `OTLP_AUTH_TOKEN`。默认的 `GO_LOG_OTLP_ENDPOINT=http://host.docker.internal:4318` 适合同一台 Mac 上的 Docker Desktop 与已发布 4318 端口的中心。其他部署填写 Agent 可达的 OTLP HTTP 基础地址，Agent 会按数据类型追加 `/v1/logs` 或 `/v1/traces`。
 
 2. 在项目根目录的 `config/` 里配置业务依赖。使用 Docker Desktop 连接 Mac 上的 MySQL 时，将 `config/database/mysql/dev.yml` 的 `Write.Host` 配为 `host.docker.internal`，沿用本机 MySQL 的端口、账号和密码。这个宿主机地址在 dev 环境允许 `Write.TLS.Enabled: false`。直接用 `go run` 在 Mac 上启动时，可使用 `127.0.0.1`。配置 Python 客户端时，可在 `config/integrations/company/dev.yml` 中使用 `http://host.docker.internal:8000` 访问 Mac 上的服务。
 
@@ -40,6 +44,8 @@ Go 的工作目录为 `/app`。环境配置 `logger/<env>.yml` 中的 `file_path
    ```
 
 4. 正常访问 Go 接口后，在 HyperDX 的 **Search → Logs** 选择最近 15 分钟，搜索 `ServiceName:"<service_name>"`。用当前应用 YAML 中的 `service_name` 替换占位符。用 `./deploy/compose.sh dev logs app log-agent` 查看应用 JSON 日志、stderr 和 Agent 自身的日志。
+
+5. 使用包含 Span 导出功能的镜像启动后，发起一个新的业务请求，复制响应头中的 `TraceId`。在 HyperDX **Search → Traces** 搜索 `TraceId:"<该请求的 TraceId>"`，点击返回的任意 Span 查看瀑布图。用同一个标识在 **Logs** 中查询这次请求的日志。
 
 如果以其他 Compose 项目名启动的容器还占用端口，先停止那些容器。日志卷和进度卷按 Compose 项目名管理。使用曾经用过的项目名会复用该项目仍存在的卷。
 

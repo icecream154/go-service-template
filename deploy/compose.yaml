@@ -6,6 +6,8 @@ services:
     stop_grace_period: 20s
     environment:
       APP_REGION: cn
+      # 已结束的 Span 通过本项目的 Compose 网络发给 Agent。
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://log-agent:4318/v1/traces
     ports:
       # 映射顺序为「宿主机地址:宿主机端口:容器端口」。Go 在容器里监听 8080。
       # GO_BIND_ADDRESS=0.0.0.0 将 GO_HTTP_PORT 发布到宿主机的所有 IPv4 网卡。
@@ -28,7 +30,7 @@ services:
     image: otel/opentelemetry-collector-contrib:0.155.0
     command: ["--config=/etc/otelcol-contrib/go-logs.yaml"]
     restart: unless-stopped
-    # 先启动 app，再由 Agent 读取共享卷中的日志并转发。
+    # Agent 在 app 启动后读取共享卷中的日志，并通过内部 OTLP HTTP 接收 Span。
     depends_on:
       app:
         condition: service_started
@@ -43,7 +45,7 @@ services:
     # 应用日志卷本身以只读方式挂载。向中心 Collector 发送 HTTP 请求也只需要普通权限。
     cap_drop: [ALL]
     environment:
-      # 中心 Collector 是外部服务。每套环境填写 Agent 可访问的地址和该中心的 token。
+      # 日志和 Span 共用中心 Collector 的基础地址和该中心的 token。
       GO_LOG_OTLP_ENDPOINT: ${GO_LOG_OTLP_ENDPOINT:?请设置中心 Collector 的 OTLP HTTP 基础地址}
       OTLP_AUTH_TOKEN: ${OTLP_AUTH_TOKEN:?请从启动环境提供中心 Collector 使用的 OTLP_AUTH_TOKEN}
     volumes:

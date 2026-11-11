@@ -3,12 +3,16 @@ package tracing
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 
 	"go-service-template/env"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -24,8 +28,11 @@ var shared struct {
 // Init 构造 SDK Provider 并发布共享 Tracer，必须在接收请求或启动业务协程之前调用。
 // serviceName、instanceID 由装配方从已初始化 Logger 的配置副本传入，deployment 复用已有环境配置。
 // 不另读 YAML、不生成另一份实例标识，也不设置 OpenTelemetry 全局 Provider 或传播器。
-// 当前不注册处理器或导出器；初始化本身不会产生、打印或上报 Span。
-func Init(serviceName, instanceID string, deployment env.Config) error {
+// 设置 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT 时，已完成的 Span 通过 OTLP HTTP 批量上报。
+func Init(ctx context.Context, serviceName, instanceID string, deployment env.Config) error {
+	if ctx == nil {
+		return errors.New("tracing startup context is required")
+	}
 	// 1. 串行构造并发布，避免重复创建 Provider，或替换运行中的共享实例。
 	shared.Lock()
 	defer shared.Unlock()
@@ -55,19 +62,33 @@ func Init(serviceName, instanceID string, deployment env.Config) error {
 		attribute.String("deployment.environment.name", deployment.Environment),
 	)
 	// 4. 创建真实 SDK Provider；根链路使用全量采样，子链路尊重父节点的采样决定。
-	// 当前没有导出器或后台批处理协程；SDK 原始 panic 采集关闭，由边界 End 记录受控说明。
-	provider := sdktrace.NewTracerProvider(
+	// SDK 原始 panic 采集关闭，由边界 End 记录受控说明。
+	options := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(identity),
 		// 4.1. 根 Span 沿用入口已经确定的合法 TraceId，子节点仍由 SDK 管理父子关系。
 		// 不通过伪造上游 SpanId 实现兼容，也不修改上游的采样或随机性标志。
 		sdktrace.WithIDGenerator(contextIDGenerator{}),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 		sdktrace.WithoutPanicRecording(),
-	)
+	}
+	// Compose 提供本地 Agent 的接收地址。HTTP 导出器在发送批次时才建立连接。
+	if endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"); endpoint != "" {
+		parsed, err := url.Parse(endpoint)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Hostname() == "" || parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT must be an HTTP or HTTPS URL without credentials, query, or fragment")
+		}
+		exporter, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpointURL(endpoint))
+		if err != nil {
+			return fmt.Errorf("initialize OTLP trace exporter: %w", err)
+		}
+		options = append(options, sdktrace.WithBatcher(exporter))
+	}
+	provider := sdktrace.NewTracerProvider(options...)
 	// 5. 复用已有的五类边界封装；该构造不写日志，不反向依赖 Logger，避免循环依赖。
 	instance, err := New(provider)
 	if err != nil {
-		// 5.1. 未发布的 Provider 没有处理器、导出器或在途 Span，可直接释放；保留两类错误。
+		// 5.1. 未发布的 Provider 没有在途 Span，关闭时一并释放已构造的导出器。
 		return errors.Join(err, provider.Shutdown(context.Background()))
 	}
 	// 6. 全部步骤成功后同时发布实例和所有权，Current 不会读到未完成的构造状态。
