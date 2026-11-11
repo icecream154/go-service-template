@@ -308,16 +308,17 @@ func RuneCountAtMost(value string, maximum int) error
 
 1. **规则按业务含义归属，不按字段的数据类型归属。** “合法昵称”属于对应领域，“字符串有多少个码点”属于公共检查。其他领域即使也有“名称”或“URL”字段，也维护自己的业务规则；只有含义一致的基础算法才放入公共包复用。
 
-2. **规则与对应实体放在同一个 models 包，按实体组织文件。** 实体定义及其领域操作放在实体文件，独立字段检查和实体共同校验函数放在对应的校验文件；HTTP 请求的校验组合仍放在 Validator。以下占位符仅表示通用组织约定，不指向具体项目文件。
+2. **每个领域使用一个 `models` 包，按实体或领域值对象组织文件。** 文件名用小写下划线形式表达业务概念。同一实体拆出多个文件时，使用相同的实体名前缀，文件仍在同一个包内。
 
-   ```text
-   app/domains/<domain>/
-     models/
-       <entity>.go
-       <entity>_validation.go
-     validator/v<version>/<controller>/
-       <use_case>_validator.go
-   ```
+   | 文件 | 内容与创建条件 |
+   | --- | --- |
+   | `<entity>.go` | 放实体定义及其专属类型和枚举，随后组织构造函数和依赖实体字段或状态的领域操作。仅承载字段的实体使用这个文件即可。 |
+   | `<entity>_validation.go` | 实体有可独立调用的字段规则或可复用的实体校验时创建。先声明规则使用的常量和本层命名错误值，再组织校验函数。私有辅助函数集中在文件末尾。 |
+   | `<entity>_<responsibility>.go` | 一组领域操作具有明确的业务职责，且适合独立阅读和维护时拆出。例如会员订单形成一组状态迁移规则后，可以使用 `membership_order_transition.go`。 |
+
+   具有独立业务含义的领域值对象可以用自身的业务名称命名文件。校验相关常量遵守第 2.3 节，本层命名错误值遵守[错误声明规范](api-error.md#11-service-与-models-的错误声明和返回约束)。
+
+   用户资料的实体定义、字段规则和测试分别放在 `user_profile.go`、`user_profile_validation.go` 和 `user_profile_validation_test.go`。`UserFollow` 和 `MembershipChangeRecord` 当前仅声明字段，各自使用实体文件。HTTP 请求的校验组合由 Validator 组织。 [用户资料实体](../../app/domains/user/models/user_profile.go) · [用户资料字段规则](../../app/domains/user/models/user_profile_validation.go) · [领域模型单测规范](../test/unit-test.md#34-领域模型单测)
 
 3. **独立字段规则通过明确命名的纯函数提供。** 函数只接收待检查的字段及必要策略，不要求调用方先构造完整实体。校验昵称时，不需要给尚未生成的 ID、时间或版本填充占位值，也不强制调用全字段的实体 `Validate()`。
 

@@ -48,6 +48,21 @@
 
 以更新用户资料为例，`models` 单测覆盖昵称的长度、空白和编码边界。Validator 选一个非法昵称确认错误定位到 `user_name`，并验证 `expected_version` 缺失或为 `null` 时拒绝，显式传 `0` 时通过版本字段校验。Service 的纯参数检查验证业务允许的版本范围。MySQL 集成测试预置与请求不同的资料版本，断言 HTTP `409`、业务码 `USER_PROFILE_VERSION_CONFLICT`，并检查数据库中的原资料保持不变。 [昵称校验](../../app/domains/user/models/user_profile_validation.go) · [资料更新](../../app/domains/user/service/user_profile_service.go)
 
+### 3.4 领域模型单测
+
+按实体或领域值对象定位被测行为，沿用第 2 节的同目录、同名测试文件和用例组织约定。优先在 `models_test` 中通过公开入口验证。私有辅助函数随入口覆盖，确有独立规则且难以通过公开入口触发时使用同包测试。[领域文件组织](../application/api-service-validator.md#51-领域规则的归属与组织方式)
+
+| 被测行为 | 场景与断言 |
+| --- | --- |
+| 字段规则及实体校验 | 覆盖典型合法值、有效边界、紧邻越界值和有不同拒绝原因的输入。长度等边界由测试按业务契约独立表达，例如昵称测试直接构造 64 和 65 个 Unicode 码点。成功时断言校验通过，失败时用 `errors.Is` 断言错误类别。调用方需要区分具体规则时，用 `errors.As` 取得 `*check.Violation` 并核对 `Rule`。 |
+| 构造函数及领域操作 | 有默认值、计算、字段关系或状态约束时，为每条用例准备独立对象。成功时核对返回值及相关字段，失败时同时断言错误和实体状态保持原值。一次修改多个字段时，可选其中一个输入无效，验证整次修改被拒绝。 |
+| 依赖时间或策略的规则 | 显式传入固定时间或只读策略，覆盖影响结果的临界时刻和允许、拒绝场景。例如会员到期判断分别验证到期前、恰好到期和到期后。 |
+| 纯字段声明、枚举及直接赋值 | 由使用这些声明或构造结果的用例覆盖。 |
+
+以头像为例，`models` 测已提供地址的长度和 HTTP(S) 格式，Validator 测创建时能否省略、更新时是否必填，以及错误是否定位到 `avatar_url`。Service 单测验证基于查询结果做出的业务决策，例如重复键后是否能确认账户冲突。实际唯一约束、事务和锁的效果由 MySQL 集成测试验证。[头像地址规则](../../app/domains/user/models/user_profile_validation.go) · [创建用户校验](../../app/domains/user/validator/v1/user_profile/create_user_validator.go) · [更新资料校验](../../app/domains/user/validator/v1/user_profile/update_user_profile_validator.go) · [账户冲突处理](../../app/domains/user/service/user_profile_service.go)
+
+完成后逐函数查看语句覆盖率，结合用例核对规则、错误和状态变化的覆盖。
+
 ## 4. 用例设计与断言
 
 1. **让每条用例的目标明确。** 按准备初始状态、执行被测行为、核对结果组织。行为一致的输入选取代表值，能改变结果的输入条件分别建立用例。在每条用例定义前写注释，说明为什么选择这个输入，以及期望验证的具体行为。
@@ -64,50 +79,8 @@
 
 ## 6. 示例
 
-以下示例可放在 `app/domains/user/models/user_profile_validation_test.go`。它导入 `models` 包，验证[昵称校验](../../app/domains/user/models/user_profile_validation.go)的有效边界和错误类别。
-
-```go
-package models_test
-
-import (
-	"errors"
-	"strings"
-	"testing"
-
-	"go-service-template/app/domains/user/models"
-	"go-service-template/internal/check"
-)
-
-func TestValidateUserName(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		wantErr error
-	}{
-		// 用短中文昵称验证有效的多字节文本可以通过。
-		{name: "accepts a normal nickname", input: "小明"},
-		// 用 64 个汉字验证长度按 Unicode 码点计算，且上限包含在有效范围内。
-		{name: "accepts 64 code points", input: strings.Repeat("中", 64)},
-		// 在上一个边界输入上增加一个码点，验证相邻越界值被拒绝。
-		{name: "rejects 65 code points", input: strings.Repeat("中", 65), wantErr: check.ErrInvalidValue},
-		// 用空格和制表符组成非空字符串，验证纯空白昵称被拒绝。
-		{name: "rejects a blank nickname", input: " \t", wantErr: check.ErrInvalidValue},
-		// 用单字节 0xff 构造无效 UTF-8，验证编码错误归为无效值。
-		{name: "rejects invalid UTF-8", input: "\xff", wantErr: check.ErrInvalidValue},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := models.ValidateUserName(test.input)
-			if !errors.Is(err, test.wantErr) {
-				t.Errorf("ValidateUserName(%q) error = %v, want %v", test.input, err, test.wantErr)
-			}
-		})
-	}
-}
-```
-
-多个测试函数按源码顺序排列、同类用例复用断言辅助函数的示例见[整数检查单测](../../internal/check/scalar/integer_test.go)。
+- 用户资料校验单测按源码顺序覆盖账户来源、外部账户 ID、昵称和头像地址。昵称用分解重音字符构造 64 和 65 个码点的边界，四组用例复用辅助函数检查错误类别和规则名。[用户资料校验单测](../../app/domains/user/models/user_profile_validation_test.go)
+- 整数检查单测展示多个测试函数按源码顺序排列，同类用例共用断言辅助函数。[整数检查单测](../../internal/check/scalar/integer_test.go)
 
 ## 7. 执行与维护
 
@@ -122,4 +95,4 @@ func TestValidateUserName(t *testing.T) {
 | 生成各被测包的覆盖率报告 | `go test -coverprofile=coverage.out ./...` |
 | 查看报告中的函数覆盖率 | `go tool cover -func=coverage.out` |
 
-按目录运行时，选择被测包所在的目录。上表的用户领域命令在加入示例文件后可执行。提交时，测试随对应行为的变更一起维护。覆盖率用于定位遗漏的代码，评审时检查新增或变更的行为是否有清晰、可独立重跑的用例。
+按目录运行时，选择被测包所在的目录。提交时，测试随对应行为的变更一起维护。覆盖率用于定位遗漏的代码，评审时检查新增或变更的行为是否有清晰、可独立重跑的用例。
