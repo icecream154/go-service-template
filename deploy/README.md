@@ -31,7 +31,7 @@ Go 的工作目录为 `/app`。环境配置 `logger/<env>.yml` 中的 `file_path
 
 1. 启动前在终端提供与中心 Collector 相同的 `OTLP_AUTH_TOKEN`。默认的 `GO_LOG_OTLP_ENDPOINT=http://host.docker.internal:4318` 适合同一台 Mac 上的 Docker Desktop 与已发布 4318 端口的中心。其他部署填写 Agent 可达的 OTLP HTTP 基础地址，Agent 会追加 `/v1/logs`。
 
-2. 在项目根目录的 `config/` 里配置业务依赖。MySQL 在 Mac 上运行时，将 `config/database/mysql/dev.yml` 的 `Write.Host` 配为 `host.docker.internal`，并为连接配置 `Write.TLS.Enabled: true`、受信任的 `CAFile` 和证书中的 `ServerName`。项目只允许本地回环连接关闭 MySQL TLS，容器访问宿主机的地址需要 TLS。配置 Python 客户端时，可在 `config/integrations/company/dev.yml` 中使用 `http://host.docker.internal:8000` 访问 Mac 上的服务。
+2. 在项目根目录的 `config/` 里配置业务依赖。使用 Docker Desktop 连接 Mac 上的 MySQL 时，将 `config/database/mysql/dev.yml` 的 `Write.Host` 配为 `host.docker.internal`，沿用本机 MySQL 的端口、账号和密码。这个宿主机地址在 dev 环境允许 `Write.TLS.Enabled: false`。直接用 `go run` 在 Mac 上启动时，可使用 `127.0.0.1`。配置 Python 客户端时，可在 `config/integrations/company/dev.yml` 中使用 `http://host.docker.internal:8000` 访问 Mac 上的服务。
 
 3. 确认中心服务和 MySQL 可用。在仓库根目录启动 Go 和 Agent。
 

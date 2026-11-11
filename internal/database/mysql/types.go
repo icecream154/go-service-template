@@ -16,6 +16,8 @@ type Config struct {
 	Connections map[string]ConnectionConfig `yaml:"Connections"`
 	// FilePath 保存实际读取的绝对路径，仅供定位文件；不是 YAML 中的配置项。
 	FilePath string `yaml:"-"`
+	// environment 由 LoadConfig 设置，供 Open 复用同一环境的 TLS 校验规则。
+	environment string
 }
 
 // ConnectionConfig 对应一个命名连接，当前仅支持由 Write 同时承担读和写。
@@ -95,7 +97,7 @@ type EndpointConfig struct {
 	MultiStatements bool `yaml:"MultiStatements"`
 	// Session 应用于每个新建物理连接，包括连接池补充和断线重连后的连接。
 	Session SessionConfig `yaml:"Session"`
-	// TLS 只在启用时解析证书路径和加载证书；关闭仅用于本地开发回环连接。
+	// TLS 只在启用时解析证书路径和加载证书。开发环境的本机连接可以关闭。
 	TLS TLSConfig `yaml:"TLS"`
 	// SetMaxOpenConns 是单命名连接、单进程的最大总连接数，必须为正数。
 	SetMaxOpenConns int `yaml:"SetMaxOpenConns"`
@@ -131,7 +133,7 @@ type SessionConfig struct {
 // Enabled=false 时其余字段不参与占位符展开、证书语义校验或证书加载。
 // YAML 结构和字段类型仍统一解码检查，不因关闭 TLS 而放宽。
 type TLSConfig struct {
-	// Enabled 在测试、生产环境必须开启；仅开发回环连接允许关闭。
+	// Enabled 在测试、生产环境必须开启。开发可为回环地址或 host.docker.internal 关闭。
 	Enabled bool `yaml:"Enabled"`
 	// CAFile 是可信 CA 文件路径；相对路径按当前 YAML 所在目录解析。
 	CAFile string `yaml:"CAFile"`

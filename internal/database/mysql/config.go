@@ -38,6 +38,7 @@ func LoadConfig(configDir, environment string) (Config, error) {
 		return Config{}, err
 	}
 	config.FilePath = filePath
+	config.environment = environment
 	for _, name := range sortedConnectionNames(config.Connections) {
 		connection := config.Connections[name]
 		if !connection.Enabled {
@@ -45,9 +46,6 @@ func LoadConfig(configDir, environment string) (Config, error) {
 		}
 		if err := expandConnection(&connection, "Connections."+name); err != nil {
 			return Config{}, err
-		}
-		if environment != "dev" && !connection.Write.TLS.Enabled {
-			return Config{}, invalidField("Connections."+name+".Write.TLS.Enabled", "TLS is required outside the development environment")
 		}
 		config.Connections[name] = connection
 	}

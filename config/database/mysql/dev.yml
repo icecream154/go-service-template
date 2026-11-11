@@ -1,6 +1,6 @@
 # 本地开发 MySQL 配置：三个普通业务连接和事务连接共用本机地址及开发账号，分别使用独立连接池。
-# 本机回环连接显式关闭 TLS，不需要 CA 文件或 DEV_MYSQL_CA_FILE 环境变量。
-# test、prod 的 TLS 配置独立维护，不受本文件影响。
+# dev 环境连接 localhost、回环 IP 或 Docker Desktop 的宿主机地址 host.docker.internal 时，可关闭 TLS。
+# test 和 prod 的 MySQL 连接要求启用 TLS。
 #
 # 加载流程：选择 dev.yml -> 解析 YAML 并合并锚点 -> 校验配置 -> 配置驱动、会话、连接池和 GORM。
 # 初始化组件逐项应用下列配置，并在所有启用连接校验成功后启动 HTTP 服务。
@@ -57,7 +57,8 @@ Gormv2:
         # Write 是主库端点，当前也承担查询；&writer 将端点参数命名以便复用。
         Write: &writer
           # 本机 TCP 地址。
-          Host: "127.0.0.1"
+          # 直接在宿主机运行 Go 时用回环地址。Docker Desktop 容器连接宿主机时可改为 host.docker.internal。
+          Host: "host.docker.internal"
           # MySQL 监听端口。
           Port: 3306
           # 默认数据库；该连接访问未限定库名的 user_profile 时，实际为 user_service.user_profile。
@@ -91,7 +92,7 @@ Gormv2:
             # ERROR_FOR_DIVISION_BY_ZERO：结合严格模式，对写入中的除零报错。
             # NO_ENGINE_SUBSTITUTION：指定引擎不可用时报错，不自动替换。
             SQLMode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-          # 本地回环连接的 TLS 例外；初始化组件须按 Enabled 分支决定是否构建 TLS 配置。
+          # dev 本机连接可关闭 TLS，适用于 localhost、回环 IP 和 host.docker.internal。
           TLS:
             # false：直接使用本地非 TLS 连接，不加载 CA、不校验证书相关字段。
             Enabled: false

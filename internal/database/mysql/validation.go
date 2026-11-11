@@ -52,7 +52,7 @@ func (c Config) Validate() error {
 		if behavior.NowFunc.Location != "UTC" || behavior.NowFunc.Precision != "millisecond" {
 			return invalidField(path+".Behavior.NowFunc", "only UTC with millisecond precision is supported")
 		}
-		if err := connection.Write.validate(path + ".Write"); err != nil {
+		if err := connection.Write.validate(path+".Write", c.environment); err != nil {
 			return err
 		}
 	}
@@ -64,7 +64,7 @@ func (c Config) Validate() error {
 
 // validate 保留项目明确要求的端点约束，地址和证书的具体可用性由驱动、TLS 校验。
 // 各组选项按实际生效位置检查，错误只含字段名和约束，不包含账号、密码或连接地址。
-func (e EndpointConfig) validate(path string) error {
+func (e EndpointConfig) validate(path, environment string) error {
 	if strings.TrimSpace(e.Host) == "" || strings.TrimSpace(e.User) == "" || e.Pass == "" {
 		return invalidField(path, "Host, User and Pass are required")
 	}
@@ -107,9 +107,14 @@ func (e EndpointConfig) validate(path string) error {
 		}
 	}
 	if !e.TLS.Enabled {
+		if environment != "" && environment != "dev" {
+			return invalidField(path+".TLS.Enabled", "TLS is required outside the development environment")
+		}
 		ip := net.ParseIP(e.Host)
-		if e.Host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return invalidField(path+".TLS.Enabled", "TLS may only be disabled for a local development loopback connection")
+		loopback := e.Host == "localhost" || (ip != nil && ip.IsLoopback())
+		dockerHost := environment == "dev" && e.Host == "host.docker.internal"
+		if !loopback && !dockerHost {
+			return invalidField(path+".TLS.Enabled", "TLS may only be disabled for a loopback address or host.docker.internal in the development environment")
 		}
 		return nil // 关闭 TLS 后不读取和校验未使用的 CA、主机名等参数。
 	}
