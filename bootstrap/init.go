@@ -42,7 +42,7 @@ import (
 // logger.Init 自行读取日志配置、生成实例标识并发布共享 Logger；本入口不构造日志输出器。
 // tracing.Init 复用日志元信息和部署环境，自行构造并发布 SDK Provider 与共享 Tracer。
 // 成功返回后，调用方负责数据库及各 Client 空闲连接的最终清理。
-// Logger 和 tracing 在后续初始化失败时仍保留，追踪关闭和日志同步统一交给进程入口处理。
+// Logger 和 tracing 在后续初始化失败时仍保留，追踪及日志文件的收尾由进程入口处理。
 // 本函数不会启动 HTTP 服务，调用方应在收到成功结果后再注册服务的监听入口。
 func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultErr error) {
 	// 1. 已取消的启动无需继续读取配置或尝试联网；保留错误链供上层区分取消与普通故障。
@@ -57,7 +57,7 @@ func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultE
 	}
 	// 3. 取得已经校验的部署配置值副本，避免日志组件另行读取环境变量或维护另一套环境来源。
 	deployment := env.Current()
-	// 4. 只调用 Logger 的公共初始化入口；配置解码、实例标识生成、stdout 选择和单例发布
+	// 4. 只调用 Logger 的公共初始化入口；配置解码、实例标识生成、输出设置和单例发布
 	// 都封装在 internal/logger 中，使后续依赖初始化之前就有可获取的共享 Logger。
 	if err := logger.Init(filepath.Join(configDir, "logger"), deployment); err != nil {
 		// 4.1. Logger 尚未成功发布时停止启动，保留初始化错误供进程入口报告。
@@ -67,7 +67,7 @@ func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultE
 	loggerConfig := logger.Current().Config()
 	// 4.3. 只调用 tracing 公共初始化入口；Resource、Provider、采样及共享实例发布均由其内部完成。
 	if err := tracing.Init(loggerConfig.ServiceName, loggerConfig.InstanceID, deployment); err != nil {
-		// 4.3.1. 追踪未完成初始化时停止装配，已经可用的 Logger 由进程入口在最终退出时同步。
+		// 4.3.1. 追踪未完成初始化时停止装配，已经可用的 Logger 由进程入口在最终退出时收尾。
 		return nil, fmt.Errorf("initialize application tracing: %w", err)
 	}
 	// 5. 构造公司内部 HTTP Client；这里只传入配置叶子目录和已确认的环境名称。
@@ -146,6 +146,6 @@ func Init(ctx context.Context, configDir string) (_ *appruntime.Runtime, resultE
 		// 14.1. Service 装配失败也必须释放已创建的连接池，关闭失败与原始故障一起返回。
 		return nil, errors.Join(fmt.Errorf("initialize application services: %w", err), runtime.Close())
 	}
-	// 15. 全部组件均已完成初始化，交付 Runtime；最终清理与日志同步由进程入口按顺序执行。
+	// 15. 全部组件均已完成初始化，交付 Runtime。进程入口负责按顺序收尾共享资源。
 	return runtime, nil
 }

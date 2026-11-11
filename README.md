@@ -22,7 +22,7 @@ JWT 签名密钥直接填写在 `config/authn/jwt/<environment>.yml` 的 `signin
 
 `APP_ENV` 支持 `dev/test/prod`，未设置或为空时默认 `dev`；`APP_REGION` 目前支持 `cn`，未设置或为空时默认 `cn`。环境名和区域值严格匹配，非法值停止启动。
 
-Logger 在部署环境初始化后读取唯一的 `config/logger/<environment>.yml`，仅包含 `service_name`、`min_level`；环境复用 `env.Current()`，实例标识在本次初始化中生成 16 字节随机数并编码为 32 位十六进制字符串。开发环境最低级别为 `DEBUG`，测试和生产为 `INFO`。配置仅接受单份 YAML 文档和已知字段，不展开环境变量，也不回退其他环境；缺失或无效时停止启动。共享实例通过 `logger.Current()` 获取，重复成功初始化报错。共享 Logger 固定向 stdout 同步写单行 JSON，由运行环境保存日志；当前尚未批量替换既有业务日志。
+Logger 在部署环境初始化后读取唯一的 `config/logger/<environment>.yml`，其中 `service_name` 指定日志服务名，`min_level` 指定最低日志级别，`file_path` 指定可选的日志文件。共享 Logger 向 stdout 同步写单行 JSON，配置 `file_path` 时也向该文件追加同一条记录。相对文件路径以进程工作目录为基准，三个环境的模板均为 `.data/logs/app.jsonl`。环境复用 `env.Current()`，实例标识在本次初始化中生成 16 字节随机数并编码为 32 位十六进制字符串。开发环境最低级别为 `DEBUG`，测试和生产为 `INFO`。配置仅接受单份 YAML 文档和已知字段，不展开环境变量，也不回退其他环境。缺失或无效时停止启动。共享实例通过 `logger.Current()` 获取，重复成功初始化报错。当前尚未批量替换既有业务日志。
 
 按环境选择唯一的 `config/database/mysql/<environment>.yml`，文件缺失不回退其他环境。默认监听 `:8080`，初始化总时限为 30 秒，停机收尾总时限为 10 秒。可指定配置根目录、地址和时限：
 
@@ -32,21 +32,25 @@ go run ./cmd/web -config-dir /srv/app/config -addr 127.0.0.1:8081 -startup-timeo
 
 `-config-dir` 是包含 `logger`、`integrations/company`、`integrations/thirdparty`、`authn/jwt`、`snowflake`、`database/mysql` 的配置根目录，默认 `config`。其他工作目录启动时应传入正确路径；TLS CA 相对路径以所选 YAML 所在目录为基准。
 
-公司 Client 配置读取 `config/integrations/company/<environment>.yml`。开发环境使用本地地址；测试和生产分别设置 `TEST_PYTHON_SERVICE_TEMPLATE_BASE_URL`、`PROD_PYTHON_SERVICE_TEMPLATE_BASE_URL`，或直接填写配置中的 `base_url`。地址缺失、超时无效或 Client 未注册时停止启动，初始化不调用远端 HTTP 接口。
+公司 Client 配置读取 `config/integrations/company/<environment>.yml`。开发环境默认使用本地地址，测试和生产在各自部署配置的 `base_url` 中直接填写实际地址。地址缺失、超时无效或 Client 未注册时停止启动，初始化不调用远端 HTTP 接口。
 
 LLM 分组读取 `config/integrations/thirdparty/<environment>/ai/llm/` 下的 `qwen.yml`、`minimax.yml`，环境仅支持 `dev/test/prod`，已注册 Client 的配置缺失或非法时停止启动。两份文件分别直接保存 `base_url`、`api_key`、`connect_timeout`、`request_timeout` 四个字段；API Key 直接填写在各环境 YAML 中，不展开环境变量，也不写入日志。MiniMax 服务地址为 `https://api.minimaxi.com/v1`，当前连接及请求超时分别为 3 秒、60 秒。启动只构造 SDK Client，不调用模型。每次调用均须提供 Model：Qwen 仅支持 `llm.QwenModel38Max`、`llm.QwenModel37Plus`、`llm.QwenModel38Flash`；MiniMax 要求非空白模型名，当前不另设模型白名单。
 
-测试或生产部署先注入 MySQL YAML 中引用的环境变量及 CA 证书，再设置 `APP_ENV=test` 或 `APP_ENV=prod`。MySQL 配置中的 `${NAME}` 在 YAML 解码后展开，缺失或为空时停止启动；错误信息不会打印密码或 DSN。
+测试或生产部署在各自的 MySQL YAML 中把 `${NAME}` 占位符替换为实际配置值，并提供 CA 证书。使用 Compose 时，由对应环境的覆盖文件选择 `APP_ENV`。MySQL 配置加载失败的错误信息不会打印密码或 DSN。
 
-测试环境的 RDS 地址、账号和 CA 路径已经配置在 `test.yml`；运行时设置 `TEST_MYSQL_PASSWORD` 注入密码，并通过 `APP_ENV=test` 选择此配置。四个命名连接继承同一测试账号和密码，CA 使用仓库中的 `ApsaraDB-CA-Chain/ApsaraDB-CA-Chain.pem`，路径相对于该 YAML 文件解析；部署配置文件时须一并包含这个证书目录。
+测试环境的 `test.yml` 包含 RDS 地址、账号和 CA 路径。密码填写在该环境的实际部署 YAML 中，四个命名连接继承同一测试账号和密码。CA 使用 `ApsaraDB-CA-Chain/ApsaraDB-CA-Chain.pem`，路径相对于该 YAML 文件解析，部署配置文件时须一并包含这个证书目录。
 
 测试 RDS 须提前在控制台为配置中的连接地址开启 SSL；客户端开启 TLS 和提供 CA 文件不会自动开启服务端 SSL。配置同时验证证书链和连接域名，服务端不支持 SSL 时连接会失败。控制台操作说明及实例重启影响见[阿里云 RDS SSL 文档](https://help.aliyun.com/zh/rds/apsaradb-rds-for-mysql/configure-a-cloud-certificate-to-enable-ssl-encryption)。
 
-启动顺序为：部署环境初始化 → logger 包读取日志配置、生成实例标识并发布共享 Logger → company 包读取并校验环境配置、创建共享 Transport 和两个 Image Client → thirdparty 选择环境目录，经 AI、LLM 分组加载并构造 Qwen、MiniMax，全部成功后发布共享实例 → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败清理本次已创建的 company、thirdparty HTTP 空闲连接和数据库连接池，并由进程入口最后同步已初始化的 Logger，以非零状态退出。
+启动顺序为：部署环境初始化 → logger 包读取日志配置、生成实例标识并发布共享 Logger → company 包读取并校验环境配置、创建共享 Transport 和两个 Image Client → thirdparty 选择环境目录，经 AI、LLM 分组加载并构造 Qwen、MiniMax，全部成功后发布共享实例 → 加载 JWT 配置、验证密钥并发布签发与认证组件 → 取得数据中心编号 → 加载所选环境的雪花配置并初始化发号器 → MySQL 配置解码、占位符展开与校验 → 创建并校验数据库连接池 → 创建 Repository → 创建并发布 Service → 创建领域 Router 和 Controller、注册版本化路由 → 装配默认及接口覆盖的响应等待中间件 → 打印环境、区域 → 监听 HTTP。初始化失败清理本次已创建的 company、thirdparty HTTP 空闲连接和数据库连接池，并由进程入口调用 `logger.Shutdown()` 收尾，以非零状态退出。
 
-SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才清理 company、thirdparty 的 HTTP 空闲连接并正常关闭数据库，最后同步 Logger。启动后的路由或监听失败、尚未处理业务请求时，也按此顺序清理。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享资源及 Logger 同步，并以失败状态退出，避免同步等待与仍在写日志的内部工作相互阻塞；由进程退出释放连接，这不代表业务完成或事务已回滚。
+SIGINT/SIGTERM 触发停机，在同一个独立收尾预算内，先停止接收并等待 HTTP 请求，再等待已超时但仍在运行的内部处理。HTTP 收尾失败也会继续执行内部收尾；只有 HTTP 和内部处理均确认结束后，才清理 company、thirdparty 的 HTTP 空闲连接并正常关闭数据库，最后同步并关闭 Logger 持有的日志文件。启动后的路由或监听失败、尚未处理业务请求时，也按此顺序清理。预算耗尽、未能确认全部结束时，记录收尾失败，跳过主动关闭共享资源及 Logger 收尾，并以失败状态退出，避免同步等待与仍在写日志的内部工作相互阻塞；由进程退出释放连接，这不代表业务完成或事务已回滚。
 
 当前 `bootstrap.Init` 只初始化应用资源，启动不写入用户数据。
+
+### 用 Docker Compose 同时启动 Go 和日志 Agent
+
+构建和部署文件位于 `deploy/`。各环境的 Compose 一起运行 `app` 和 `log-agent`，应用业务配置从对应环境的 YAML 目录只读挂载。Go Logger 按 `file_path` 把日志写入共享卷，Agent 读取文件并通过 OTLP HTTP 发往中心 Collector。参见[部署说明](deploy/README.md)。
 
 ## 雪花 ID
 
@@ -164,7 +168,7 @@ Service 不保存 Repository 字段，方法内获取默认仓储，执行查询
 
 `DataBase: ""` 表示不选择默认库，业务 SQL 必须指定完整库表名；启动检查会正确处理 `DATABASE()` 返回的 SQL `NULL`。普通连接保留各自默认库，供直接使用未限定表名的操作；仓储内部已指定完整库表名的操作不依赖默认库。跨库事务涉及的库须位于同一个 MySQL 主实例，目标表均使用 InnoDB。
 
-独立连接池不要求独立账号。本地和测试环境的 `transaction` 都通过 `*writer` 继承已有账号密码，无需额外创建账号；测试环境只需注入一个 `TEST_MYSQL_PASSWORD`。生产保留通用事务凭据 `PROD_MYSQL_TRANSACTION_USERNAME/PASSWORD`，由部署方按获准流程配置库表权限；若现有账号的授权符合相同范围，也可以复用该账号。配置不会自动创建账号或扩大权限。
+独立连接池不要求独立账号。本地和测试环境的 `transaction` 都通过 `*writer` 继承已有账号密码，无需额外创建账号。生产在部署 YAML 的 `transaction` 连接中填写实际账号和密码，由部署方按获准流程配置库表权限。若现有账号的授权符合相同范围，也可以复用该账号。配置不会自动创建账号或扩大权限。
 
 新增同一实例内、权限范围相同的跨库流程时，复用 `transaction` 并在业务入口管理事务，无需按库表组合新增连接。目标实例或权限范围不同时，另配命名连接；多个连接分别开启的事务不会自动合并。
 

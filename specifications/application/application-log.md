@@ -544,7 +544,7 @@ Header 为本次请求独立创建，不携带其他调用遗留的追踪头，�
 
 失败信息使用固定的阶段说明，不将原始错误对象、URL、Query、请求或响应正文、认证头写入日志；底层错误仍按现有方式返回业务方并保留错误链。调用日志不改变仅接受 HTTP 200、响应读取上限为 16 MiB、不额外重试、原有响应体关闭及关闭错误忽略等调用约定。异常终止会记录失败的 `finished`，panic 继续沿原有路径传播，不在日志层吞掉。
 
-公共请求层通过 `logger.Current()` 取得启动时发布的共享 Logger，通过 `tracing.Current()` 取得共享 Tracer；必须在进程启动时完成初始化，不在请求时隐式创建实例。输出仍为 stdout 单行 JSON，并遵循最低日志级别过滤；过滤不影响 Span 创建、结果记录或标准头透传。公共层直接调用日志方法，日志编码或输出故障由 Logger 内部统一使用独立 stderr 兜底，TraceId 采用引用转义格式；Client 不重复报告或替换调用的业务结果。
+公共请求层通过 `logger.Current()` 取得启动时发布的共享 Logger，通过 `tracing.Current()` 取得共享 Tracer；必须在进程启动时完成初始化，不在请求时隐式创建实例。共享 Logger 按配置输出单行 JSON，并遵循最低日志级别过滤；过滤不影响 Span 创建、结果记录或标准头透传。公共层直接调用日志方法，日志编码或输出故障由 Logger 内部统一使用独立 stderr 兜底，TraceId 采用引用转义格式；Client 不重复报告或替换调用的业务结果。
 
 操作作用域应由具体 Client 入口建立。直接调用公共 `base.Client` 不会自动推断具体业务方法或生成 Client 操作名；公共层只使用传入 Context 中已有的作用域。Client 层目前覆盖公司 HTTP Client 及下文的 Qwen、MiniMax 文本调用，其他第三方 SDK 按各自协议另行接入。
 
@@ -611,16 +611,17 @@ nil Context 跳过 Span 创建，保留原有的初始化、Params、Context 检
 
 `bootstrap.Init` 在 `env.Init()` 成功后、其他应用依赖创建前调用 `logger.Init(configDir, deployment)`。这里的 `configDir` 为配置根目录下的 `logger` 叶子目录，`deployment` 直接使用已有 `env.Current()`。配置选择、读取、实例标识生成、Logger 构造及共享实例发布均由 `internal/logger` 完成，bootstrap 只负责调用和初始化顺序。
 
-配置文件为 `config/logger/dev.yml`、`test.yml`、`prod.yml`，只声明以下两个字段，不重复保存部署环境或进程实例标识：
+配置文件为 `config/logger/dev.yml`、`test.yml`、`prod.yml`，声明服务名、最低日志级别和可选的文件输出路径。
 
 ```yaml
 service_name: go-service-template
 min_level: INFO
+file_path: .data/logs/app.jsonl
 ```
 
 开发环境的 `min_level` 为 `DEBUG`，测试和生产为 `INFO`。只读取所选环境的文件，缺失时不回退；加载仅接受一份 YAML 文档及已声明字段，不展开环境变量。非法配置阻止启动，不发布部分实例。
 
-`Init` 为本次初始化生成 16 字节随机数并编码为 32 位十六进制 `instance_id`，与配置中的服务名称、最低级别及复用的部署环境一起注入 `New`。共享 Logger 固定向 stdout 同步写入单行 JSON，不创建本地文件，也不接管 stdout 的关闭责任。启动装配只向输出适配器暴露 `Write`，当前没有内部缓冲，因此共享实例同步时不对终端或管道执行文件系统同步；独立调用 `New` 时，调用方仍可注入自己的 Writer，并遵循其原有 `Sync()` 契约。
+`Init` 为本次初始化生成 16 字节随机数并编码为 32 位十六进制 `instance_id`，与配置中的服务名称、最低级别及复用的部署环境一起注入 `New`。共享 Logger 向 stdout 同步写入单行 JSON。有 `file_path` 时，`Init` 打开文件并追加同一条记录，相对路径以进程工作目录为基准。文件由 Logger 持有和同步，stdout 的生命周期仍由进程管理。独立调用 `New` 时，调用方仍可注入自己的 Writer，并遵循其原有 `Sync()` 契约。
 
 初始化全部成功后才一次性发布共享实例，后续通过 `logger.Current()` 获取。初始化前调用 `Current()` 会 panic，重复成功调用 `Init` 返回错误，运行中不重新加载配置或替换实例。包级 `logger.Sync()` 在尚未初始化时返回 nil；已初始化时先取得共享实例快照、释放共享锁，再执行实例同步。
 
@@ -642,10 +643,10 @@ Logger 发布成功后，`bootstrap.Init` 通过 `logger.Current().Config()` 取
 
 全部构造成功后，`Init` 在锁保护下一次性发布共享 Tracer 和本包拥有的 Provider；失败不发布部分实例。`tracing.Current()` 初始化前调用会 panic，重复成功初始化返回错误；关闭后不清空指针，也不支持运行中重建。包级 `tracing.Shutdown(ctx)` 未初始化时安全返回 nil，只关闭本包 `Init` 创建的 Provider，不接管独立 `New` 注入的外部 Provider。
 
-### 追踪关闭与最终日志同步
+### 追踪关闭与日志文件收尾
 
-进程入口 `run` 在 bootstrap 之前登记最终清理，覆盖初始化失败、主动取消及正常退出路径。成功启动后先停止 HTTP 并等待内部工作结束，再清理 Client 和数据库，随后调用 `tracing.Shutdown(ctx)`，最后执行 `logger.Sync()`。尚未开始处理请求的启动或监听失败同样可以安全关闭已创建的 Provider。
+进程入口 `run` 在 bootstrap 之前登记最终清理，覆盖初始化失败、主动取消及正常退出路径。成功启动后先停止 HTTP 并等待内部工作结束，再清理 Client 和数据库，随后调用 `tracing.Shutdown(ctx)`，最后调用 `logger.Shutdown()` 同步并关闭日志文件。尚未开始处理请求的启动或监听失败同样可以安全释放已创建的资源。
 
-追踪关闭使用独立的非 nil Context，其超时时长复用 `-shutdown-timeout`，不使用已经取消的进程 Context 或已经释放的启动 Context。该预算在业务排空及共享资源清理后单独创建，与 HTTP 和内部处理共用的原排空预算分开。关闭错误并入原始退出错误，仍继续同步 Logger；当前未配置处理器或导出器，关闭不意味着已有数据被远端保存。
+追踪关闭使用独立的非 nil Context，其超时时长复用 `-shutdown-timeout`，不使用已经取消的进程 Context 或已经释放的启动 Context。该预算在业务排空及共享资源清理后单独创建，与 HTTP 和内部处理共用的原排空预算分开。关闭错误并入原始退出错误，仍继续执行 Logger 收尾。当前 Span 的保存范围见上面的追踪初始化说明。
 
-未完全排空时沿用异常退出流程，跳过共享资源清理、Provider 关闭及日志同步，避免后台工作仍在执行时提前终止追踪或等待日志写锁。最终故障报告继续使用现有标准库日志兜底；Logger 同步不关闭 stdout，也不代表采集平台已持久化数据。
+未完全排空时沿用异常退出流程，跳过共享资源清理、Provider 关闭及 Logger 收尾，避免后台工作仍在执行时提前终止追踪或等待日志写锁。最终故障报告继续使用现有标准库日志兜底。本地文件的同步和关闭由 Logger 完成，后续采集和远端存储由 Agent 与中心服务完成。

@@ -1,0 +1,49 @@
+# 与 environments/ 下的一份环境配置合并使用。应用镜像和 APP_ENV 由环境文件提供。
+services:
+  app:
+    restart: unless-stopped
+    # Go HTTP 和内部任务使用各自的进程收尾流程，留出处理 SIGTERM 的时间。
+    stop_grace_period: 20s
+    environment:
+      APP_REGION: cn
+    ports:
+      - "${GO_BIND_ADDRESS:-127.0.0.1}:${GO_HTTP_PORT:-8080}:8080"
+    volumes:
+      # 应用运行时读取部署环境的 YAML。相对路径以本公共 Compose 所在的 deploy/ 为基准。
+      - type: bind
+        source: ${GO_CONFIG_DIR:?请设置 GO_CONFIG_DIR 指向该环境的应用 YAML 目录}
+        target: /app/config
+        read_only: true
+        bind:
+          create_host_path: false
+      # logger YAML 的 file_path 相对于应用工作目录 /app，写入这个共享卷。
+      - go-logs:/app/.data/logs
+
+  log-agent:
+    image: otel/opentelemetry-collector-contrib:0.155.0
+    command: ["--config=/etc/otelcol-contrib/go-logs.yaml"]
+    restart: unless-stopped
+    # 先启动 app，让其镜像初始化日志卷目录和属主。Agent 可在中心暂时不可用时独立重试。
+    depends_on:
+      app:
+        condition: service_started
+    # 状态卷的初始属主是容器内 root。Agent 写入状态卷，应用日志以只读方式挂载。
+    user: "0:0"
+    cap_drop: [ALL]
+    environment:
+      # 中心 Collector 是外部服务。每套环境填写 Agent 可访问的地址和该中心的 token。
+      GO_LOG_OTLP_ENDPOINT: ${GO_LOG_OTLP_ENDPOINT:?请设置中心 Collector 的 OTLP HTTP 基础地址}
+      OTLP_AUTH_TOKEN: ${OTLP_AUTH_TOKEN:?请从启动环境提供中心 Collector 使用的 OTLP_AUTH_TOKEN}
+    volumes:
+      - ./collector/otelcol-go-logs.yaml:/etc/otelcol-contrib/go-logs.yaml:ro
+      - type: volume
+        source: go-logs
+        target: /app/.data/logs
+        read_only: true
+        volume:
+          nocopy: true
+      - log-agent-state:/var/lib/otelcol
+
+volumes:
+  go-logs:
+  log-agent-state:

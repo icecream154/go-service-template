@@ -1,0 +1,6 @@
+/.env
+/.env.app
+/.compose-config/
+/.data/logs/
+!/deploy/environments/*/.env
+/deploy/environments/*/config.local/

@@ -1,2 +1,4 @@
 service_name: go-service-template
 min_level: DEBUG
+# 相对路径以 Go 进程的工作目录为基准。省略时只写 stdout。
+file_path: .data/logs/app.jsonl

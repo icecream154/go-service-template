@@ -1,0 +1,11 @@
+# 构建上下文只包含 Go 模块和应用源码。运行配置由 Compose 单独挂载。
+**
+!go.mod
+!go.sum
+!app/
+!bootstrap/
+!cmd/
+!env/
+!internal/
+!routers/
+**/.env*

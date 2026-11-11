@@ -1,0 +1,8 @@
+# Compose 项目名采用「项目名-环境」，用于区分各环境的容器、网络和数据卷。
+name: go-service-template-prod
+
+services:
+  app:
+    image: ${GO_APP_IMAGE:?请设置生产环境要部署的 Go 镜像 digest}
+    environment:
+      APP_ENV: prod

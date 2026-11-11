@@ -1,6 +1,6 @@
 // web 是 HTTP 服务的进程入口，负责参数解析、退出信号和应用资源生命周期。
 // 环境、Logger 与数据库等依赖的创建交给 bootstrap；本入口负责在初始化成功后启动服务，
-// 正常退出先结束 HTTP 访问及内部业务，再释放共享资源、关闭追踪并同步日志。运行时日志统一使用英文。
+// 正常退出先结束 HTTP 访问及内部业务，再释放共享资源、关闭追踪及日志文件。运行时日志统一使用英文。
 package main
 
 import (
@@ -44,11 +44,11 @@ func main() {
 	}
 }
 
-// run 持有资源生命周期：初始化后监听，HTTP 和内部业务均结束后清理资源、关闭追踪，最后同步日志。
+// run 持有资源生命周期：初始化后监听，HTTP 和内部业务均结束后清理资源、关闭追踪，最后关闭日志文件。
 //
 // ctx 是进程级停止通知，args 仅包含命令行参数，不包含可执行文件名。
 // 返回错误交给 main 记录并转换为非零退出码；本函数自身不终止进程。
-// resultErr 使用命名返回值，以便 defer 把数据库关闭、日志同步错误并入原有启动或服务错误。
+// resultErr 使用命名返回值，以便 defer 把数据库及日志文件的收尾错误并入原有启动或服务错误。
 func run(ctx context.Context, args []string) (resultErr error) {
 	// 1. 创建独立的启动参数集合。ContinueOnError 使参数错误作为返回值处理，避免 flag 包自行退出进程。
 	// 参数帮助信息和后续错误文案保持英文；请求帮助时直接返回，不初始化任何资源。
@@ -89,8 +89,8 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		return nil
 	}
 
-	// 5. 在 bootstrap 前登记最终追踪关闭和日志同步，覆盖部分初始化成功后的失败退出路径。
-	// 与现有共享资源共用关闭条件；后登记的 Client/数据库清理 defer 先执行，最后关闭追踪并同步日志。
+	// 5. 在 bootstrap 前登记追踪和日志收尾，覆盖部分初始化成功后的失败退出路径。
+	// 与现有共享资源共用关闭条件。后登记的 Client/数据库清理 defer 先执行。
 	closeRuntime := true
 	defer func() {
 		// 5.1. 内部工作未排空时可能仍在结束 Span 或写日志，不能提前关闭 Provider 或等待输出锁。
@@ -99,16 +99,16 @@ func run(ctx context.Context, args []string) (resultErr error) {
 			return
 		}
 		// 5.2. 使用独立的有限预算关闭追踪，不复用已取消的进程 Context 或已释放的启动 Context。
-		// 未初始化时 Shutdown 安全返回 nil；关闭错误并入原始错误，之后仍继续同步 Logger。
+		// 未初始化时 Shutdown 安全返回 nil。关闭错误并入原始错误，之后仍继续清理 Logger。
 		tracingCtx, cancelTracing := context.WithTimeout(context.Background(), *shutdownTimeout)
 		if err := tracing.Shutdown(tracingCtx); err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("shut down application tracing: %w", err))
 		}
 		cancelTracing()
-		// 5.3. 尚未初始化 Logger 时 Sync 安全返回 nil；成功初始化后同步错误并入进程返回值。
-		// 最终由 main 的既有错误输出报告，避免用同一个故障 Logger 递归记录同步错误。
-		if err := logger.Sync(); err != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("sync application logs: %w", err))
+		// 5.3. 同步并关闭 Logger 持有的文件。没有打开文件时可安全返回 nil。
+		// 最终由 main 的既有错误输出报告，避免用同一个故障 Logger 递归记录收尾错误。
+		if err := logger.Shutdown(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("shut down application logger: %w", err))
 		}
 	}()
 
@@ -121,19 +121,19 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	// 6.3. 初始化没有交付完整 Runtime 时结束启动；bootstrap 负责自身部分资源的失败清理。
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			// 6.3.1. 进程停止通知导致的初始化取消视为正常退出，仍执行已登记的 tracing 关闭和 Logger 同步。
+			// 6.3.1. 进程停止通知导致的初始化取消视为正常退出，仍执行已登记的追踪及日志收尾。
 			return nil
 		}
 		// 6.3.2. 独立启动超时、配置错误或连接故障保留错误链，最终以失败状态退出供部署平台识别。
 		return fmt.Errorf("initialize application: %w", err)
 	}
 	// 7. 保存完整的 Client 集合，并在成功获得 Runtime 后登记共享资源清理。
-	// 此 defer 后登记、先执行，只有 HTTP 和内部业务都确认结束，才释放资源并允许最后同步 Logger。
+	// 此 defer 后登记、先执行，只有 HTTP 和内部业务都确认结束，才释放资源并收尾日志文件。
 	companyClients := company.Current()
 	thirdpartyClients := thirdparty.Current()
 	defer func() {
 		// 7.1. 未排空时资源可能仍被内部工作使用，保留既有错误输出并跳过主动清理；
-		// 同一个 closeRuntime 标志也会跳过外层 tracing 关闭和 Logger 同步，最终交由失败退出释放进程资源。
+		// 同一个 closeRuntime 标志也会跳过外层追踪及日志收尾，最终交由失败退出释放进程资源。
 		if !closeRuntime {
 			log.Printf("Skip shared resource cleanup: HTTP or internal work was not fully drained; process will exit")
 			return
@@ -143,7 +143,7 @@ func run(ctx context.Context, args []string) (resultErr error) {
 		thirdpartyClients.CloseIdleConnections()
 		companyClients.CloseIdleConnections()
 		if err := runtime.Close(); err != nil {
-			// 7.3. 数据库关闭错误与原始错误合并；之后仍继续关闭 tracing 并执行 Logger 同步。
+			// 7.3. 数据库关闭错误与原始错误合并。之后仍继续收尾追踪和日志文件。
 			resultErr = errors.Join(resultErr, fmt.Errorf("close database connections: %w", err))
 		}
 	}()
@@ -167,15 +167,15 @@ func run(ctx context.Context, args []string) (resultErr error) {
 	// 11. 显式创建 TCP Listener，端口占用等错误在进入服务循环前返回，并触发已登记的资源清理。
 	listener, err := net.Listen("tcp", *address)
 	if err != nil {
-		// 11.1. 监听尚未成功时没有业务请求进入，维持 closeRuntime=true，允许完整清理及日志同步。
+		// 11.1. 监听尚未成功时没有业务请求进入，维持 closeRuntime=true，允许完整清理。
 		return fmt.Errorf("listen for HTTP requests: %w", err)
 	}
 	// 11.2. 输出实际监听地址；随后将 Listener 的关闭责任交给 serve，不交给 Router 持有。
 	log.Printf("HTTP server listening: address=%s", listener.Addr())
 	// 12. 持续服务并统一收尾；第一个返回值仅在 HTTP 与内部工作均排空时为 true。
-	// 该值决定两个 defer 是否可以安全执行共享资源清理及 Logger 同步，不由某次请求状态推断。
+	// 该值决定两个 defer 是否可以安全执行共享资源、追踪和日志文件收尾。
 	closeRuntime, resultErr = serve(ctx, listener, handler, *shutdownTimeout)
-	// 13. 返回结果，随后逆序执行共享资源清理、tracing 关闭、Logger 同步；最终错误由 main 报告。
+	// 13. 返回结果，随后逆序清理共享资源、追踪和日志文件。最终错误由 main 报告。
 	return resultErr
 }
 

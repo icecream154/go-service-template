@@ -1,0 +1,11 @@
+# Compose 项目名采用「项目名-环境」，用于区分各环境的容器、网络和数据卷。
+name: go-service-template-dev
+
+services:
+  app:
+    build:
+      # 上下文从 deploy/compose.yaml 指向仓库根目录，Dockerfile 路径相对于上下文。
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      APP_ENV: dev

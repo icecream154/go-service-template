@@ -1,0 +1,62 @@
+# Go 服务的日志 Agent。由本项目的 Compose 启动，读取应用写入共享卷的 JSON 日志。
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol
+
+receivers:
+  # filelog 是接收器类型，斜杠后是实例名，由下方管道的 receivers 引用。
+  filelog/go-service:
+    # 实际绑定的是共享卷中的文件，对应 Go logger YAML 的 file_path。
+    include: [/app/.data/logs/app.jsonl]
+    # 第一次从文件开头读取，后续启动从状态卷记录的位置继续读取。
+    start_at: beginning
+    storage: file_storage
+    retry_on_failure:
+      enabled: true
+    operators:
+      # 解析 Go Logger 的时间、级别和可选追踪标识。普通文本会被跳过。
+      - type: json_parser
+        on_error: drop_quiet
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+        severity:
+          parse_from: attributes.level
+        trace:
+          trace_id:
+            parse_from: attributes.trace_id
+          span_id:
+            parse_from: attributes.span_id
+      - type: move
+        id: message_to_body
+        from: attributes.message
+        to: body
+      - type: move
+        id: service_name_to_resource
+        # HyperDX 中的服务名取自 Go 日志的 service_name 字段。
+        from: attributes.service_name
+        to: 'resource["service.name"]'
+      - type: move
+        id: environment_to_resource
+        from: attributes.environment
+        to: 'resource["deployment.environment.name"]'
+      - type: move
+        id: instance_id_to_resource
+        from: attributes.instance_id
+        to: 'resource["service.instance.id"]'
+
+exporters:
+  otlp_http/central:
+    # Compose 提供中心 OTLP HTTP 的基础地址，导出器为日志追加 /v1/logs。
+    endpoint: '${env:GO_LOG_OTLP_ENDPOINT}'
+    headers:
+      authorization: 'Bearer ${env:OTLP_AUTH_TOKEN}'
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    # logs 指定数据类型，斜杠后为此管道的名字。
+    logs/go-service:
+      receivers: [filelog/go-service]
+      exporters: [otlp_http/central]

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"go-service-template/env"
@@ -17,10 +19,11 @@ import (
 var shared struct {
 	sync.RWMutex
 	logger *Logger
+	file   *os.File
 }
 
 // Init 读取当前部署环境的日志配置，生成进程实例标识，并发布共享 Logger。
-// configDir 是 logger 配置叶子目录，deployment 复用已有环境配置；输出固定为 stdout。
+// configDir 是 logger 配置叶子目录。输出使用 stdout，配置 file_path 时也追加到日志文件。
 // 只有成功初始化后才能调用 Current，重复成功初始化返回错误，失败不会发布部分实例。
 func Init(configDir string, deployment env.Config) error {
 	// 1. 串行执行构造和发布，防止并发初始化生成多个进程标识或替换已经使用的 Logger。
@@ -32,7 +35,7 @@ func Init(configDir string, deployment env.Config) error {
 		return errors.New("logger is already initialized")
 	}
 
-	// 2. 读取唯一的环境配置文件，配置内容只提供服务名称和最低日志级别。
+	// 2. 读取唯一的环境配置文件，取得服务名称、最低日志级别和可选文件路径。
 	// 读取或 YAML 解析失败时直接返回，进程共享位置仍保持 nil。
 	config, err := loadConfiguration(configDir, deployment.Environment)
 	if err != nil {
@@ -47,24 +50,51 @@ func Init(configDir string, deployment env.Config) error {
 		return fmt.Errorf("generate logger instance ID: %w", err)
 	}
 
-	// 4. 通过已有构造方法完成日志配置语义校验、编码器及输出器的创建。
-	// 匿名包装只暴露 io.Writer 的 Write：stdout 没有本包维护的缓冲，无须调用文件 fsync；
-	// 终端或管道通常不支持 os.File.Sync，故不把它们的 EINVAL 当成正常停机失败。
-	// New 的独立使用方仍可直接传入支持 Sync 的文件，本处不改变该构造接口的同步语义。
+	// 4. stdout 只暴露 Write，以便退出时只同步 Logger 自行打开的日志文件。
+	var output io.Writer = struct{ io.Writer }{os.Stdout}
+	var file *os.File
+	if config.FilePath != "" {
+		if strings.TrimSpace(config.FilePath) == "" {
+			return errors.New("logger file_path must not be whitespace only")
+		}
+		if err := os.MkdirAll(filepath.Dir(config.FilePath), 0755); err != nil {
+			return fmt.Errorf("create logger file directory: %w", err)
+		}
+		file, err = os.OpenFile(config.FilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("open logger file: %w", err)
+		}
+		output = fileOutput{Writer: io.MultiWriter(os.Stdout, file), file: file}
+	}
+
+	// 5. 校验日志配置并构造编码器。失败时关闭已经打开的文件。
 	instance, err := New(Config{
 		ServiceName: config.ServiceName,
 		InstanceID:  hex.EncodeToString(instanceBytes[:]),
 		MinLevel:    config.MinLevel,
-	}, deployment, struct{ io.Writer }{os.Stdout})
+	}, deployment, output)
 	if err != nil {
-		// 4.1. 构造失败不发布实例；stdout 的所有权仍属于进程，本包没有需要关闭的输出资源。
+		if file != nil {
+			return errors.Join(err, file.Close())
+		}
 		return err
 	}
 
-	// 5. 仅在全部步骤成功后一次性发布指针，后续 Current 取得同一个可并发复用的实例。
+	// 6. 全部步骤成功后发布共享实例和它拥有的文件，后续 Current 取得同一 Logger。
 	// 本方法不记录业务日志、不注册全局标准库 Logger，也不在后台启动协程。
 	shared.logger = instance
+	shared.file = file
 	return nil
+}
+
+// fileOutput 将同一条 JSON 写到 stdout 和文件。Sync 只同步文件。
+type fileOutput struct {
+	io.Writer
+	file *os.File
+}
+
+func (w fileOutput) Sync() error {
+	return w.file.Sync()
 }
 
 // Current 返回启动时发布的共享 Logger；未初始化时的调用属于装配顺序错误。
@@ -82,20 +112,31 @@ func Current() *Logger {
 	return shared.logger
 }
 
-// Sync 同步已经初始化的共享 Logger，未初始化时可安全调用并返回 nil。
-// 只转交同步操作，不清空共享指针、不关闭 stdout，也不表示所有业务或采集平台已完成处理。
+// Sync 同步共享 Logger 拥有的日志文件。没有打开的文件时返回 nil。
+// Sync 只同步文件，文件由 Shutdown 关闭。
 func Sync() error {
-	// 1. 在短暂读锁下复制共享指针，然后释放锁，避免输出器同步期间阻塞共享实例访问。
+	// 持有读锁直到同步结束，使 Shutdown 在同步后关闭文件。
 	shared.RLock()
-	instance := shared.logger
-	shared.RUnlock()
-
-	// 2. 参数解析、环境加载或日志配置加载可能在发布实例前失败；这类退出路径无日志实例需要同步。
-	if instance == nil {
+	defer shared.RUnlock()
+	if shared.file == nil {
 		return nil
 	}
+	return shared.logger.Sync()
+}
 
-	// 3. 将实例同步结果原样交给生命周期持有方，保留已有错误链，不递归使用故障 Logger 记录自身错误。
-	// Init 选择的 stdout 包装没有自有缓冲，因此该路径不会对终端或管道发起文件 fsync。
-	return instance.Sync()
+// Shutdown 在业务工作结束后同步并关闭共享 Logger 拥有的文件，可以重复调用。
+// stdout 的生命周期仍由进程管理。
+func Shutdown() error {
+	shared.Lock()
+	defer shared.Unlock()
+	if shared.file == nil {
+		return nil
+	}
+	file := shared.file
+	shared.file = nil
+	syncErr := shared.logger.Sync()
+	if err := file.Close(); err != nil {
+		return errors.Join(syncErr, fmt.Errorf("close JSON log file: %w", err))
+	}
+	return syncErr
 }

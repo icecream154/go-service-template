@@ -21,6 +21,8 @@ type configuration struct {
 	ServiceName string `yaml:"service_name"`
 	// MinLevel 使用 Level 的固定字符串取值，语义校验统一交给 New，加载器不补默认级别。
 	MinLevel Level `yaml:"min_level"`
+	// FilePath 可选。配置时将 JSON 日志同时追加到该文件，相对路径以进程工作目录为基准。
+	FilePath string `yaml:"file_path"`
 }
 
 // loadConfiguration 读取指定环境的日志配置文件，不改变共享实例或展开环境变量。
