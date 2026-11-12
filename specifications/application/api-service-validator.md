@@ -471,7 +471,7 @@ func RuneCountAtMost(value string, maximum int) error
 3. **事务在业务流程中直接组织。** 使用真实数据库的事务回调，在回调内构造绑定当前事务的 Repository，依次执行锁读、状态与版本检查、写入和回读。事务内操作使用同一事务，提交成功后才返回成功结果；回调或提交失败时原样返回错误，不返回部分结果。
 4. **日志与追踪遵循原有执行边界。** 公开方法建立操作作用域和 Service Span，业务发生位置记录日志并标记失败，使用 `defer span.End()` 收尾。辅助函数按实际需要接收 Context，不创建重复的业务 Span。
 
-Service 和 Controller 的业务流程由真实依赖环境中的集成测试覆盖；领域规则、Validator 和公共组件保留单元测试。测试方式不能反向要求生产业务代码增加 mock 装配结构，详见[Service 与 Controller 集成测试](../test/unit-test.md#36-service-与-controller-集成测试)。
+Service 和 Controller 中，完全没有外部依赖且包含实际业务逻辑的方法必须编写单元测试；有真实依赖的业务流程由集成测试覆盖。领域规则、Validator 和公共组件继续保留单元测试。测试方式不能反向要求生产业务代码增加 mock 装配结构；每条单测用注释说明用例目标，并按被测源码顺序组织，详见[Service 与 Controller 的测试分工](../test/unit-test.md#36-service-与-controller-的测试分工)。
 
 #### Service Context 约定
 
