@@ -257,7 +257,7 @@ defer span.End()
 
 来自 Controller 的调用形成 `H → C → S`，其中 `S` 是本次 Service 执行新生成的 SpanId，TraceId 始终沿用 `T`。其他入口已有当前 Span 时成为其子节点，没有父节点时按共享 Provider 规则创建根节点；入口必须提供非 nil Context，传 nil 属于接入错误，不在 Service 中补造 Background。方法返回后 Controller 仍持有 `(T,C)`，不会被 Service 的 operation 或 `S` 覆盖。
 
-十九个明确的错误返回分支在发生位置调用 `span.Fail`，覆盖参数错误、权限拒绝、查询未命中、账户冲突、状态或版本冲突、数据库执行故障及头像生成各阶段失败。说明复用该分支已有日志的固定 `Error` 文本，不记录原始错误或用户数据，不改变日志级别、错误返回及响应分类；正常返回和 panic 由直接登记的 `End` 收尾。`Fail` 只更新 Span 状态，不额外输出日志，业务日志仍直接写在原有发生位置，不新增方法级 started/finished、计时变量或日志完成状态。
+明确的错误返回分支在发生位置调用 `span.Fail`，覆盖参数错误、权限拒绝、查询未命中、账户冲突、状态或版本冲突、数据库执行故障及头像生成各阶段失败。说明复用该分支已有日志的固定 `Error` 文本，不记录原始错误或用户数据，不改变日志级别、错误返回及响应分类；正常返回和 panic 由直接登记的 `End` 收尾。`Fail` 只更新 Span 状态，不额外输出日志，业务日志仍直接写在原有发生位置，不新增方法级 started/finished、计时变量或日志完成状态。
 
 构造方法、`validate...`、模型转换及私有 `createUser`、分页、批量查询和事务辅助函数不创建 Span；需要日志的辅助函数沿用本次 Service Context，其他辅助函数保持现有签名。私有流程返回的错误由公开业务方法标记 Service 失败。Qwen、MiniMax 的文本调用在 llm 公共层创建子节点 `L`，公司 HTTP Client 在 base 公共层创建子节点 `K`；接收 `(T,S)` 时，两类 Client 分别派生为 `(T,L)`、`(T,K)`，其父节点都为 `S`，返回后 Service 仍使用 `(T,S)`。数据库会话、事务、取消和重试行为保持原有约定。
 

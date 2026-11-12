@@ -323,7 +323,7 @@ func (s *UserProfileService) CreateUser(ctx context.Context, params CreateUserPa
 	}
 	// 3. 将当前 Service Context 传给创建辅助流程，其内部日志沿用同一 TraceId、SpanId 和 operation。
 	// 发号、写入与重复账户确认仍按原顺序执行，不改变数据库契约。
-	profile, err := createUser(ctx, params, appruntime.Current().Repositories.UserProfile, snowflake.NextID)
+	profile, err := createUser(ctx, params, appruntime.Current().Repositories.UserProfile)
 	if err != nil {
 		// 3.1. 已确认的重复账户属于已知业务冲突，标记当前 Span，记录为警告后返回原有业务错误。
 		if errors.Is(err, ErrAccountAlreadyExists) {
@@ -345,11 +345,11 @@ func (s *UserProfileService) CreateUser(ctx context.Context, params CreateUserPa
 	return profile, nil
 }
 
-// createUser 按次接收仓储和发号函数，不将依赖或单次注册状态保存在 Service 上。
+// createUser 完成发号、持久化和重复账户确认，不将单次注册状态保存在 Service 上。
 // Context 沿用 CreateUser 的操作作用域和 Span，不在私有辅助函数中重新识别或创建节点；技术故障保持原始错误值。
-func createUser(ctx context.Context, params CreateUserParams, profiles *repository.UserProfileRepository, nextID func() (int64, error)) (*models.UserProfile, error) {
-	// 1. 使用调用方提供的发号函数生成内部 ID，失败时保持原错误，不尝试数据库写入。
-	id, err := nextID()
+func createUser(ctx context.Context, params CreateUserParams, profiles *repository.UserProfileRepository) (*models.UserProfile, error) {
+	// 1. 使用共享发号器生成内部 ID，失败时保持原错误，不尝试数据库写入。
+	id, err := snowflake.NextID()
 	if err != nil {
 		// 1.1. 本层不包装发号错误，公开业务方法会在同一操作作用域记录创建失败。
 		return nil, err

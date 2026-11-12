@@ -290,7 +290,7 @@ Controller 的业务入参只有 Request DTO，`ctx` 是独立的 HTTP 上下文
 
 [UserProfileService.CreateUser](../../app/domains/user/service/user_profile_service.go) 在入口对非 nil Context 调用 `logger.WithCurrentOperation` 建立 Service 操作作用域，再调用私有 `validateCreateUserParams`，用于保障非 HTTP 调用也遵守输入约束。同一 Service 文件顶部先声明共享及用例专属错误，再按用例依次组织 Params、可选 Result、输入常量、参数校验和处理方法；Result 紧接 Params，跨用例复用的实现放在文件尾部的 `shared` 区域。创建结果就是 `models.UserProfile`，因此这个用例直接返回模型，不声明 `CreateUserResult`。
 
-当前六个用户资料 Service 公开业务方法均已统一标准 Context 首参，Controller 调用同步传递内部 `ctx.Request.Context()`；查询和写入也遵守这一约定。非 HTTP 入口负责提供本次执行的非 nil Context，纯参数校验、映射和构造函数无需机械添加。接收 Context 与建立作用域并不自动输出流程日志，现有标准库业务日志仍待迁移；也不自动将 Context 绑定到 Repository 或 GORM，既有 SQL 和事务执行方式保持不变。完整约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
+当前六个用户资料 Service 公开业务方法均已统一标准 Context 首参，Controller 调用同步传递内部 `ctx.Request.Context()`；查询和写入也遵守这一约定。非 HTTP 入口负责提供本次执行的非 nil Context，纯参数校验、映射和构造函数无需机械添加。流程日志由 Service 在业务发生位置记录；接收 Context 与建立作用域不自动将 Context 绑定到 Repository 或 GORM，既有 SQL 和事务执行方式保持不变。完整约定见[Service Context 约定](api-service-validator.md#service-context-约定)。
 
 Validator 和 Service 分别组织各自入口的校验，共同调用 models 的字段规则，不各自维护长度或 URL 判断。用例的批量、分页和版本边界及分页默认值声明在 [Service 文件](../../app/domains/user/service/user_profile_service.go) 各用例的 Params 旁，由 Validator 和 Service 引用；默认值由入口准备，Service 不自动改写非法值。
 

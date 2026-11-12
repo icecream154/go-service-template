@@ -462,6 +462,17 @@ func RuneCountAtMost(value string, maximum int) error
 
 5. **纯输入检查失败时尽早原样返回错误。** 调用公共检查或 models 得到非 `nil` 错误后，Service 直接返回该错误，不继续执行依赖这些值的查询或写入，也不使用本层错误替换它。Service 自身独立判断出的输入条件失败，才可以返回本层通过 `errors.New` 预先声明的错误值。Service 不声明新的 error 类型；最终对外映射遵守第 9 节，不能因为错误来自 Service 就一律归为 HTTP 500。
 
+#### Service 执行结构
+
+**Service 的公开业务方法直接组织完整用例，按业务顺序完成参数校验、状态读取、权限判断、依赖调用和结果返回。** 保持执行链路清晰，只有具备独立职责或复用价值的逻辑才提取私有辅助函数。
+
+1. **Service 保持无状态，构造函数不接收 Client 或 Repository。** `NewXxxService()` 只创建服务对象。业务执行时通过项目已有的 `appruntime.Current()`、`company.Current()`、`thirdparty.Current()` 等共享入口取得已初始化的依赖；不保存请求 Context 或单次执行状态。
+2. **不为单元测试引入额外的执行层或依赖入口。** 不强制拆分公开外层和私有内层，不逐个将 Client、Repository 方法改成函数参数，也不增加仅供 mock 的接口、事务执行器或回调类型。已有纯领域规则与公共检查直接复用。
+3. **事务在业务流程中直接组织。** 使用真实数据库的事务回调，在回调内构造绑定当前事务的 Repository，依次执行锁读、状态与版本检查、写入和回读。事务内操作使用同一事务，提交成功后才返回成功结果；回调或提交失败时原样返回错误，不返回部分结果。
+4. **日志与追踪遵循原有执行边界。** 公开方法建立操作作用域和 Service Span，业务发生位置记录日志并标记失败，使用 `defer span.End()` 收尾。辅助函数按实际需要接收 Context，不创建重复的业务 Span。
+
+Service 和 Controller 的业务流程由真实依赖环境中的集成测试覆盖；领域规则、Validator 和公共组件保留单元测试。测试方式不能反向要求生产业务代码增加 mock 装配结构，详见[Service 与 Controller 集成测试](../test/unit-test.md#36-service-与-controller-集成测试)。
+
 #### Service Context 约定
 
 所有 Service 公开业务方法的签名采用 `Method(ctx context.Context, params XxxParams)`。Context 承载本次执行的 TraceId、操作作用域及适用的执行控制，Params 继续显式承载业务输入；不将 Params、DTO 或业务必填字段藏入 Context，也不把请求 Context 存入共享 Service、Client 或 Repository。
