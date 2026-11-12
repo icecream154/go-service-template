@@ -15,6 +15,8 @@ var current *Services
 type Services struct {
 	// UserProfile 提供用户资料领域操作，不保存单次请求或事务状态。
 	UserProfile *userservice.UserProfileService
+	// UserMembership 查询当前会员权益和只追加的权益变更历史。
+	UserMembership *userservice.UserMembershipService
 }
 
 // Init 构造并发布默认服务集合，不执行 SQL，也不创建数据库连接。
@@ -25,7 +27,8 @@ func Init() error {
 		return errors.New("application services are already initialized")
 	}
 	current = &Services{
-		UserProfile: userservice.NewUserProfileService(),
+		UserProfile:    userservice.NewUserProfileService(),
+		UserMembership: userservice.NewUserMembershipService(),
 	}
 	return nil
 }

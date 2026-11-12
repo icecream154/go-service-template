@@ -3,6 +3,7 @@ package routers
 
 import (
 	userv1controller "go-service-template/app/domains/user/controller/v1"
+	usermembershipvalidator "go-service-template/app/domains/user/validator/v1/user_membership"
 	userprofilevalidator "go-service-template/app/domains/user/validator/v1/user_profile"
 
 	"github.com/gin-gonic/gin"
@@ -24,19 +25,29 @@ type UserRouter struct {
 	updateUserProfileValidator *userprofilevalidator.UpdateUserProfileValidator
 	// batchQueryUserProfilesValidator 绑定并校验批量查询请求。
 	batchQueryUserProfilesValidator *userprofilevalidator.BatchQueryUserProfilesValidator
+	// userMemberships 查询本人会员权益与历史，不保存请求状态。
+	userMemberships *userv1controller.UserMembershipController
+	// queryUserMembershipByUserIDValidator 绑定并校验本人当前权益查询。
+	queryUserMembershipByUserIDValidator *usermembershipvalidator.QueryUserMembershipByUserIDValidator
+	// queryMembershipChangeRecordPageValidator 绑定并校验本人权益历史游标查询。
+	queryMembershipChangeRecordPageValidator *usermembershipvalidator.QueryMembershipChangeRecordPageValidator
 }
 
-// NewRouter 创建用户资料控制器及各用例的 Validator，不执行数据库查询。
+// NewRouter 创建用户资料、会员控制器及各用例的 Validator，不执行数据库查询。
 func NewRouter() *UserRouter {
 	controller := userv1controller.NewUserProfileController()
+	membershipController := userv1controller.NewUserMembershipController()
 	return &UserRouter{
-		userProfiles:                      controller,
-		createUserValidator:               userprofilevalidator.NewCreateUserValidator(controller),
-		generateUserAvatarValidator:       userprofilevalidator.NewGenerateUserAvatarValidator(controller),
-		queryUserProfileByUserIDValidator: userprofilevalidator.NewQueryUserProfileByUserIDValidator(controller),
-		queryUserProfilePageValidator:     userprofilevalidator.NewQueryUserProfilePageValidator(controller),
-		updateUserProfileValidator:        userprofilevalidator.NewUpdateUserProfileValidator(controller),
-		batchQueryUserProfilesValidator:   userprofilevalidator.NewBatchQueryUserProfilesValidator(controller),
+		userProfiles:                             controller,
+		createUserValidator:                      userprofilevalidator.NewCreateUserValidator(controller),
+		generateUserAvatarValidator:              userprofilevalidator.NewGenerateUserAvatarValidator(controller),
+		queryUserProfileByUserIDValidator:        userprofilevalidator.NewQueryUserProfileByUserIDValidator(controller),
+		queryUserProfilePageValidator:            userprofilevalidator.NewQueryUserProfilePageValidator(controller),
+		updateUserProfileValidator:               userprofilevalidator.NewUpdateUserProfileValidator(controller),
+		batchQueryUserProfilesValidator:          userprofilevalidator.NewBatchQueryUserProfilesValidator(controller),
+		userMemberships:                          membershipController,
+		queryUserMembershipByUserIDValidator:     usermembershipvalidator.NewQueryUserMembershipByUserIDValidator(membershipController),
+		queryMembershipChangeRecordPageValidator: usermembershipvalidator.NewQueryMembershipChangeRecordPageValidator(membershipController),
 	}
 }
 
@@ -51,4 +62,7 @@ func (r *UserRouter) RegisterV1Routes(v1 *gin.RouterGroup) {
 	userProfile.POST("/generateUserAvatar", r.generateUserAvatarValidator.GenerateUserAvatar)
 	userProfile.POST("/updateUserProfile", r.updateUserProfileValidator.UpdateUserProfile)
 	userProfile.POST("/batchQueryUserProfiles", r.batchQueryUserProfilesValidator.BatchQueryUserProfiles)
+	userMembership := user.Group("/userMembership")
+	userMembership.GET("/queryUserMembershipByUserId", r.queryUserMembershipByUserIDValidator.QueryUserMembershipByUserID)
+	userMembership.GET("/queryMembershipChangeRecordPage", r.queryMembershipChangeRecordPageValidator.QueryMembershipChangeRecordPage)
 }

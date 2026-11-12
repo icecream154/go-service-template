@@ -41,6 +41,21 @@ func (r *MembershipChangeRecordRepository) GetRecordByOrderID(orderID int64) (*t
 	return &record, nil
 }
 
+// QueryRecordPage 按用户及 created_at、id 的降序游标读取历史，不查询订单库。
+// afterCreatedAt 为 nil 时读取第一页；非 nil 时 afterID 与时间共同定位严格小于的边界。
+// limit 由 Service 校验并包含额外探测行；仓储不裁剪结果、不生成令牌或计算总数。
+func (r *MembershipChangeRecordRepository) QueryRecordPage(userID int64, afterCreatedAt *time.Time, afterID int64, limit int) ([]tables.MembershipChangeRecord, error) {
+	query := r.db.Table(membershipChangeRecordTable).Where("user_id = ?", userID)
+	if afterCreatedAt != nil {
+		query = query.Where("(created_at < ? OR (created_at = ? AND id < ?))", *afterCreatedAt, *afterCreatedAt, afterID)
+	}
+	rows := make([]tables.MembershipChangeRecord, 0)
+	if err := query.Order("created_at DESC").Order("id DESC").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 // CreateRecord 追加一条历史，ID、订单及权益快照的合法性由调用方保证。
 // 使用副本统一 UTC 毫秒时间，失败不修改输入，成功后回填实际写入的值。
 // 不处理唯一键冲突，不自动覆盖记录；外部事务的最终提交仍由调用方负责。
