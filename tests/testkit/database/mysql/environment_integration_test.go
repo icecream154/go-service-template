@@ -28,6 +28,9 @@ func TestEnvironmentIsolationResetAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first MySQL environment: %v", err)
 	}
+	if first == nil {
+		t.Fatal("declared MySQL schema must create the first environment")
+	}
 	cleanupEnvironment(t, first)
 	// 预期来自本用例的明确约定，不复用被测扫描结果来构造预期。
 	firstSchema := []acceptanceDatabase{
@@ -47,6 +50,9 @@ func TestEnvironmentIsolationResetAndClose(t *testing.T) {
 	second, err := Create(ctx, options)
 	if err != nil {
 		t.Fatalf("create extended MySQL environment: %v", err)
+	}
+	if second == nil {
+		t.Fatal("declared MySQL schema must create the extended environment")
 	}
 	cleanupEnvironment(t, second)
 	if first.RunID() == "" || second.RunID() == "" || first.RunID() == second.RunID() {

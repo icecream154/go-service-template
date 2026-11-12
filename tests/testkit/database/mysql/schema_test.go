@@ -89,6 +89,47 @@ func TestReadSchemaAllowsDatabaseWithoutTables(t *testing.T) {
 	}
 }
 
+func TestReadSchemaAllowsProjectWithoutMySQL(t *testing.T) {
+	// 未声明任何 MySQL 业务域表示项目不需要 MySQL，扫描应成功返回空计划。
+	cases := []struct {
+		name        string
+		directories []string
+		files       map[string]string
+	}{
+		{name: "missing database directory"},
+		{name: "empty database directory", directories: []string{"database"}},
+		{name: "only other storage", files: map[string]string{
+			"database/cache/redis/seed.sql":        "not MySQL",
+			"database/documents/mongo/schema.json": "{}",
+		}},
+		{name: "no domain with a root creation script", directories: []string{"database/empty/mysql"}, files: map[string]string{
+			"database/catalog/mysql/item.sql":                   "CREATE TABLE item (id BIGINT);",
+			"database/nested/mysql/scripts/create_database.sql": "CREATE DATABASE nested_data;",
+			"database/uppercase/mysql/CREATE_DATABASE.sql":      "CREATE DATABASE uppercase_data;",
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			for _, directory := range test.directories {
+				if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(directory)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for path, contents := range test.files {
+				writeScannerFile(t, root, path, contents)
+			}
+			plan, err := readSchema(root)
+			if err != nil {
+				t.Fatalf("project without MySQL should not fail discovery: %v", err)
+			}
+			if len(plan.databases) != 0 {
+				t.Fatalf("project without MySQL should have an empty plan, got %#v", plan)
+			}
+		})
+	}
+}
+
 func TestReadSchemaSkipsDomainsWithoutRootCreationScript(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "database", "transactions", "mysql"), 0o700); err != nil {
@@ -114,12 +155,7 @@ func TestReadSchemaRejectsIncompleteOrAmbiguousLayout(t *testing.T) {
 		files       map[string]string
 		errContains string
 	}{
-		// 没有 MySQL 定义时不能生成一个看似成功但没有业务库的计划。
-		{name: "missing database directory"},
-		{name: "only other storage", files: map[string]string{"database/cache/redis/seed.sql": "ignored"}},
-		{name: "no domain with a creation script", files: map[string]string{
-			"database/catalog/mysql/item.sql": "CREATE TABLE item (id BIGINT);",
-		}, errContains: "no MySQL schema directories with create_database.sql"},
+		// 已声明 MySQL 的业务域必须通过文件组织和 SQL 文件检查，不能当作没有依赖跳过。
 		{name: "duplicate creation script in nested directory", files: map[string]string{
 			"database/catalog/mysql/create_database.sql":        "CREATE DATABASE catalog_data;",
 			"database/catalog/mysql/nested/create_database.sql": "CREATE DATABASE hidden_data;",
@@ -149,6 +185,29 @@ func TestReadSchemaRejectsIncompleteOrAmbiguousLayout(t *testing.T) {
 			}
 			if test.errContains != "" && !strings.Contains(filepath.ToSlash(err.Error()), test.errContains) {
 				t.Errorf("error %q does not contain %q", err, test.errContains)
+			}
+		})
+	}
+}
+
+func TestReadSchemaRejectsInvalidDirectories(t *testing.T) {
+	// 不需要 MySQL 与目录本身损坏不同；路径错误不能被吞掉并返回空计划。
+	for _, scenario := range []string{"missing repository", "repository is a file", "database is a file", "mysql is a file"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			switch scenario {
+			case "missing repository":
+				root = filepath.Join(root, "missing")
+			case "repository is a file":
+				writeScannerFile(t, root, "repository", "not a directory")
+				root = filepath.Join(root, "repository")
+			case "database is a file":
+				writeScannerFile(t, root, "database", "not a directory")
+			case "mysql is a file":
+				writeScannerFile(t, root, "database/catalog/mysql", "not a directory")
+			}
+			if _, err := readSchema(root); err == nil {
+				t.Fatal("invalid directory must return an error, not an empty successful plan")
 			}
 		})
 	}

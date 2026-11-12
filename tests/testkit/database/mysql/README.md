@@ -1,12 +1,12 @@
 # MySQL 隔离测试环境
 
-测试代码调用本包的 `Create`，即可得到一个已启动、已建库建表、可以连接的独立 MySQL 环境，供集成测试与业务测试使用。用例再通过返回的数据库连接插入前置数据、查询执行结果，结束后调用 `Close` 删除环境。应用启动、SDK Mock 和具体用例的数据准备由调用方负责。
+测试代码调用本包的 `Create`，按项目声明的 MySQL 依赖创建独立环境。有符合条件的业务域时，返回已启动、已建库建表的环境；没有时返回 `(nil, nil)`，不访问 Docker，也不创建临时资源。环境创建后，用例通过数据库连接插入前置数据、查询执行结果，结束后调用 `Close` 删除环境。应用启动、SDK Mock 和具体用例的数据准备由调用方负责。
 
 ## 文件职责
 
 | 文件 | 具体做什么 |
 | --- | --- |
-| [environment.go](environment.go) | 提供测试代码直接调用的方法：`Create` 创建 MySQL 容器并建立连接；`DB` 和 `ConfigDir` 返回连接与配置目录；`Reset` 清空业务表；`Close` 关闭连接并删除容器、网络和临时文件。 |
+| [environment.go](environment.go) | 提供测试代码直接调用的方法：`Create` 根据扫描结果决定是否创建 MySQL 容器并建立连接；`DB` 和 `ConfigDir` 返回连接与配置目录；`Reset` 清空业务表；`Close` 关闭连接并删除容器、网络和临时文件。 |
 | [materials.go](materials.go) | 生成测试用 CA、服务端证书和私钥；生成供 MySQL 容器读取的服务端配置，以及供应用读取的数据库连接配置。 |
 | [schema.go](schema.go) | 扫描 `database/<业务域>/mysql/` 下的 SQL，先执行建库文件，再执行其他文件；根据实际创建的库生成授权，重置时查询各业务库中的表并清空数据。库名、表名和数量都不在代码中预先列举；同时检查 MySQL 的版本和运行配置是否符合项目要求。 |
 | [entrypoint.sh](entrypoint.sh) | 在容器启动时设置服务端私钥文件的属主和访问权限，使 MySQL 用户能读取私钥，再调用官方镜像的启动脚本。由 `Create` 自动放入容器并执行。 |
@@ -19,7 +19,7 @@
 ## 前提与运行
 
 - 使用满足仓库 `../../../../go.mod` 的 Go 工具链。
-- 本机 Docker 已启动，当前用户有权连接 Docker socket；首次运行需要能获取 MySQL 及 Testcontainers 清理服务的镜像。
+- 需要创建 MySQL 环境时，本机 Docker 须已启动，当前用户有权连接 Docker socket；首次运行需要能获取 MySQL 及 Testcontainers 清理服务的镜像。项目未声明 MySQL 依赖时，不要求 Docker 可用。
 - 当前方案针对本机 Docker，包括 macOS Docker Desktop。端口只绑定 Docker 主机的 `127.0.0.1`；远程 Docker 和容器内测试执行器需要另行设计可达网络，不能直接套用这套端口发布策略。
 - 每个 MySQL 实例的数据目录使用上限 1 GiB 的 tmpfs，容器内存上限为 2 GiB。双环境验收会同时启动两个实例，请为 Docker 留出足够内存。
 
@@ -42,6 +42,8 @@ Docker 不可用时，上述容器测试会报错，不会跳过。它测试的�
 
 以下代码以仓库现有的 `user` 业务域为例，放在带 `integration` 或 `business` 构建标签的测试文件中。`RepositoryRoot` 为空时从当前工作目录向上定位本仓库；也可以显式传入项目绝对路径。示例中的业务域和查询表名由用例选择，不是 testkit 支持范围的固定清单。
 
+调用方先检查 `err`，再检查环境是否为 `nil`。通用测试启动流程在环境为 `nil` 时继续准备其他依赖，不调用 MySQL 环境的方法；下面的用例明确需要用户数据库，因此会检查该依赖是否确实声明。
+
 ```go
 //go:build integration
 
@@ -59,6 +61,9 @@ func TestExample(t *testing.T) {
     env, err := mysqltest.Create(t.Context(), mysqltest.Options{})
     if err != nil {
         t.Fatal(err)
+    }
+    if env == nil {
+        t.Fatal("this test requires a MySQL schema, but none was declared")
     }
     t.Cleanup(func() {
         // 不复用已取消的用例 Context；实际接口测试须先排空并停止应用。
@@ -88,7 +93,7 @@ func TestExample(t *testing.T) {
 
 | 方法 | 调用后会发生什么 |
 | --- | --- |
-| `Create(ctx, Options{})` | 启动独立 MySQL 容器，生成证书和配置，建库建表并验证连接；成功后返回 `*Environment`。任何一步失败都会返回错误，并尝试清理已创建的资源。 |
+| `Create(ctx, Options{})` | 先扫描 SQL；没有符合条件的业务域时返回 `(nil, nil)`，正常跳过 MySQL。存在业务域时创建容器、证书和配置，建库建表并验证连接后返回 `*Environment`；发生错误时返回错误，并尝试清理已创建的资源。 |
 | `env.DB(name)` | 按 `database/<name>/mysql/` 中的业务域目录名返回 `*sql.DB`，连接到该目录的建库 SQL 实际创建的数据库，用于插入前置数据和查询结果；连接由 `env.Close` 统一关闭。 |
 | `env.ConfigDir()` | 返回临时配置根目录的路径，目录中包含 `database/mysql/test.yml`，供应用读取测试数据库的连接配置。启动完整应用所需的其他配置由调用方补齐。 |
 | `env.RunID()` | 返回本次环境的唯一标识，便于在测试报错或清理失败时定位对应资源。 |
@@ -109,7 +114,7 @@ func TestExample(t *testing.T) {
 
 ## SQL 目录扫描与执行
 
-1. 扫描 `../../../../database` 的业务域子目录。只有 `mysql/` 根目录中存在 `create_database.sql` 的业务域才会参与初始化，扫描器会递归读取其 `.sql` 文件。空目录和缺少建库脚本的目录会被跳过。至少需要一个符合条件的业务域。
+1. 扫描项目根目录下 `database/` 的业务域子目录。只有 `mysql/` 根目录中存在 `create_database.sql` 的业务域才会参与初始化，扫描器会递归读取其 `.sql` 文件。空目录和缺少建库脚本的目录会被跳过；`database/` 不存在或最终没有符合条件的业务域，表示未声明 MySQL 依赖，返回空计划。仓库根路径无效、目录无法读取或已声明的 SQL 有误，仍返回错误。
 2. 每个参与初始化的业务域对应一个业务库。连接名取业务域目录名，须符合项目的小写 snake_case 命名规则。
 3. 先按业务域名称排序，执行全部建库文件。每份文件必须创建一个此前不存在的数据库；通过查询 MySQL 获取实际库名，不将目录名拼成 `<业务域>_service`，也不解析 SQL 文本来猜测库名。不同业务域不能共用同一个数据库。
 4. 全部库创建成功后，依次处理各业务域。先在执行 SQL 的连接中选择该业务库，再按文件的相对路径字典序执行其余 SQL，包括子目录中的文件。脚本有先后依赖时，用目录或文件名前缀明确顺序，例如 `001_create_item.sql`、`002_add_index.sql`。

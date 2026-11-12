@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/docker/docker/errdefs"
@@ -12,6 +14,8 @@ import (
 func TestCreateRejectsInvalidInputBeforeDocker(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
+	invalidSchemaRoot := t.TempDir()
+	writeScannerFile(t, invalidSchemaRoot, "database/catalog/mysql/create_database.sql", " \n\t")
 	cases := []struct {
 		name    string
 		ctx     context.Context
@@ -26,8 +30,9 @@ func TestCreateRejectsInvalidInputBeforeDocker(t *testing.T) {
 		{name: "negative timeout", ctx: context.Background(), options: Options{StartupTimeout: -1}},
 		// 浮动标签不保证环境可重现，不能启动 latest 或大版本标签。
 		{name: "floating image", ctx: context.Background(), options: Options{Image: "mysql:latest"}},
-		// 缺少正式 DDL 时不能先创建资源再用简化表继续测试。
-		{name: "missing schema", ctx: context.Background(), options: Options{RepositoryRoot: t.TempDir()}},
+		// 仓库路径错误或已声明的建库脚本无效仍应报错，不能误判为项目不需要 MySQL。
+		{name: "missing repository", ctx: context.Background(), options: Options{RepositoryRoot: filepath.Join(t.TempDir(), "missing")}},
+		{name: "empty creation script", ctx: context.Background(), options: Options{RepositoryRoot: invalidSchemaRoot}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -37,6 +42,41 @@ func TestCreateRejectsInvalidInputBeforeDocker(t *testing.T) {
 			}
 			if test.want != nil && !errors.Is(err, test.want) {
 				t.Fatalf("error = %v; want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCreateSkipsDockerWhenProjectDoesNotUseMySQL(t *testing.T) {
+	// Docker 地址故意不可用；没有 MySQL 定义时仍应直接成功返回，不能先探测或启动 Docker。
+	t.Setenv("DOCKER_HOST", "unix://"+filepath.Join(t.TempDir(), "unavailable-docker.sock"))
+	cases := []struct {
+		name        string
+		directories []string
+		files       map[string]string
+	}{
+		{name: "missing database directory"},
+		{name: "empty database directory", directories: []string{"database"}},
+		{name: "only Redis", files: map[string]string{"database/cache/redis/seed.sql": "not MySQL"}},
+		{name: "no root creation script", directories: []string{"database/empty/mysql"}, files: map[string]string{
+			"database/catalog/mysql/item.sql":                   "CREATE TABLE item (id BIGINT);",
+			"database/nested/mysql/scripts/create_database.sql": "CREATE DATABASE nested_data;",
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			for _, directory := range test.directories {
+				if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(directory)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for path, contents := range test.files {
+				writeScannerFile(t, root, path, contents)
+			}
+			environment, err := Create(t.Context(), Options{RepositoryRoot: root})
+			if err != nil || environment != nil {
+				t.Fatalf("project without MySQL must return no environment and no error; got %v, %v", environment, err)
 			}
 		})
 	}
