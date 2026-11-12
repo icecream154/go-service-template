@@ -4,7 +4,6 @@ package thirdparty
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -22,7 +21,8 @@ type Clients struct {
 }
 
 // Init 从配置叶子目录 integrations/thirdparty 选择当前环境，再调用各功能的装配方法。
-// 功能层自行加载已注册 SDK 的配置并构造 Client，全部成功后一次性发布。
+// 普通构建加载 SDK 配置并构造 Client，集成测试专用构建通过测试装配提供 Client。
+// 装配成功后一次性发布实例。
 // 本方法不调用远端模型；成功发布后禁止重复初始化。
 func Init(configDir, environment string) error {
 	shared.Lock()
@@ -39,7 +39,7 @@ func Init(configDir, environment string) error {
 		return errors.New("thirdparty client configuration directory is required")
 	}
 
-	aiClients, err := ai.NewClients(filepath.Join(configDir, environment, "ai"))
+	aiClients, err := assembleAIClients(configDir, environment)
 	if err != nil {
 		return fmt.Errorf("initialize AI clients: %w", err)
 	}

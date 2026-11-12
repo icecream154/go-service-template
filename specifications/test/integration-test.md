@@ -4,7 +4,7 @@
 
 **本项目将单接口的完整处理链路测试定义为「集成测试」；将多个接口组合完成产品用例的测试定义为「业务测试」。** 本文默认以 HTTP 接口为被测入口，验证不同入参、调用身份、存储状态和外部依赖行为下的响应与实际执行结果。
 
-本文是初版规范和建设方案。[MySQL 隔离环境设施](../../tests/testkit/database/mysql/README.md)已提供创建、连接、重置、清理和独立容器验收入口；应用测试装配、SDK Mock、HTTP 接口用例及其统一执行入口仍待实现。环境设施通过不表示接口集成测试已通过。
+本文是初版规范和建设方案。[MySQL 隔离环境设施](../../tests/testkit/database/mysql/README.md)提供容器生命周期管理。[应用测试启动器](../../tests/integration/application-setup.go)在同一轮环境中启动 MySQL 和被测 HTTP 进程。按场景配置的 SDK Mock、HTTP 接口用例及其统一执行入口仍待实现。
 
 | 测试类型 | 验证目标 | 规范 |
 | --- | --- | --- |
@@ -33,9 +33,9 @@
 
 ### 2.2 首版实现选择
 
-采用标准库 `testing` 编写用例，使用 Testcontainers for Go 管理数据库容器，使用 `httptest.NewServer` 等受控端点模拟公司 HTTP 服务，第三方 SDK 则整体使用 Mock 实现。测试设施通过测试专用装配构建并启动应用进程，复用 `cmd/web` 的启停流程及真实 HTTP、业务和存储链路，仅在第三方依赖装配处选择 Mock。业务测试复用同一套设施。
+采用标准库 `testing` 编写用例，使用 Testcontainers for Go 管理数据库容器，使用 `httptest.NewServer` 等受控端点模拟公司 HTTP 服务，第三方 SDK 则整体使用 Mock 实现。调用方用测试专用装配构建 `cmd/web` 并把二进制交给启动器。子进程复用服务的启停流程及真实 HTTP、业务和存储链路，第三方依赖由测试装配提供。业务测试复用同一套设施。
 
-SDK Mock 必须实际装配到被测应用进程内；只在测试父进程替换内存对象，对另行启动的应用进程不会生效。测试设施负责向该进程提供每条用例的 Mock 规则、收集调用记录并重置状态。当前生产初始化仍创建真实 SDK，测试专用装配能力尚待实现，不能仅修改地址或原样启动现有二进制就声称完成 SDK 替换；正常构建不启用测试装配。
+SDK Mock 必须装配在被测应用进程内。测试设施负责向该进程提供用例规则、收集调用记录并重置状态。当前 `integration_app` 构建在子进程内禁用真实 SDK 装配，Qwen 和 MiniMax 的调用会返回未初始化错误。需要 SDK 响应的场景仍需提供可配置的 Mock 实现。部署构建沿用正常的 SDK 初始化流程。
 
 应用使用独立配置目录，通过 `-config-dir`、`-addr` 和有限的启动、关闭预算启动。使用动态分配的端口，避免占用固定开发端口；就绪判断必须确认实际 HTTP 入口可用，不能只看进程存在或日志输出“初始化成功”。
 
@@ -147,13 +147,48 @@ Mock 按依赖契约维护，不复制 SDK 内部实现。第三方 SDK 的实�
 
 ## 8. 文件组织、执行与维护
 
-接口用例目录和统一运行命令仍为待实现方案；共享设施中的 MySQL 模块已落地。共享设施负责环境启动和清理，不要求执行者先手工启动数据库。
+共享启动器负责准备数据库、启动应用并清理本轮资源。接口用例和统一执行入口按下表组织。
 
 | 规划位置 | 职责 |
 | --- | --- |
 | `tests/integration/<domain>/<api>_test.go` | 按被测接口组织用例，使用 `//go:build integration`；函数名如 `TestUpdateUserProfile_VersionConflict`。 |
 | `tests/integration/<domain>/testdata/` | 对应接口用例的协议样本和必要数据文件。 |
-| `tests/testkit/` | 共用环境设施；`database/mysql/` 已实现 MySQL 生命周期、配置和正式结构初始化，应用进程、协议模拟及 SDK Mock 等仍待实现。 |
+| `tests/integration/application-setup.go` | 在用例中调用 `StartApplication`，启动并清理数据库和被测进程。 |
+| `tests/testkit/database/mysql/` | 共用的 MySQL 生命周期、配置生成和正式结构初始化。 |
+
+### 8.1 使用应用启动器
+
+在 macOS 或 Linux 上使用本机 Docker。从仓库根目录构建带测试装配的服务二进制，再将它的路径作为 `ApplicationOptions.Executable` 传给用例。
+
+```sh
+integration_build_dir=$(mktemp -d)
+go build -tags=integration_app -o "$integration_build_dir/web" ./cmd/web
+```
+
+在带 `integration` 标签的用例中导入 `go-service-template/tests/integration`，再调用 `StartApplication(t, options)`。`ApplicationOptions.MySQL` 使用 MySQL testkit 的默认值或本轮显式选项。`PrepareConfig` 接收临时配置根目录以及用例上下文，在该目录补齐启动所需文件。
+
+```go
+app := integration.StartApplication(t, integration.ApplicationOptions{
+	Executable:    webExecutable,
+	PrepareConfig: prepareTestConfig,
+})
+```
+
+| 文件 | 用例提供的内容 |
+| --- | --- |
+| `database/mysql/test.yml` | 由启动器通过 MySQL testkit 生成，保留本轮地址、账号和 CA 路径。 |
+| `logger/test.yml` | 本轮服务名称、日志级别及可选的本轮日志路径。 |
+| `authn/jwt/test.yml` | 测试 issuer、audience、签名密钥和 Token 有效期。 |
+| `snowflake/test.yml` | 本轮应用的 `machine_id`。 |
+| `integrations/company/test.yml` | `python-service-template` 的本地模拟 `base_url`、连接超时，以及 `image.image_edit` 和 `image.image_gen` 的请求超时。 |
+
+公司服务的模拟端点由用例先启动并登记清理。启动器将 `APP_ENV=test`、`APP_REGION=cn` 和测试装配标记显式传入子进程，配置中的测试值可直接由 `PrepareConfig` 写入。服务绑定 `127.0.0.1:0`。启动器从进程日志取得分配的端口，并验证一次无副作用的 HTTP `404 NOT_FOUND` 响应后才返回 `Application`。
+
+使用 `app.BaseURL` 发 HTTP 请求，使用 `app.Database.DB("user")` 写入并提交前置数据，或独立查询实际结果。串行用例复用同一实例时，等上一条请求和后台工作结束后再调用 `app.Database.Reset(ctx)`。失败诊断可通过 `app.ProcessLogPath` 定位本轮私有进程日志。诊断时可用 Go 1.26 的 `-artifacts` 保留该文件，分享前按本规范脱敏。
+
+测试收尾先发送 `SIGTERM`，由应用排空 HTTP 和内部工作。超过停机预算时强制终止并报告失败。确认进程退出后才关闭 MySQL，关闭数据库使用独立的有界上下文。
+
+### 8.2 运行用例
 
 共享设施只在测试显式调用时启动资源，不能在包初始化时连接依赖。默认 `go test ./...` 继续只运行单测；集成用例不跟随默认入口执行。规划执行命令为：
 
@@ -161,7 +196,7 @@ Mock 按依赖契约维护，不复制 SDK 内部实现。第三方 SDK 的实�
 go test -tags=integration -count=1 ./tests/integration/...
 ```
 
-该命令在测试目录及运行设施实现后才可用。运行入口为整轮测试设置足够且有限的总时限，覆盖启动、故障场景和清理预算；关闭测试结果缓存，保证每轮实际执行。明确启动的集成测试缺少 Docker、配置或依赖时应失败，不静默跳过后报告通过。
+添加用例并在其中提供测试二进制和本轮配置后，可以使用该命令。运行入口为整轮测试设置有限的总时限，覆盖启动、故障场景和清理预算，并关闭测试结果缓存，保证每轮实际执行。明确启动的集成测试缺少 Docker、配置或依赖时应失败。
 
 每条用例必须能单独运行、重跑和换序运行。CI 将集成测试作为独立任务，报告用例结果、环境准备故障、未覆盖项及清理结果。按接口及风险场景维护覆盖，不以单测语句覆盖率或仅成功响应替代集成测试完成情况。
 
