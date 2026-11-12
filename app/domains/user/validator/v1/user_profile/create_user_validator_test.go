@@ -6,13 +6,14 @@ import (
 	"testing"
 
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
+	"go-service-template/internal/response"
 	commonvalidator "go-service-template/internal/validator"
 )
 
 type createUserHTTPCase struct {
-	name       string
-	body       string
-	wantFields []string
+	name        string
+	body        string
+	wantDetails []response.FieldError
 }
 
 func TestCreateUser(t *testing.T) {
@@ -27,13 +28,22 @@ func TestCreateUser(t *testing.T) {
 		// 空对象省略全部字段，验证三个必填字段按顺序报告，头像保持可选。
 		{
 			name: "missing required fields", body: `{}`,
-			wantFields: []string{"account_source", "external_account_id", "user_name"},
+			wantDetails: []response.FieldError{
+				{Field: "account_source", Reason: "not_blank: must not be blank"},
+				{Field: "external_account_id", Reason: "not_blank: must not be blank"},
+				{Field: "user_name", Reason: "not_blank: must not be blank"},
+			},
 		},
 		// 给三个必填字段传空白，并提供无效头像，验证四条错误依请求字段顺序汇总。
 		{
-			name:       "all fields invalid",
-			body:       `{"account_source":" ","external_account_id":"\t","user_name":"\u3000","avatar_url":"avatar.png"}`,
-			wantFields: []string{"account_source", "external_account_id", "user_name", "avatar_url"},
+			name: "all fields invalid",
+			body: `{"account_source":" ","external_account_id":"\t","user_name":"\u3000","avatar_url":"avatar.png"}`,
+			wantDetails: []response.FieldError{
+				{Field: "account_source", Reason: "not_blank: must not be blank"},
+				{Field: "external_account_id", Reason: "not_blank: must not be blank"},
+				{Field: "user_name", Reason: "not_blank: must not be blank"},
+				{Field: "avatar_url", Reason: "absolute_url: must have an absolute URI scheme"},
+			},
 		},
 	}
 
@@ -42,16 +52,16 @@ func TestCreateUser(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, recorder := newProfileValidatorRequest(http.MethodPost, "/", test.body)
 			validator.CreateUser(ctx)
-			assertProfileValidatorBadRequest(t, ctx, recorder, test.wantFields...)
+			assertProfileValidatorBadRequest(t, ctx, recorder, test.wantDetails...)
 		})
 	}
 }
 
 type createUserAvatarCase struct {
-	name       string
-	avatarJSON string
-	wantAvatar *string
-	wantFields []string
+	name        string
+	avatarJSON  string
+	wantAvatar  *string
+	wantDetails []response.FieldError
 }
 
 func TestValidateCreateUserRequest(t *testing.T) {
@@ -70,17 +80,17 @@ func TestValidateCreateUserRequest(t *testing.T) {
 		},
 		// 只含空白的头像有值，验证它会进入领域校验并定位到头像字段。
 		{
-			name:       "blank avatar",
-			avatarJSON: `,"avatar_url":"  "`,
-			wantAvatar: new("  "),
-			wantFields: []string{"avatar_url"},
+			name:        "blank avatar",
+			avatarJSON:  `,"avatar_url":"  "`,
+			wantAvatar:  new("  "),
+			wantDetails: []response.FieldError{{Field: "avatar_url", Reason: "not_blank: must not be blank"}},
 		},
 		// 提供有路径但无协议和主机的头像，验证错误明细定位到 avatar_url。
 		{
-			name:       "relative avatar URL",
-			avatarJSON: `,"avatar_url":"/profile.png"`,
-			wantAvatar: new("/profile.png"),
-			wantFields: []string{"avatar_url"},
+			name:        "relative avatar URL",
+			avatarJSON:  `,"avatar_url":"/profile.png"`,
+			wantAvatar:  new("/profile.png"),
+			wantDetails: []response.FieldError{{Field: "avatar_url", Reason: "absolute_url: must have an absolute URI scheme"}},
 		},
 	}
 
@@ -96,7 +106,7 @@ func TestValidateCreateUserRequest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("validateCreateUserRequest() error = %v, want nil", err)
 			}
-			assertProfileValidatorFields(t, details, test.wantFields...)
+			assertProfileValidatorDetails(t, details, test.wantDetails...)
 
 			want := userprofiledto.CreateUserRequest{
 				AccountSource:     "OIDC",

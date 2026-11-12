@@ -45,7 +45,6 @@ func TestUserMembershipDTO(t *testing.T) {
 }
 
 func TestMembershipChangeRecordDTOList(t *testing.T) {
-	level := int32(10)
 	beforeEffectiveAt := time.Date(2026, 1, 1, 0, 0, 0, 123000000, time.UTC)
 	beforeExpiredAt := beforeEffectiveAt.Add(30 * 24 * time.Hour)
 	afterExpiredAt := beforeExpiredAt.Add(30 * 24 * time.Hour)
@@ -61,13 +60,13 @@ func TestMembershipChangeRecordDTOList(t *testing.T) {
 		// 续费排在首次开通之前，验证原顺序及前后快照全部保留，首次开通的前值仍为 nil。
 		{name: "renewal and opening snapshots", records: []*models.MembershipChangeRecord{
 			{ID: 9, UserID: 7, MembershipID: 90, OrderID: 102, ChangeType: 20,
-				BeforeMembershipLevel: &level, BeforeEffectiveAt: &beforeEffectiveAt, BeforeExpiredAt: &beforeExpiredAt,
+				BeforeMembershipLevel: new(int32(10)), BeforeEffectiveAt: new(beforeEffectiveAt), BeforeExpiredAt: new(beforeExpiredAt),
 				AfterMembershipLevel: 10, AfterEffectiveAt: beforeEffectiveAt, AfterExpiredAt: afterExpiredAt, CreatedAt: beforeExpiredAt},
 			{ID: 3, UserID: 7, MembershipID: 90, OrderID: 101, ChangeType: 10,
 				AfterMembershipLevel: 10, AfterEffectiveAt: beforeEffectiveAt, AfterExpiredAt: beforeExpiredAt, CreatedAt: beforeEffectiveAt},
 		}, want: []usermembershipdto.MembershipChangeRecord{
 			{RecordID: 9, MembershipID: 90, OrderID: 102, ChangeType: 20,
-				BeforeMembershipLevel: &level, BeforeEffectiveAt: &beforeEffectiveAt, BeforeExpiredAt: &beforeExpiredAt,
+				BeforeMembershipLevel: new(int32(10)), BeforeEffectiveAt: new(beforeEffectiveAt), BeforeExpiredAt: new(beforeExpiredAt),
 				AfterMembershipLevel: 10, AfterEffectiveAt: beforeEffectiveAt, AfterExpiredAt: afterExpiredAt, CreatedAt: beforeExpiredAt},
 			{RecordID: 3, MembershipID: 90, OrderID: 101, ChangeType: 10,
 				AfterMembershipLevel: 10, AfterEffectiveAt: beforeEffectiveAt, AfterExpiredAt: beforeExpiredAt, CreatedAt: beforeEffectiveAt},
@@ -75,7 +74,12 @@ func TestMembershipChangeRecordDTOList(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			// 输入快照深拷贝可变指针，独立于输入和预期，避免原地修改同时改变断言两侧。
+			before := snapshotMembershipChangeRecords(test.records)
 			got := membershipChangeRecordDTOList(test.records)
+			if !reflect.DeepEqual(test.records, before) {
+				t.Error("DTO conversion changed the source membership change records")
+			}
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("DTO list = %#v, want %#v", got, test.want)
 			}
@@ -160,4 +164,28 @@ func TestFailUserMembershipOperation(t *testing.T) {
 			assertUserControllerFailure(t, ctx, recorder, test.err, test.wantStatus, test.wantCode, test.wantBusiness, test.wantChallenge)
 		})
 	}
+}
+
+func snapshotMembershipChangeRecords(records []*models.MembershipChangeRecord) []*models.MembershipChangeRecord {
+	if records == nil {
+		return nil
+	}
+	snapshot := make([]*models.MembershipChangeRecord, len(records))
+	for i, record := range records {
+		if record == nil {
+			continue
+		}
+		copyRecord := *record
+		if record.BeforeMembershipLevel != nil {
+			copyRecord.BeforeMembershipLevel = new(*record.BeforeMembershipLevel)
+		}
+		if record.BeforeEffectiveAt != nil {
+			copyRecord.BeforeEffectiveAt = new(*record.BeforeEffectiveAt)
+		}
+		if record.BeforeExpiredAt != nil {
+			copyRecord.BeforeExpiredAt = new(*record.BeforeExpiredAt)
+		}
+		snapshot[i] = &copyRecord
+	}
+	return snapshot
 }

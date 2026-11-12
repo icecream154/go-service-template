@@ -222,6 +222,57 @@ type fixtureJWTClaims struct {
 	jwtlib.RegisteredClaims
 }
 
+type authenticateJWTAlgorithmCase struct {
+	name       string
+	method     jwtlib.SigningMethod
+	signingKey any
+	wantErr    error
+}
+
+func TestAuthenticateSigningAlgorithms(t *testing.T) {
+	config := jwtTestConfig()
+	provider := newJWTTestProvider(t, config, jwtTestNamespaces())
+	key := decodeJWTTestKey(t, config)
+	tests := []authenticateJWTAlgorithmCase{
+		// 合法密钥与完整有效声明使用 HS256，作为同一组凭证的成功对照。
+		{name: "accepts HS256", method: jwtlib.SigningMethodHS256, signingKey: key},
+		// 同一合法密钥改用 HS384，验证签名算法不在允许范围时仍须拒绝。
+		{name: "rejects HS384", method: jwtlib.SigningMethodHS384, signingKey: key, wantErr: authn.ErrInvalidCredential},
+		// 同一合法密钥改用 HS512，验证不能因属于 HMAC 算法就接受凭证。
+		{name: "rejects HS512", method: jwtlib.SigningMethodHS512, signingKey: key, wantErr: authn.ErrInvalidCredential},
+		// 显式允许测试库生成合法的 none 凭证，验证认证器不会接受无签名身份。
+		{name: "rejects none", method: jwtlib.SigningMethodNone, signingKey: jwtlib.UnsafeAllowNoneSignatureType, wantErr: authn.ErrInvalidCredential},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				now := time.Now().UTC()
+				principal := authn.Principal{Kind: authn.PrincipalKindUser, Namespace: jwtUserNamespace, SubjectID: "user-1"}
+				claims := fixtureJWTClaims{
+					Kind: principal.Kind, Namespace: principal.Namespace,
+					RegisteredClaims: jwtlib.RegisteredClaims{
+						Issuer: config.Issuer, Audience: jwtlib.ClaimStrings{config.Audience}, Subject: principal.SubjectID,
+						IssuedAt: jwtlib.NewNumericDate(now.Add(-time.Minute)), NotBefore: jwtlib.NewNumericDate(now.Add(-time.Minute)),
+						ExpiresAt: jwtlib.NewNumericDate(now.Add(time.Minute)),
+					},
+				}
+				token := jwtlib.NewWithClaims(test.method, claims)
+				token.Header["typ"] = "JWT"
+				value, err := token.SignedString(test.signingKey)
+				if err != nil {
+					t.Fatalf("sign %s fixture credential: %v", test.method.Alg(), err)
+				}
+
+				got, err := provider.Authenticate(t.Context(), authn.Credential{Scheme: "Bearer", Value: value})
+				if test.wantErr != nil {
+					principal = authn.Principal{}
+				}
+				assertJWTAuthentication(t, got, err, principal, test.wantErr)
+			})
+		})
+	}
+}
+
 type authenticateJWTClaimsCase struct {
 	name    string
 	change  func(*fixtureJWTClaims, time.Time)

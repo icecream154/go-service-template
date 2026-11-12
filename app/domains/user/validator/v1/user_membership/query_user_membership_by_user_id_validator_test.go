@@ -17,42 +17,42 @@ import (
 
 func TestQueryUserMembershipByUserIDRejectsBadRequest(t *testing.T) {
 	tests := []struct {
-		name       string
-		method     string
-		target     string
-		wantFields []string
+		name        string
+		method      string
+		target      string
+		wantDetails []response.FieldError
 	}{
 		// 不支持的绑定方法在校验前失败，响应不补造字段明细。
 		{name: "binding failure", method: http.MethodPut, target: "/?user_id=1"},
 		// 必填 ID 缺失时必须返回 user_id 明细，不能查询匿名目标。
-		{name: "missing ID", method: http.MethodGet, target: "/", wantFields: []string{"user_id"}},
+		{name: "missing ID", method: http.MethodGet, target: "/", wantDetails: []response.FieldError{{Field: "user_id", Reason: "must be a positive 64-bit integer"}}},
 		// 显式零值可绑定但不是有效目标，不能进入 Controller。
-		{name: "zero ID", method: http.MethodGet, target: "/?user_id=0", wantFields: []string{"user_id"}},
+		{name: "zero ID", method: http.MethodGet, target: "/?user_id=0", wantDetails: []response.FieldError{{Field: "user_id", Reason: "must be a positive 64-bit integer"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, recorder := newMembershipValidatorRequest(test.method, test.target)
 			NewQueryUserMembershipByUserIDValidator(nil).QueryUserMembershipByUserID(ctx)
-			assertMembershipValidatorBadRequest(t, ctx, recorder, test.wantFields...)
+			assertMembershipValidatorBadRequest(t, ctx, recorder, test.wantDetails...)
 		})
 	}
 }
 
 func TestValidateQueryUserMembershipByUserIDRequest(t *testing.T) {
 	tests := []struct {
-		name       string
-		queryID    string
-		wantID     string
-		wantFields []string
+		name        string
+		queryID     string
+		wantID      string
+		wantDetails []response.FieldError
 	}{
 		// 百分号编码的正号与前导零按现有 ID 文本规则保留。
 		{name: "original decimal text", queryID: "%2B00042", wantID: "+00042"},
 		// 最大 int64 不经浮点数转换，允许完整标识通过。
 		{name: "maximum ID", queryID: "9223372036854775807", wantID: "9223372036854775807"},
 		// 超过最大 int64 的数字必须由 ID 规则拒绝。
-		{name: "overflow ID", queryID: "9223372036854775808", wantID: "9223372036854775808", wantFields: []string{"user_id"}},
+		{name: "overflow ID", queryID: "9223372036854775808", wantID: "9223372036854775808", wantDetails: []response.FieldError{{Field: "user_id", Reason: "must be a positive 64-bit integer"}}},
 		// 校验不能通过裁剪空白把无效输入修复为有效 ID。
-		{name: "whitespace ID", queryID: "%201", wantID: " 1", wantFields: []string{"user_id"}},
+		{name: "whitespace ID", queryID: "%201", wantID: " 1", wantDetails: []response.FieldError{{Field: "user_id", Reason: "must be a positive 64-bit integer"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestValidateQueryUserMembershipByUserIDRequest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("validateQueryUserMembershipByUserIDRequest() error = %v", err)
 			}
-			assertMembershipValidatorFields(t, details, test.wantFields...)
+			assertMembershipValidatorDetails(t, details, test.wantDetails...)
 			if request.UserID != test.wantID {
 				t.Errorf("UserID = %q, want %q", request.UserID, test.wantID)
 			}
@@ -80,21 +80,14 @@ func newMembershipValidatorRequest(method, target string) (*gin.Context, *httpte
 	return ctx, recorder
 }
 
-func assertMembershipValidatorFields(t *testing.T, details []response.FieldError, wantFields ...string) {
+func assertMembershipValidatorDetails(t *testing.T, details []response.FieldError, wantDetails ...response.FieldError) {
 	t.Helper()
-	gotFields := make([]string, len(details))
-	for i, detail := range details {
-		gotFields[i] = detail.Field
-		if strings.TrimSpace(detail.Reason) == "" {
-			t.Errorf("field %q has no error reason", detail.Field)
-		}
-	}
-	if !slices.Equal(gotFields, wantFields) {
-		t.Errorf("error fields = %v, want %v", gotFields, wantFields)
+	if !slices.Equal(details, wantDetails) {
+		t.Errorf("field errors = %#v, want %#v", details, wantDetails)
 	}
 }
 
-func assertMembershipValidatorBadRequest(t *testing.T, ctx *gin.Context, recorder *httptest.ResponseRecorder, wantFields ...string) {
+func assertMembershipValidatorBadRequest(t *testing.T, ctx *gin.Context, recorder *httptest.ResponseRecorder, wantDetails ...response.FieldError) {
 	t.Helper()
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("HTTP status = %d, want 400, body = %s", recorder.Code, recorder.Body.String())
@@ -123,7 +116,7 @@ func assertMembershipValidatorBadRequest(t *testing.T, ctx *gin.Context, recorde
 	if failure.Code != response.CodeInvalidArgument || strings.TrimSpace(failure.Message) == "" {
 		t.Errorf("error = %q, %q, want INVALID_ARGUMENT and a nonblank message", failure.Code, failure.Message)
 	}
-	if len(wantFields) == 0 {
+	if len(wantDetails) == 0 {
 		if len(failure.Details) != 0 {
 			t.Errorf("binding failure details = %s, want omitted", failure.Details)
 		}
@@ -133,8 +126,9 @@ func assertMembershipValidatorBadRequest(t *testing.T, ctx *gin.Context, recorde
 	if err := json.Unmarshal(failure.Details, &details); err != nil {
 		t.Fatalf("decode field errors: %v", err)
 	}
-	assertMembershipValidatorFields(t, details, wantFields...)
-	if len(details) > 0 && failure.Message != details[0].Error() {
-		t.Errorf("message = %q, want first field error %q", failure.Message, details[0].Error())
+	assertMembershipValidatorDetails(t, details, wantDetails...)
+	wantMessage := wantDetails[0].Field + ": " + wantDetails[0].Reason
+	if failure.Message != wantMessage {
+		t.Errorf("message = %q, want first field error %q", failure.Message, wantMessage)
 	}
 }

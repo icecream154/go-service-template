@@ -14,12 +14,10 @@ import (
 )
 
 func TestParseMembershipChangeRecordPageToken(t *testing.T) {
-	// 超过 JavaScript 安全整数范围的 ID 必须逐位保留，日期也需保留毫秒。
+	// 固定 v1 样本独立编码为版本 1、用户 9223372036854775807、Unix 毫秒 1794448800123、记录 9223372036854775806。
+	// 不调用生产编码器准备解析输入，防止编码和解码同时改错后仍能往返通过。
+	const token = "AX__________AAABoc17uXt__________g"
 	cursor := models.MembershipChangeRecordCursor{UserID: math.MaxInt64, ID: math.MaxInt64 - 1, CreatedAt: time.Date(2026, 11, 12, 2, 0, 0, 123000000, time.UTC)}
-	token, err := models.EncodeMembershipChangeRecordPageToken(cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
 	parsed, err := models.ParseMembershipChangeRecordPageToken(token, cursor.UserID)
 	if err != nil || parsed == nil || *parsed != cursor {
 		t.Fatalf("Parse token = (%+v, %v), want %+v", parsed, err, cursor)
@@ -28,7 +26,10 @@ func TestParseMembershipChangeRecordPageToken(t *testing.T) {
 	if got, err := models.ParseMembershipChangeRecordPageToken("", 123); got != nil || err != nil {
 		t.Fatalf("empty token = (%+v, %v), want (nil, nil)", got, err)
 	}
-	data, _ := base64.RawURLEncoding.DecodeString(token)
+	data, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		t.Fatalf("decode fixed v1 fixture: %v", err)
+	}
 	alter := func(change func([]byte)) string {
 		copyData := append([]byte(nil), data...)
 		change(copyData)
@@ -53,8 +54,9 @@ func TestParseMembershipChangeRecordPageToken(t *testing.T) {
 		{name: "short payload", token: base64.RawURLEncoding.EncodeToString(data[:24]), userID: cursor.UserID},
 		// 解码前即限制最大长度，防止无限制分配。
 		{name: "oversized payload", token: strings.Repeat("A", 1024), userID: cursor.UserID},
-		// RawURL 令牌不允许额外填充或空白。
+		// RawURL 令牌不允许额外填充。
 		{name: "padded token", token: token + "==", userID: cursor.UserID},
+		// 尾部换行不能被静默忽略并接受为同一令牌。
 		{name: "whitespace", token: token + "\n", userID: cursor.UserID},
 		// 非法字符应报告输入错误而不是编码组件原始错误。
 		{name: "invalid encoding", token: "%", userID: cursor.UserID},
@@ -73,10 +75,13 @@ func TestParseMembershipChangeRecordPageToken(t *testing.T) {
 
 func TestEncodeMembershipChangeRecordPageToken(t *testing.T) {
 	tests := []struct {
-		name   string
-		cursor models.MembershipChangeRecordCursor
-		failed bool
+		name      string
+		cursor    models.MembershipChangeRecordCursor
+		wantToken string
+		failed    bool
 	}{
+		// 独立固定 v1 字符串锁定版本、字段次序、大端整数和毫秒时间，避免只靠解码器验证编码器。
+		{name: "fixed v1 fixture", cursor: models.MembershipChangeRecordCursor{UserID: 9223372036854775807, ID: 9223372036854775806, CreatedAt: time.Date(2026, 11, 12, 2, 0, 0, 123000000, time.UTC)}, wantToken: "AX__________AAABoc17uXt__________g"},
 		// MySQL 最小有效年支持负 Unix 毫秒，往返转换不能视为无符号时间。
 		{name: "minimum date", cursor: models.MembershipChangeRecordCursor{UserID: 1, ID: 2, CreatedAt: time.Date(1000, 1, 1, 0, 0, 0, 0, time.UTC)}},
 		// 最大日期边界保持毫秒精度。
@@ -98,8 +103,11 @@ func TestEncodeMembershipChangeRecordPageToken(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if tt.wantToken != "" && token != tt.wantToken {
+				t.Errorf("Encode = %q, want fixed v1 token %q", token, tt.wantToken)
+			}
 			got, err := models.ParseMembershipChangeRecordPageToken(token, tt.cursor.UserID)
-			if err != nil || *got != tt.cursor {
+			if err != nil || got == nil || *got != tt.cursor {
 				t.Fatalf("round trip = (%+v, %v), want %+v", got, err, tt.cursor)
 			}
 		})

@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	userprofiledto "go-service-template/app/domains/user/dto/v1/user_profile"
+	"go-service-template/internal/response"
 )
 
 type batchQueryUserProfilesHTTPCase struct {
-	name       string
-	body       string
-	wantFields []string
+	name        string
+	body        string
+	wantDetails []response.FieldError
 }
 
 func TestBatchQueryUserProfilesBadRequest(t *testing.T) {
@@ -22,11 +23,11 @@ func TestBatchQueryUserProfilesBadRequest(t *testing.T) {
 		// JSON 数字无法绑定到字符串列表，验证元素类型错误同样在绑定阶段返回 400。
 		{name: "number in string list", body: `{"user_id_list":[1]}`},
 		// 请求缺少列表，验证可以绑定但校验失败，错误定位到 user_id_list。
-		{name: "missing list", body: `{}`, wantFields: []string{"user_id_list"}},
+		{name: "missing list", body: `{}`, wantDetails: []response.FieldError{{Field: "user_id_list", Reason: "must contain between 1 and 100 user IDs"}}},
 		// 显式 null 绑定后的列表长度为零，验证它同样违反数量下限。
-		{name: "null list", body: `{"user_id_list":null}`, wantFields: []string{"user_id_list"}},
+		{name: "null list", body: `{"user_id_list":null}`, wantDetails: []response.FieldError{{Field: "user_id_list", Reason: "must contain between 1 and 100 user IDs"}}},
 		// 首项合法而次项文本无效，验证元素校验失败仍只返回一条列表字段明细。
-		{name: "invalid second item", body: `{"user_id_list":["1","invalid"]}`, wantFields: []string{"user_id_list"}},
+		{name: "invalid second item", body: `{"user_id_list":["1","invalid"]}`, wantDetails: []response.FieldError{{Field: "user_id_list", Reason: "each item must be a positive 64-bit integer string"}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -35,7 +36,7 @@ func TestBatchQueryUserProfilesBadRequest(t *testing.T) {
 
 			validator.BatchQueryUserProfiles(ctx)
 
-			assertProfileValidatorBadRequest(t, ctx, recorder, test.wantFields...)
+			assertProfileValidatorBadRequest(t, ctx, recorder, test.wantDetails...)
 		})
 	}
 }
@@ -78,13 +79,10 @@ func TestValidateBatchQueryUserProfilesRequest(t *testing.T) {
 				t.Errorf("UserIDList = %v, want original %v", request.UserIDList, test.userIDs)
 			}
 			if test.wantReason == "" {
-				assertProfileValidatorFields(t, details)
+				assertProfileValidatorDetails(t, details)
 				return
 			}
-			assertProfileValidatorFields(t, details, "user_id_list")
-			if len(details) == 1 && details[0].Reason != test.wantReason {
-				t.Errorf("reason = %q, want %q", details[0].Reason, test.wantReason)
-			}
+			assertProfileValidatorDetails(t, details, response.FieldError{Field: "user_id_list", Reason: test.wantReason})
 		})
 	}
 }
