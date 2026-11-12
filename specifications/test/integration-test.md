@@ -4,7 +4,7 @@
 
 **本项目将单接口的完整处理链路测试定义为「集成测试」；将多个接口组合完成产品用例的测试定义为「业务测试」。** 本文默认以 HTTP 接口为被测入口，验证不同入参、调用身份、存储状态和外部依赖行为下的响应与实际执行结果。
 
-本文是初版规范和建设方案。[MySQL 隔离环境设施](../../tests/testkit/database/mysql/README.md)提供容器生命周期管理。[应用测试启动器](../../tests/integration/application-setup.go)在同一轮环境中启动 MySQL 和被测 HTTP 进程。按场景配置的 SDK Mock、HTTP 接口用例及其统一执行入口仍待实现。
+本文是初版规范和建设方案。[MySQL 隔离环境设施](../../tests/testkit/database/mysql/README.md)提供容器生命周期管理。[应用测试启动器](../../tests/integration/application-setup.go)在同一轮环境中启动 MySQL 和被测 HTTP 进程。[创建用户用例](../../tests/integration/user/create_user_test.go)覆盖首次注册的成功链路。按场景配置的 SDK Mock 和统一执行入口仍待实现。
 
 | 测试类型 | 验证目标 | 规范 |
 | --- | --- | --- |
@@ -158,12 +158,7 @@ Mock 按依赖契约维护，不复制 SDK 内部实现。第三方 SDK 的实�
 
 ### 8.1 使用应用启动器
 
-在 macOS 或 Linux 上使用本机 Docker。从仓库根目录构建带测试装配的服务二进制，再将它的路径作为 `ApplicationOptions.Executable` 传给用例。
-
-```sh
-integration_build_dir=$(mktemp -d)
-go build -tags=integration_app -o "$integration_build_dir/web" ./cmd/web
-```
+在 macOS 或 Linux 上使用本机 Docker。调用方将带 `integration_app` 标签构建的服务二进制路径作为 `ApplicationOptions.Executable` 传给用例。macOS 的构建和执行步骤见下一节。
 
 在带 `integration` 标签的用例中导入 `go-service-template/tests/integration`，再调用 `StartApplication(t, options)`。`ApplicationOptions.MySQL` 使用 MySQL testkit 的默认值或本轮显式选项。`PrepareConfig` 接收临时配置根目录以及用例上下文，在该目录补齐启动所需文件。
 
@@ -188,15 +183,76 @@ app := integration.StartApplication(t, integration.ApplicationOptions{
 
 测试收尾先发送 `SIGTERM`，由应用排空 HTTP 和内部工作。超过停机预算时强制终止并报告失败。确认进程退出后才关闭 MySQL，关闭数据库使用独立的有界上下文。
 
-### 8.2 运行用例
+### 8.2 在 macOS 手动运行 TestCreateUser
 
-共享设施只在测试显式调用时启动资源，不能在包初始化时连接依赖。默认 `go test ./...` 继续只运行单测；集成用例不跟随默认入口执行。规划执行命令为：
+首个用例 `TestCreateUser` 启动独立的 MySQL 和被测进程，匿名发送 `POST /api/v1/user/userProfile/createUser`。它检查 HTTP 200、初始用户资料和 Bearer 凭证，再按请求中的外部账户独立查询 MySQL，核对已提交的用户 ID、昵称、启用状态和版本。
+
+用例内的 `prepareTestConfig` 写入日志、JWT、雪花和公司服务配置，JWT 签名密钥每轮随机生成。公司服务指向本机模拟端点，收到任何意外请求都会使测试失败。测试结束时依次清理服务进程、MySQL 和模拟端点。
+
+以下步骤在同一个终端执行，构建、测试和查看日志使用同一个临时目录。
+
+#### 1. 启动 Docker Desktop
 
 ```sh
-go test -tags=integration -count=1 ./tests/integration/...
+open -a Docker
 ```
 
-添加用例并在其中提供测试二进制和本轮配置后，可以使用该命令。运行入口为整轮测试设置有限的总时限，覆盖启动、故障场景和清理预算，并关闭测试结果缓存，保证每轮实际执行。明确启动的集成测试缺少 Docker、配置或依赖时应失败。
+等 Docker Desktop 显示引擎已运行，再检查客户端是否可以访问本机引擎。
+
+```sh
+docker context show
+docker info
+```
+
+当前 context 应指向本机 Docker Desktop。`docker info` 成功返回 `Server` 信息后继续。首次运行可能会拉取 MySQL 和 Testcontainers 清理服务的镜像。
+
+#### 2. 构建服务并设置二进制路径
+
+进入仓库根目录，使用 Go 1.26 或更高版本。如果终端找不到 `go`，把下列命令中的 `go` 替换为已配置的 Go SDK 中 `bin/go` 的绝对路径。
+
+```sh
+go version
+integration_run_dir="$(mktemp -d)"
+go build -tags=integration_app -o "$integration_run_dir/web" ./cmd/web
+```
+
+构建成功后，将服务路径传给用例。已有带 `integration_app` 标签构建的本机二进制时，也可将变量指向该文件的绝对路径。启动器直接运行宿主机二进制，MySQL 由 Testcontainers 通过 Docker 启动。
+
+```sh
+export INTEGRATION_WEB_BINARY="$integration_run_dir/web"
+```
+
+#### 3. 运行单个用例
+
+```sh
+go test -tags=integration -run '^TestCreateUser$' \
+  -count=1 -timeout=10m -v \
+  -artifacts -outputdir "$integration_run_dir" \
+  ./tests/integration/user
+```
+
+`integration` 标签启用测试文件，`-run` 只选择 `TestCreateUser`，`-count=1` 关闭结果缓存。用例完成 HTTP、数据库断言和清理后，终端显示 `--- PASS: TestCreateUser`。缺少二进制、Docker 或测试配置会使测试失败。
+
+#### 4. 查看服务日志
+
+`-artifacts` 会把 `web-*.log` 保留在 `$integration_run_dir/_artifacts/` 的本轮子目录中。终端的 `=== ARTIFACTS TestCreateUser ...` 行会显示实际目录。也可以直接定位日志并查看最后 100 行。
+
+```sh
+find "$integration_run_dir/_artifacts" -type f -name 'web-*.log' \
+  -print -exec tail -n 100 {} +
+```
+
+日志包含被测进程的标准输出和标准错误，包括实际监听地址及停机结果。如果在 MySQL 创建或配置准备时失败，进程日志可能尚未生成，先查看终端测试报错。分享日志前按本规范脱敏。
+
+### 8.3 运行整个集成测试目录
+
+共享设施只在用例显式调用时启动资源。默认 `go test ./...` 只运行常规测试。新增用例后，可用同一测试二进制运行整个集成测试目录。
+
+```sh
+go test -tags=integration -count=1 -timeout=10m ./tests/integration/...
+```
+
+按用例数量设置整轮测试时限，覆盖启动、业务请求和清理预算。`-count=1` 关闭测试结果缓存。
 
 每条用例必须能单独运行、重跑和换序运行。CI 将集成测试作为独立任务，报告用例结果、环境准备故障、未覆盖项及清理结果。按接口及风险场景维护覆盖，不以单测语句覆盖率或仅成功响应替代集成测试完成情况。
 
@@ -210,4 +266,4 @@ go test -tags=integration -count=1 ./tests/integration/...
 | 查询资料、分页及批量查询 | 筛选、顺序、总数、空结果、重复 ID 和缺失记录，核对实际序列化结果。 |
 | 查询会员及变更历史 | 不存在与未开通的区别、有效及过期状态、异常存量数据、本人权限和连续翻页，查询不修改权益。 |
 
-先完成共享环境和一个正常接口用例，再补参数、权限、冲突、并发和受控故障；业务流程用例按[业务测试规范](business-test.md)独立组织。以上是建设清单，不是已执行或已通过的测试记录。
+以共享环境和已提供的首次注册用例为起点，继续补充参数、权限、冲突、并发和受控故障场景。业务流程用例按[业务测试规范](business-test.md)独立组织。
