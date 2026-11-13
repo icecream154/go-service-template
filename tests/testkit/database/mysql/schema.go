@@ -13,6 +13,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"go-service-template/tests/testkit/repo"
 )
 
 // schemaPlan 来自目录扫描，只保存本次要执行的 SQL，不维护业务库名或表名清单。
@@ -36,42 +38,14 @@ const databaseCreationFilename = "create_database.sql"
 var schemaIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // repositoryRoot 解析 Options.RepositoryRoot，返回 readSchema 用来查找 database/ 的仓库绝对路径。
-// root 有值时使用调用方指定的路径。root 为空时，从测试进程的工作目录向上查找声明本项目模块的 go.mod。
-// 无法解析路径、获取工作目录或找到本项目时返回错误。目录的存在性和类型由 readSchema 检查。
+// root 有值时使用调用方指定的路径。root 为空时，从测试进程的工作目录向上查找最近一个包含合法 go.mod 的模块根目录。
+// 无法解析路径、获取工作目录或找到模块根目录时返回错误。目录的存在性和类型由 readSchema 检查。
 func repositoryRoot(root string) (string, error) {
-	// 显式路径也可指向测试准备的临时仓库根目录。filepath.Abs 按当前工作目录解析相对路径。
-	if root != "" {
-		absolute, err := filepath.Abs(root)
-		if err != nil {
-			// 标记路径解析阶段并保留底层错误，供调用方定位指定目录的问题。
-			return "", fmt.Errorf("resolve repository root: %w", err)
-		}
-		return absolute, nil
-	}
-
-	// 自动发现从测试进程的当前工作目录开始，支持在仓库的子包目录中运行测试。
-	current, err := os.Getwd()
+	resolved, err := repo.FindRoot(root)
 	if err != nil {
-		// 获取工作目录失败时向上传递系统错误，调用方据此结束扫描。
-		return "", err
+		return "", fmt.Errorf("locate repository root: %w", err)
 	}
-
-	// 逐级检查当前目录及其父目录，返回最近一个模块声明匹配的目录。
-	for {
-		// 用 go.mod 开头的模块声明识别仓库，读取成功且匹配时即找到 SQL 扫描根目录。
-		module, err := os.ReadFile(filepath.Join(current, "go.mod"))
-		if err == nil && strings.HasPrefix(string(module), "module go-service-template\n") {
-			return current, nil
-		}
-
-		// 移到上一级继续查找。父目录等于当前目录时，说明已经查到文件系统根目录。
-		parent := filepath.Dir(current)
-		if parent == current {
-			// 自动查找耗尽时，错误会提示调用方显式设置 Options.RepositoryRoot。
-			return "", errors.New("cannot locate repository; set Options.RepositoryRoot")
-		}
-		current = parent
-	}
+	return resolved, nil
 }
 
 // readSchema 从仓库的 database/ 目录发现 MySQL 业务域，递归读取 SQL 并生成初始化计划。

@@ -17,10 +17,12 @@ import (
 // openAICompatibleClient 复用 OpenAI 兼容协议，不作为其他 SDK 的强制实现。
 // 每个供应商分别构造自己的实例和连接池，构造后不保存单次请求状态。
 type openAICompatibleClient struct {
-	provider       string
-	sdk            openai.ChatCompletionService
-	requestTimeout time.Duration
-	transport      *http.Transport
+	provider         string
+	sdk              openai.ChatCompletionService
+	requestTimeout   time.Duration
+	transport        *http.Transport
+	mockGenerateText func(ctx context.Context, params GenerateTextParams) (*GenerateTextResult, int, error)
+	mockCloseIdle    func()
 }
 
 // newOpenAICompatibleClient 接收供应商已校验的连接参数，不读取配置或发起远端请求。
@@ -58,8 +60,14 @@ func newOpenAICompatibleClient(provider, baseURL, apiKey string, connectTimeout,
 
 // closeIdleConnections 释放自有连接池的空闲连接，不取消正在执行的请求。
 func (c *openAICompatibleClient) closeIdleConnections() {
-	if c != nil && c.transport != nil {
+	if c == nil {
+		return
+	}
+	if c.transport != nil {
 		c.transport.CloseIdleConnections()
+	}
+	if c.mockCloseIdle != nil {
+		c.mockCloseIdle()
 	}
 }
 
@@ -125,6 +133,33 @@ func (c *openAICompatibleClient) generateText(ctx context.Context, provider stri
 	// cancel 的 defer 只释放计时资源；追踪与日志在各结果分支收尾，不增加 SDK 或 Transport 子 Span。
 	callCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
+	// 5.1. 仅在 integration_app 构建装配了跨进程 SDK Mock 时走受控委托分支，保留外层模型校验、Span 与日志语义。
+	if c.mockGenerateText != nil {
+		result, mockStatus, err := c.mockGenerateText(callCtx, params)
+		fields := logger.Fields{Event: logger.EventFinished}
+		if mockStatus != 0 {
+			fields.StatusCode = &mockStatus
+		}
+		if err != nil {
+			finishedAt := time.Now()
+			durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
+			fields.DurationMS = &durationMS
+			if errors.Is(err, ErrInvalidResponse) {
+				fields.Error = "LLM text generation response is invalid"
+			} else {
+				fields.Error = "LLM SDK request failed"
+			}
+			span.EndSDKClient(mockStatus, fields.Error, finishedAt)
+			lg.Error(ctx, "LLM text generation finished", fields)
+			return nil, err
+		}
+		finishedAt := time.Now()
+		durationMS := float64(finishedAt.Sub(startedAt)) / float64(time.Millisecond)
+		fields.DurationMS = &durationMS
+		span.EndSDKClient(mockStatus, "", finishedAt)
+		lg.Info(ctx, "LLM text generation finished", fields)
+		return result, nil
+	}
 	// 6. 调用 SDK 并取得实际 HTTP 响应；只读取状态，正文读取和关闭仍由 SDK 负责。
 	// WithResponseInto 不替换默认文本反序列化目标，也不附加自定义 TraceId 请求头。
 	var response *http.Response
