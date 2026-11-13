@@ -24,6 +24,15 @@ type Response struct {
 	RawBody    []byte
 }
 
+// CallRecord 保存单次 HTTP 请求的非敏感执行轨迹摘要（严禁记录请求头凭证或响应正文）。
+type CallRecord struct {
+	Method     string
+	Path       string
+	StatusCode int
+	TraceID    string
+	Duration   time.Duration
+}
+
 type requestBuilder struct {
 	query   url.Values
 	headers http.Header
@@ -102,6 +111,16 @@ func WithJSONBody(payload any) Option {
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	observer   func(CallRecord)
+}
+
+// WithObserver 返回共享底层连接配置但附加调用轨迹观察器的浅拷贝客户端，供步骤执行器记录脱敏请求摘要。
+func (c *Client) WithObserver(observer func(CallRecord)) *Client {
+	return &Client{
+		baseURL:    c.baseURL,
+		httpClient: c.httpClient,
+		observer:   observer,
+	}
 }
 
 // NewClient 创建指向 baseURL 的测试 HTTP 客户端；timeout <= 0 时采用 15 秒默认单次超时。
@@ -165,7 +184,9 @@ func (c *Client) Do(t testing.TB, method, path string, opts ...Option) *Response
 	}
 	req.Header = rb.headers
 
+	startedAt := time.Now()
 	resp, err := c.httpClient.Do(req)
+	elapsed := time.Since(startedAt)
 	if err != nil {
 		t.Fatalf("execute HTTP request %s %s: %v", method, path, err)
 	}
@@ -179,9 +200,20 @@ func (c *Client) Do(t testing.TB, method, path string, opts ...Option) *Response
 		t.Fatalf("HTTP response body for %s %s exceeds %d bytes", method, path, maxResponseBodyBytes)
 	}
 
+	clonedHeader := resp.Header.Clone()
+	if c.observer != nil {
+		c.observer(CallRecord{
+			Method:     strings.ToUpper(method),
+			Path:       path,
+			StatusCode: resp.StatusCode,
+			TraceID:    clonedHeader.Get("TraceId"),
+			Duration:   elapsed,
+		})
+	}
+
 	return &Response{
 		StatusCode: resp.StatusCode,
-		Header:     resp.Header.Clone(),
+		Header:     clonedHeader,
 		RawBody:    rawBody,
 	}
 }

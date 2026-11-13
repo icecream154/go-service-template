@@ -41,9 +41,17 @@ func TestClientAndAssertionsDoNotLeakSensitiveData(t *testing.T) {
 	RequireFieldError(t, errInfo, "user_id")
 
 	// 验证脱敏诊断函数不会把 data 内的敏感 token 带入错误摘要。
-	sensitiveResp := client.Get(t, "/sensitive")
+	var observed []CallRecord
+	observedClient := client.WithObserver(func(rec CallRecord) {
+		observed = append(observed, rec)
+	})
+	sensitiveResp := observedClient.Get(t, "/sensitive")
 	summary := safeDiagnosticSummary(sensitiveResp)
 	if strings.Contains(summary, "SUPER_SECRET_JWT_VALUE") {
 		t.Fatalf("safeDiagnosticSummary leaked sensitive token: %s", summary)
+	}
+	if len(observed) != 1 || observed[0].Method != http.MethodGet || observed[0].Path != "/sensitive" ||
+		observed[0].StatusCode != http.StatusOK || observed[0].TraceID != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("unexpected observed CallRecord: %+v", observed)
 	}
 }

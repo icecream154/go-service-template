@@ -26,6 +26,7 @@ type Behavior struct {
 	delay      time.Duration
 	resultJSON json.RawMessage
 	fault      *FaultSpec
+	sequence   []Behavior
 }
 
 // RespondJSON 构造返回指定 JSON 载荷的成功模拟动作。
@@ -56,6 +57,22 @@ func RespondError(code string, statusCode, providerCode int, message string) Beh
 func WithDelay(delay time.Duration, behavior Behavior) Behavior {
 	behavior.delay = delay
 	return behavior
+}
+
+// Sequence 按调用先后顺序依次执行 behaviors；超出预定调用次数时返回 502 并记入未预期调用违规列表。
+func Sequence(behaviors ...Behavior) Behavior {
+	if len(behaviors) == 0 {
+		panic("sdkmock.Sequence requires at least one Behavior")
+	}
+	var flattened []Behavior
+	for _, b := range behaviors {
+		if len(b.sequence) > 0 {
+			flattened = append(flattened, b.sequence...)
+		} else {
+			flattened = append(flattened, b)
+		}
+	}
+	return Behavior{sequence: flattened}
 }
 
 type ruleKey struct {
@@ -91,11 +108,22 @@ func (r *Rule) RequireCallCount(t testing.TB, want int) []RecordedCall {
 	return calls
 }
 
-func (r *Rule) record(call RecordedCall) Behavior {
+func (r *Rule) record(call RecordedCall) (Behavior, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	idx := len(r.calls)
 	r.calls = append(r.calls, call)
-	return r.behavior
+	if len(r.behavior.sequence) > 0 {
+		if idx >= len(r.behavior.sequence) {
+			return Behavior{}, true
+		}
+		selected := r.behavior.sequence[idx]
+		if r.behavior.delay > 0 {
+			selected.delay += r.behavior.delay
+		}
+		return selected, false
+	}
+	return r.behavior, false
 }
 
 // Controller 在父测试进程内运行本地 HTTP 控制面，集中管控子进程内的全部第三方 SDK 调用。
@@ -221,7 +249,20 @@ func (c *Controller) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 
-	behavior := rule.record(recorded)
+	behavior, exhausted := rule.record(recorded)
+	if exhausted {
+		c.mu.Lock()
+		c.unexpected = append(c.unexpected, recorded)
+		c.mu.Unlock()
+		writeInvokeJSON(w, http.StatusBadGateway, InvokeResponse{
+			Error: &FaultSpec{
+				Code:       "UNEXPECTED_CALL",
+				StatusCode: http.StatusBadGateway,
+				Message:    fmt.Sprintf("sdkmock sequence exhausted for %s.%s", req.Provider, req.Operation),
+			},
+		})
+		return
+	}
 	if behavior.delay > 0 {
 		select {
 		case <-r.Context().Done():

@@ -57,3 +57,40 @@ func TestServerExpectCaptureAndVerifyReset(t *testing.T) {
 		t.Fatalf("second VerifyAndReset after clear = %v, want nil", err)
 	}
 }
+
+func TestSequenceResponderAndExhaustionViolation(t *testing.T) {
+	stub := NewServer()
+	defer stub.Close()
+
+	// 注册按顺序依次返回两次不同结果，第三次调用超出预期应返回 502 并在 VerifyAndReset 中判定违规。
+	route := stub.Expect(http.MethodPost, "/api/v1/demo/seq", Sequence(
+		JSONResponse(http.StatusOK, map[string]int{"step": 1}),
+		JSONResponse(http.StatusOK, map[string]int{"step": 2}),
+	))
+
+	for wantStep := 1; wantStep <= 2; wantStep++ {
+		resp, err := http.Post(stub.URL()+"/api/v1/demo/seq", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), string(rune('0'+wantStep))) {
+			t.Fatalf("step %d unexpected response: status=%d body=%s", wantStep, resp.StatusCode, body)
+		}
+	}
+	route.RequireCallCount(t, 2)
+
+	// 第三次超出预定序列，必须返回 502 并被 VerifyAndReset 捕获。
+	resp3, err := http.Post(stub.URL()+"/api/v1/demo/seq", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusBadGateway {
+		t.Fatalf("exhausted sequence status = %d, want 502", resp3.StatusCode)
+	}
+	if verifyErr := stub.VerifyAndReset(); verifyErr == nil || !strings.Contains(verifyErr.Error(), "POST /api/v1/demo/seq") {
+		t.Fatalf("expected VerifyAndReset to report exhausted sequence call, got: %v", verifyErr)
+	}
+}

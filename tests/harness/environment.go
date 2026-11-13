@@ -187,6 +187,13 @@ func (e *Environment) CompanyStub(serviceName string) *httpstub.Server {
 	return stub
 }
 
+// CompanyStubs 返回当前环境挂载的全部公司内部服务 HTTP 模拟桩映射副本。
+func (e *Environment) CompanyStubs() map[string]*httpstub.Server {
+	copied := make(map[string]*httpstub.Server, len(e.companyStubs))
+	maps.Copy(copied, e.companyStubs)
+	return copied
+}
+
 // DB 按业务域名称（如 "user"）获取供测试直接准备数据或断言终态的独立 SQL 连接池。
 func (e *Environment) DB(t testing.TB, domain string) *sql.DB {
 	t.Helper()

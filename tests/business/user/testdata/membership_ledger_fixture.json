@@ -1,0 +1,35 @@
+{
+  "plan_code": "STANDARD_MONTHLY_2026",
+  "plan_version": 2,
+  "membership_level": 10,
+  "duration_days": 30,
+  "payable_amount_cents": 2990,
+  "payment_channel": "wechat_pay",
+  "orders": [
+    {
+      "alias": "order:open_initial",
+      "order_no": "MO202610010001",
+      "transaction_no": "WX_TX_20261001_A",
+      "change_alias": "change:open_initial",
+      "change_type": 10
+    },
+    {
+      "alias": "order:renew_promo_same_ms",
+      "order_no": "MO202610150001",
+      "transaction_no": "WX_TX_20261015_B1",
+      "change_alias": "change:renew_promo_same_ms",
+      "change_type": 20
+    },
+    {
+      "alias": "order:renew_latest_same_ms",
+      "order_no": "MO202610150002",
+      "transaction_no": "WX_TX_20261015_B2",
+      "change_alias": "change:renew_latest_same_ms",
+      "change_type": 20
+    }
+  ],
+  "community_post": {
+    "title": "会员专属效率工具使用心得分享",
+    "content": "开通标准会员后整理了一套日常工作流配置，记录在此供交流参考。"
+  }
+}

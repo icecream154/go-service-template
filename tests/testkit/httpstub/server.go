@@ -17,11 +17,12 @@ const maxCapturedRequestBodyBytes = 8 << 20 // 8 MiB
 
 // RecordedRequest 保存单次到达模拟服务的 HTTP 请求完整快照，供测试断言下游调用参数与追踪头。
 type RecordedRequest struct {
-	Method   string
-	Path     string
-	RawQuery string
-	Header   http.Header
-	Body     []byte
+	Method      string
+	Path        string
+	RawQuery    string
+	Header      http.Header
+	Body        []byte
+	onExhausted func()
 }
 
 // Responder 定义匹配路由后的受控响应行为。
@@ -55,6 +56,41 @@ func DelayedResponse(delay time.Duration, next Responder) Responder {
 			time.Sleep(delay)
 		}
 		next(w, req)
+	}
+}
+
+// Sequence 按调用先后顺序依次返回 responders 中的响应；超出预定次数时返回 502 并记入未预期调用违规列表。
+func Sequence(responders ...Responder) Responder {
+	if len(responders) == 0 {
+		panic("httpstub.Sequence requires at least one Responder")
+	}
+	copied := make([]Responder, len(responders))
+	for i, responder := range responders {
+		if responder == nil {
+			panic(fmt.Sprintf("httpstub.Sequence responder at index %d is nil", i))
+		}
+		copied[i] = responder
+	}
+	var (
+		mu  sync.Mutex
+		idx int
+	)
+	return func(w http.ResponseWriter, req RecordedRequest) {
+		mu.Lock()
+		current := idx
+		idx++
+		mu.Unlock()
+
+		if current >= len(copied) {
+			if req.onExhausted != nil {
+				req.onExhausted()
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"httpstub sequence exhausted"}`))
+			return
+		}
+		copied[current](w, req)
 	}
 }
 
@@ -196,6 +232,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		RawQuery: r.URL.RawQuery,
 		Header:   r.Header.Clone(),
 		Body:     body,
+	}
+	recorded.onExhausted = func() {
+		cleanCopy := recorded
+		cleanCopy.onExhausted = nil
+		s.mu.Lock()
+		s.unexpected = append(s.unexpected, cleanCopy)
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()

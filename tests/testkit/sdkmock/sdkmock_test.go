@@ -58,3 +58,36 @@ func TestControllerAndClientRoundTrip(t *testing.T) {
 		t.Fatalf("VerifyAndReset should report unexpected SDK call, got: %v", verifyErr)
 	}
 }
+
+func TestSequenceBehaviorAndExhaustionViolation(t *testing.T) {
+	ctrl := NewController()
+	defer ctrl.Close()
+
+	client, err := NewClient(ctrl.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+
+	// 按序返回一次成功、一次错误；第三次调用超出序列必须失败且在 VerifyAndReset 中报告违规。
+	ctrl.Expect("vendor.seq", "Run", Sequence(
+		RespondJSON(map[string]string{"text": "first"}),
+		RespondError("UPSTREAM_BUSY", 503, 2001, "busy"),
+	))
+
+	var res struct {
+		Text string `json:"text"`
+	}
+	if err := client.Invoke(t.Context(), "vendor.seq", "Run", map[string]int{"i": 1}, &res); err != nil || res.Text != "first" {
+		t.Fatalf("first sequence call = (%+v, %v), want first/nil", res, err)
+	}
+	if err := client.Invoke(t.Context(), "vendor.seq", "Run", map[string]int{"i": 2}, &res); err == nil {
+		t.Fatal("second sequence call expected error")
+	}
+	if err := client.Invoke(t.Context(), "vendor.seq", "Run", map[string]int{"i": 3}, &res); err == nil {
+		t.Fatal("third exhausted sequence call must fail")
+	}
+	if verifyErr := ctrl.VerifyAndReset(); verifyErr == nil || !strings.Contains(verifyErr.Error(), "vendor.seq.Run") {
+		t.Fatalf("VerifyAndReset should report exhausted sequence call, got: %v", verifyErr)
+	}
+}

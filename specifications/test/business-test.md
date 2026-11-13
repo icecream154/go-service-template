@@ -1,143 +1,311 @@
 # 业务测试规范与方案
 
-## 1. 目的与适用范围
+本文统一规定本仓库**业务测试的目标定位、共性与业务代码的分层解耦边界、目录组织映射、跨领域前置数据构造准则、单接口动作封装红线、五段式流程剧本规范及运行维护要求**，作为测试基础设施演进与各产品流程业务测试编写的唯一准则。
 
-**业务测试验证多个接口组合起来能否完成一个产品层面的用例或功能。** 用例从产品前置条件出发，经真实 HTTP 接口推进状态，验证各步骤的数据衔接、权限和最终结果。
+---
 
-本项目统一采用以下名称：
+## 1. 目的、定位与三类测试分工
 
-| 类型 | 验证对象 | 规范 |
-| --- | --- | --- |
-| 单元测试 | 无外部依赖的函数、方法和小型组件行为 | [单元测试规范](unit-test.md) |
-| 集成测试 | 单个接口在不同入参、身份、存储状态和依赖行为下的完整执行链路 | [集成测试规范与方案](integration-test.md) |
-| 业务测试 | 多个接口共同完成的产品用例及其状态衔接 | 本文 |
+**业务测试验证多个接口组合起来能否完成一个产品层面的用例或功能。** 用例从产品前置条件出发，经真实 HTTP 接口推进状态，验证各步骤之间的数据衔接、权限隔离、外部交互与最终跨库持久化结果。
 
-同一接口的重复提交、连续分页或并发调用，仍按集成测试组织；它们成为多接口产品流程的一部分时，可以作为业务测试中的步骤。不能仅按 HTTP 请求数量划分测试类型。
+本项目统一采用以下三级测试体系：
 
-业务测试覆盖产品主流程和有不同产品结果的重要分支，不重复穷举各接口的所有参数边界。多个接口各自通过集成测试，不能代替接口间协作的业务测试；业务测试成功也不代替单个接口的独立覆盖。
+| 类型 | 验证对象 | 构建标签 | 规范文档 |
+| --- | --- | --- | --- |
+| **单元测试** | 无外部依赖的纯函数、领域规则、值转换与小型内存组件 | 无（默认 `go test ./...`） | [单元测试规范](unit-test.md) |
+| **集成测试** | **单个 HTTP 接口**在不同入参、身份、存储状态与下游响应下的完整执行分支矩阵 | `//go:build integration` | [集成测试规范与方案](integration-test.md) |
+| **业务测试** | **多个 HTTP 接口**协同完成的产品功能流程、跨步骤真实输出传递与跨领域数据一致性 | `//go:build business` | 本文 |
 
-本文为初始规范和建设方案。共享设施中的 [MySQL 隔离环境](../../tests/testkit/database/mysql/README.md)已实现；下述业务用例目录、应用装配、SDK Mock 及统一运行入口仍待实现，不表示项目已具备可执行的业务测试。
+**核心边界判定准则**：
+1. **不按请求次数机械划分**：同一接口的重复提交、单接口连续分页或并发竞争，仍属于单接口行为，归入[集成测试](integration-test.md)；当它们作为多接口产品旅程中的一环出现时，可作为业务测试的步骤。
+2. **互补而非替代**：业务测试聚焦产品主流程与产生**不同产品结果**的关键业务分支，不重复穷举单个接口的参数校验边界。多个接口各自通过集成测试，不能证明接口间状态衔接无误；业务测试通过，也不能替代单接口的边界覆盖。
 
-## 2. 技术方案与依赖边界
+---
 
-1. **与集成测试共用基础设施。** 使用 Go 标准库 `testing` 编写用例，使用 Testcontainers for Go 管理真实数据库容器，以受控协议服务模拟公司服务，以 Mock 整体替换第三方 SDK，并启动被测应用进程。环境隔离、正式 DDL、配置、数据库基线、资源清理和故障控制遵守[集成测试规范与方案](integration-test.md)，不另建一套业务测试运行环境。
-2. **从真实 HTTP 入口调用。** 使用完整应用入口及真实认证、路由、中间件、Validator、Controller、Service、Repository 和公司服务 Client。不直接调用 Service 代替流程步骤，不在 Context 中写入可信身份来绕过认证。
-3. **按依赖类型选择模拟边界。** 公司服务 Client 保留真实实现，通过测试专用地址访问协议模拟服务，核对实际请求。第三方 SDK 整体使用 Mock 实现，不执行真实 SDK、不访问供应商，也不要求 SDK 使用 HTTP 或暴露可配置地址；核对 Mock 收到的方法、参数、次数及约定返回结果或错误。未配置的请求或 Mock 调用必须使测试失败，不能默认成功或回退真实实现。
-4. **产品流程不等于真实外部联调。** 公司服务模拟与 SDK Mock 验证本服务对依赖结果的处理，不能证明真实 SDK 的协议处理、传输或供应商兼容性。真实内部服务协作、SDK 和供应商兼容性及部署环境行为另行验证，结果须说明实际依赖范围。
-5. **在第三方依赖装配边界集中替换。** 测试专用装配将第三方 SDK 依赖替换为 Mock，保持 Service、Repository 和事务执行真实，不在业务方法中逐一打桩，不用内存 Repository、SQLite 或 `sqlmock` 替代真实数据库。使用应用子进程时，Mock 必须实际装配到该进程中；仅替换测试父进程中的对象不会生效。具体装配设施仍待实现。
+## 2. 架构分层：共性能力与具体业务的严格解耦
 
-## 3. 文件组织与用例命名
+为确保工程模板具备跨项目可移植性，同时防止测试辅助代码退化为耦合特定产品诉求的“上帝构建器（God Builder）”，业务测试按**是否依赖具体业务概念**自下而上划分为四层：
 
-以下为目录职责约定；当前仅共享设施中的 `../../tests/testkit/database/mysql` 已实现：
+```mermaid
+flowchart TD
+    subgraph L4["第四层：产品流程剧本层 (tests/business/{domain}/*_test.go —— //go:build business)"]
+        STORY["面向具体产品功能的五段式多步测试剧本：显式组装前置状态、推进步骤、传递真实输出并核对终态"]
+    end
 
-| 路径 | 用途 |
+    subgraph L3["第三层：业务领域原子积木层 (tests/business/domains/{domain} —— //go:build business)"]
+        DOM_SEED["单表原子造数映射：InsertXxx（仅映射本域单张表结构与技术默认值，不含特定产品流程假设）"]
+        DOM_API["单接口 1:1 薄调用：MustXxx / CallXxx（严格对应 1 次 HTTP 请求，显式传递身份凭证）"]
+        DOM_STORE["单表存储读取辅助：QueryStoredXxx（供终态独立数据库连接核对）"]
+    end
+
+    subgraph L2["第二层：应用外壳桥接层 (tests/harness —— //go:build integration || business)"]
+        HARNESS["与集成测试 100% 共用：管理三库容器、cmd/web 单次编译、动态配置、污染熔断及 NewFlow 装配"]
+    end
+
+    subgraph L1["第一层：纯技术共性底座层 (tests/testkit —— 零 app/* 业务依赖，跨项目通用)"]
+        BASE["既有组件：database/mysql · process · httpstub(含 Sequence) · sdkmock(含 Sequence) · jwtkit · apicall · repo"]
+        SEED["seed：逻辑别名→正整数 ID 簿 · UTC 毫秒时钟 · 多库写入与前置冻结栅栏 Freeze · testdata 加载"]
+        FLOW["flow：有序具名步骤执行器 · 单步级外部 Mock 即时结算检查点 · 失败时步骤 TraceId 脱敏轨迹表"]
+        DBASSERT["dbassert：零业务结构体依赖的 SQL 行/结果集快照比对 RequireUnchanged · 跨库表行数增量核对"]
+    end
+
+    STORY --> DOM_SEED
+    STORY --> DOM_API
+    STORY --> DOM_STORE
+    STORY --> HARNESS
+    STORY --> SEED
+    STORY --> FLOW
+    STORY --> DBASSERT
+    DOM_SEED --> SEED
+    DOM_API --> FLOW
+    HARNESS --> BASE
+    HARNESS --> FLOW
+```
+
+### 2.1 分层职责红线表
+
+检验代码放对层级的唯一标准：**若删除 `app/domains/*` 与 `database/*` 中的所有示例业务域并替换为全新业务项目，`tests/testkit` 与 `tests/harness` 必须无需改动业务逻辑即可通过编译并正常工作。**
+
+| 层级 | 目录路径 | 业务耦合度 | 允许包含的内容 | 严禁出现的内容 |
+| --- | --- | --- | --- | --- |
+| **第一层：共性底座** | `tests/testkit/` | **0% 业务相关** | 容器管理、进程托管、HTTP/SDK 协议模拟及顺序响应队列、JWT 签发、脱敏断言、命名 ID 分配簿、测试时钟、写库冻结栅栏、步骤执行与轨迹引擎、通用 SQL 快照与行数对比 | 禁止 `import` 任何 `app/*`、`bootstrap`、`routers`、`cmd/*`；禁止出现任何领域名、表名、业务路由或供应商名 |
+| **第二层：外壳桥接** | `tests/harness/` | **仅绑定启动外壳** | 复用单进程启动参数、动态生成 `test.yml`、`Suite`（`Shared` 共享 / `Isolated` 独占）、JWT Claims 封装、`NewFlow` 桥接 | 禁止感知具体有哪些业务域、数据库表结构或 HTTP 业务接口 |
+| **第三层：领域积木** | `tests/business/domains/<domain>/` | **绑定所属业务域单表与单接口** | 本域单张表的 `Insert<Table>` 插入映射、本域单个路由的 `Call<Endpoint>` / `Must<Endpoint>` 1:1 薄封装、本域表行直查函数 | 禁止封装跨多接口的黑盒流程函数（如 `RegisterAndUpdate`）；禁止堆砌耦合特定测试剧情的复合大对象（如 `InsertUserWithTwoOrdersAndThreePosts`） |
+| **第四层：产品剧本** | `tests/business/<domain>/` | **100% 产品流程相关** | 面向产品用例的多步骤流程测试文件与本域静态 `testdata/*.json` 数据模板 | 禁止绕过 HTTP 接口直接调用业务 `Service` 或在步骤中途直接写库伪造流程中间态 |
+
+### 2.2 外部依赖与运行边界（与集成测试完全一致）
+
+1. **真实 HTTP 协议入口**：所有业务步骤均通过宿主机回环网络向真实 `cmd/web` 子进程发起 HTTP 请求，完整经过路由、中间件、认证、Validator、Controller、Service、Repository、事务与真实 MySQL 8.4 容器。
+2. **双轨外部依赖模拟**：
+   - **公司内部 HTTP 服务**：保留真实 Company Client（含超时、连接池、`TraceId`/`traceparent` 传播与结构化日志），通过配置指向 `httpstub.Server`；
+   - **第三方供应商 SDK**：在 `//go:build integration_app` 启动装配边界将底层网络往返委托给 `sdkmock.Controller`，保留客户端入参校验、Tracing Span 与日志生命周期；
+   - **默认拒绝未声明调用**：任何步骤触发未显式声明的内部服务路由或第三方 SDK 方法，立即判定该步骤失败。
+3. **边界声明**：模拟服务与 SDK Mock 用于验证本服务在多步骤业务流转中对外部依赖参数拼装与结果处理的正确性，不能替代真实跨服务联调与第三方供应商线上兼容性验收。
+
+---
+
+## 3. 目录结构与文件命名规范
+
+```text
+tests/
+├── testkit/                                      # 共性基础设施（与集成测试共享）
+│   ├── seed/                                     #   前置数据会话（命名 ID、UTC 毫秒时钟、Freeze 栅栏、JSON 加载）
+│   ├── flow/                                     #   多步流程执行器、单步 Mock 结算与步骤轨迹表
+│   ├── dbassert/                                 #   通用 SQL 行快照零变更比对与多库表行数增量断言
+│   └── (apicall, database/mysql, httpstub, jwtkit, process, repo, sdkmock)
+├── harness/                                      # 应用外壳桥接（//go:build integration || business）
+└── business/                                     # 业务测试根目录（全部标记 //go:build business）
+    ├── domains/                                  # 各业务域可复用的单表/单接口原子积木
+    │   ├── userdom/                              #   user 域单表插入、8 个接口 1:1 薄调用及单表直查
+    │   ├── orderdom/                             #   order 域单表插入及直查
+    │   └── postdom/                              #   post 域单表插入及直查
+    └── user/                                     # 按发起流程的主业务域分包
+        ├── main_test.go                          #   包级 Suite 生命周期入口（固定约 15 行）
+        ├── testdata/                             #   本域大型静态前置数据或协议响应模板
+        ├── register_and_set_generated_avatar_test.go
+        └── inspect_cross_domain_membership_lifecycle_test.go
+```
+
+1. **独立构建标签**：业务测试源码统一使用 `//go:build business`，绝不同时声明 `integration`，确保单元测试、集成测试、业务测试三类命令严格独立筛选。
+2. **主域归属原则**：跨多个业务域协作的产品流程，放入**发起该产品动作的主业务域目录**（如用户个人中心发起的资料与权益流程归入 `tests/business/user/`；由会员下单与支付回调驱动的跨库履约流程归入 `tests/business/order/`）。
+3. **命名表达产品行为**：测试文件采用 `<product_use_case>_test.go`（`snake_case`），顶层测试函数命名为 `Test<ProductUseCase>`（如 `TestRegisterAndSetGeneratedAvatar`）；同一产品流程下的主路径与关键业务分支使用带两位序号的 `t.Run("01_<variant>", ...)` 组织，每条子用例均能独立运行。
+
+---
+
+## 4. 业务测试五大编写规范
+
+### 4.1 规范一：跨领域前置数据（Fixture）构造规范
+
+1. **只造存量起点，硬性封存禁造中间态**：
+   - 所有前置存量数据通过 `sd := seed.New(t, env.DB)` 会话调用各领域单表 `InsertXxx` 写入真实数据库；
+   - 在发起第 1 个业务 HTTP 请求前**必须调用 `sd.Freeze()`**（`flow.Runner` 绑定 `sd` 后亦会在首个 `Step` 启动前自动校验封存）。一旦封存，任何测试代码若试图在步骤中途通过 `sd.Exec` 直接篡改数据库伪造中间状态，立即 `Fatalf` 报错终止。
+2. **告别裸魔法数字与精度漂移**：
+   - 跨库跨表关联的主外键统一通过 `sd.ID("domain:alias")`（如 `sd.ID("user:alice")`、`sd.ID("order:first")`）分配确定性正整数标识，使跨表引用关系在代码字面上自解释；
+   - 存量记录时间统一使用 `sd.Time(offset)` 生成，自动截断至 `UTC` 毫秒精度以严格对齐 MySQL `DATETIME(3)` 列定义。
+3. **跨领域组合保持透明**：
+   - 当用例需要复杂跨库前置状态（例如同时存在 `order_service.membership_order` 已履约订单、`user_service.membership_change_record` 变更流水与 `user_service.user_membership` 生效快照）时，在用例 `[1. 前置存量状态]` 段落用上述命名 ID 显式拼装各域单表 `InsertXxx`，让外键闭环与状态假设一目了然；
+   - 超长文本、批量历史流水模板或大型外部报文放入 `testdata/*.json`，使用 `seed.LoadJSON[T]` 读取后再绑定动态分配的 ID 与时间戳落库。
+
+### 4.2 规范二：领域单接口动作封装（Domain Action）红线规范
+
+`tests/business/domains/<domain>/api.go` 旨在消除多步骤流程中重复手写 URL 路径与 JSON 样板的噪音，编写时必须严守**「三不红线」**：
+
+1. **不串联多接口**：每个动作函数**严格只发送 1 次 HTTP 请求**，严禁在辅助函数内部组合调用两个及以上接口、严禁自动重试或替调用方隐式拉取前置版本号。
+2. **不隐藏调用身份**：函数签名必须显式接收请求选项 `opts ...apicall.Option`（如 `apicall.WithBearerToken(issuedToken)`），使剧本正文清楚展示每一步是由匿名访客、新注册成员还是内部管理服务发起。
+3. **不吞没错误分支能力**：按用途成对提供：
+   - `Must<Action>(s *flow.Step, req ...) RespData`：断言 HTTP `200` 且业务信封成功，直接返回强类型 `data`，用于正常推进步骤；
+   - `Call<Action>(s *flow.Step, req ...) *apicall.Response`：原样返回响应快照，供异常分支配合 `apicall.RequireError` 断言 `4xx`/`5xx` 状态码与 `business_code`。
+
+### 4.3 规范三：跨步骤真实输出交接规范
+
+后续步骤必须严格消费前序步骤的**真实接口输出**，并在交接前先断言前序输出符合契约：
+
+| 交接要素 | 强制要求 |
 | --- | --- |
-| `tests/business/<domain>/<product_use_case>_test.go` | 按产品用例组织业务测试；跨领域流程放在发起该流程的主要领域下 |
-| `tests/business/<domain>/testdata/` | 该领域业务测试专用的前置数据和受控依赖响应 |
-| `tests/testkit/` | 与集成测试共用的环境启动、HTTP 调用、数据准备、协议模拟服务、SDK Mock 装配与控制及诊断辅助设施 |
+| **业务实体 ID** | 使用创建或查询接口实际返回的雪花 ID（如 `created.UserProfile.ID`），严禁猜测发号序列 |
+| **认证凭证** | 流程包含注册或登录签发时，后续步骤必须使用响应实际返回的 `access_token`；仅存量前置角色才由 `env.Auth` 签发初始凭证 |
+| **乐观锁版本与游标** | 更新资料使用前序创建/查询返回的真实 `version`；连续翻页使用上一页响应返回的真实不透明 `next_page_token`，绝不手工伪造编码 |
+| **下游生成产物** | 如将 `generateUserAvatar` 实际返回的 `avatar_url` 原样传入后续 `updateUserProfile` |
+| **关键前置熔断** | 前序步骤一旦失败（断言未过或非预期错误），`flow.Runner` 立即中止当前流程，不拿零值变量继续执行后续步骤制造连锁噪音 |
 
-1. 业务测试文件使用 `//go:build business`，与使用 `integration` 标签的集成测试独立选择；不把业务测试同时标记为 `integration`。需要外部依赖的共享设施只由显式测试入口启动，包初始化不能启动容器或联网。
-2. 测试函数以 `Test` 开头，名称表达产品行为，例如 `TestRegisterAndSetGeneratedAvatar`。同一流程的重要变体可以使用 `t.Run`，每个变体都独立准备环境状态。
-3. 每条用例前必须注释产品目标、前置条件和预期结果。步骤按实际执行顺序排列，名称说明当前动作和预期状态，便于定位失败位置。
-4. 共用的请求发送、JSON 解码和断言可以提取为辅助函数，断言辅助函数调用 `t.Helper()`。用例中的关键输入、步骤顺序和预期值必须清楚可见，不能隐藏在自动执行整套业务的通用辅助函数中。
-5. 一条用例应能单独执行，不依赖其他测试函数先创建用户、写入记录或配置协议模拟服务及 SDK Mock。不同产品流程不拼接成一个依赖前序测试结果的大流程。
+### 4.4 规范四：单条流程剧本「五段式结构」与单步 Mock 结算规范
 
-## 4. 前置数据与步骤衔接
+每个业务测试文件及子用例统一遵循以下**五段式视觉结构**：
 
-### 4.1 只预置流程开始前的条件
+1. **文件头产品说明书**：声明主业务域、涉及数据库表、按执行顺序列出参与的 HTTP 路由清单、以及主流程与分支变体的对照总览表。
+2. **`[1. 前置存量状态（Given State）]`**：通过 `seed.Session` 装载流程开始前已存在的跨领域记录并执行 `sd.Freeze()`；对需要证明“全程未被波及”的背景记录或表行数，使用 `dbassert.CaptureSingleRow` / `dbassert.CaptureCounts` 拍下初始基线。
+3. **`[2. 跨步骤流转变量（Flow Handoff State）]`**：用一组 `var (...)` 集中声明跨步骤传递的真实业务输出变量，直观呈现整条链路的数据依赖图。
+4. **`[3. 有序产品步骤推进（Ordered Steps）]`**：
+   - 使用 `fl.Step("01_<action_and_intent>", func(s *flow.Step) { ... })` 顺序组织；
+   - **单步级外部依赖结算（Step Checkpoint）**：仅在确实需要访问外部依赖的步骤内调用 `s.ExpectSDK(...)` 或 `s.ExpectHTTP(...)`（若单步内对同一依赖按序调用多次且返回不同结果，使用 `sdkmock.Sequence` 或 `httpstub.Sequence`）。**每个 `Step` 闭包结束瞬间，`flow.Runner` 自动校验本步声明的所有规则均已被实际调用，并校验无任何未声明调用，随后立即清空规则**——从而保证外部预期绝不跨步骤串扰，任何步骤的意外出站调用都会在发生的当步精准报错。
+5. **`[4. 最终产品可见态与跨库持久化核对（End-State Audit）]`**：
+   - **外部接口视角**：从用户本人查询接口和（如适用）后台服务查询接口确认最终产品可见状态；
+   - **底层存储视角**：通过独立数据库连接核对目标库表持久化列值、跨表外键关联闭环，以及禁止副作用（如生成预览步骤未改库、对照用户快照零变化、只读流程表行数增量为 `0`）。
 
-Fixture 由人工设计并纳入版本控制，由测试自动装载。可以直接向真实数据库插入流程开始前就应存在的用户、关系或业务记录，并在调用接口前提交。
+**故障诊断输出约定**：当任一步骤失败时，`flow.Runner` 自动输出**脱敏步骤执行轨迹表**（包含从第 1 步至失败步的步骤名、耗时、每次 HTTP 请求的 `Method Path -> StatusCode` 及服务端 `TraceId`，严禁在日志中打印响应 `data` 中的 `access_token` 或密钥）。
 
-不能直接插入或修改本流程应通过接口产生的关键中间状态。例如验证“注册后设置头像”时，用户由注册接口创建，头像地址由生成接口返回，资料由更新接口写入；不能在步骤之间直接修改数据库，让后续接口得到预期状态。
+### 4.5 规范五：非原子提交边界与超时污染隔离规范
 
-数据准备应保持最小且明确。专门验证存量异常数据或运行中故障的流程，应显式声明异常条件及其施加时点，不把它混入正常路径的准备逻辑。
+1. **按真实提交边界断言失败终态**：跨多个 HTTP 请求的业务流程不属于同一个数据库事务（甚至单次请求内部也可能存在“先提交用户记录、再签发凭证”的阶段边界）。当流程在第 $K$ 步因下游错误、权限拦截或版本冲突中断时，必须同时核对：
+   - 第 $1 \dots K-1$ 步已成功提交的状态仍然真实保留并可查询；
+   - 第 $K$ 步及未执行的后续步骤没有写入半成品数据或触发多余的下游调用。
+2. **慢请求与超时场景强制独占隔离**：当用例使用 `httpstub.DelayedResponse` 或 `sdkmock.WithDelay` 故意制造请求超时（如触发 `503` 或客户端超时）且服务端内部协程可能尚未完全排空时，**严禁使用 `suite.Shared(t)`**，必须改用 `suite.Isolated(t, ...)` 独占进程环境；断言完成后由框架按「优雅停机排空 `cmd/web` → 关闭模拟桩 → 销毁数据库容器」逆序彻底回收，防止污染后续业务流程。
 
-### 4.2 后续步骤使用真实输出
+---
 
-| 衔接内容 | 要求 |
+## 5. 标准代码范式示例
+
+以下节选展示共性原语（`seed`、`flow`、`dbassert`）与领域原子积木（`userdom`）如何组装成清晰可审阅的业务流程测试：
+
+```go
+func TestRegisterAndSetGeneratedAvatar(t *testing.T) {
+	t.Run("01_register_generate_and_apply_avatar", func(t *testing.T) {
+		// [产品目标] 新用户注册后持真实签发凭证完成初始查询、AI 头像生成与资料更新，本人端、后台端与数据库三方终态一致。
+		env := suite.Shared(t)
+		sd := seed.New(t, env.DB)
+		fl := harness.NewFlow(t, env, flow.WithSeed(sd))
+
+		// [1. 前置存量状态] 预置无关存量用户作为隔离对照，封存前置写库入口
+		userdom.InsertProfile(sd, userdom.ProfileSeed{
+			ID:                sd.ID("user:bystander"),
+			AccountSource:     "wechat",
+			ExternalAccountID: "wx_existing_bystander",
+			UserName:          "存量路人甲",
+			IsEnabled:         true,
+			CreatedAt:         sd.Time(-24 * time.Hour),
+		})
+		sd.Freeze()
+
+		bystanderSnap := dbassert.CaptureSingleRow(t, env.DB(t, "user"),
+			"SELECT user_name, avatar_url, version FROM user_profile WHERE id = ?", sd.ID("user:bystander"))
+
+		// [2. 跨步骤流转变量]
+		var (
+			createdUserID  int64
+			issuedToken    string
+			initialVersion int64
+			generatedURL   string
+			updatedVersion int64
+		)
+
+		// [3. 有序产品步骤推进]
+		fl.Step("01_register_new_user", func(s *flow.Step) {
+			created := userdom.MustCreateUser(s, userdom.CreateUserRequest{
+				AccountSource:     "wechat",
+				ExternalAccountID: "wx_new_member_001",
+				UserName:          "初来乍到的小明",
+			})
+			createdUserID = created.UserProfile.ID
+			issuedToken = created.AccessToken
+		})
+
+		fl.Step("02_query_initial_profile_with_issued_token", func(s *flow.Step) {
+			initial := userdom.MustQueryProfileByUserID(s, createdUserID, apicall.WithBearerToken(issuedToken))
+			initialVersion = initial.Version
+		})
+
+		fl.Step("03_generate_avatar_without_mutating_profile", func(s *flow.Step) {
+			selfBeforeGen := dbassert.CaptureSingleRow(s.T(), env.DB(s.T(), "user"),
+				"SELECT user_name, avatar_url, version FROM user_profile WHERE id = ?", createdUserID)
+
+			qwen := s.ExpectSDK("ai.llm.qwen", "GenerateText", sdkmock.RespondJSON(map[string]any{
+				"content": "flat vector portrait of an astronaut shiba inu",
+			}))
+			imgRoute := s.ExpectHTTP("python-service-template",
+				http.MethodPost, "/api/v1/image/imageGen/generateImage",
+				httpstub.JSONResponse(http.StatusOK, map[string]any{
+					"image_url": "https://cdn.example.com/avatars/shiba-astro.png",
+				}),
+			)
+
+			gen := userdom.MustGenerateAvatar(s, "宇航员柴犬", apicall.WithBearerToken(issuedToken))
+			generatedURL = gen.AvatarURL
+
+			qwen.RequireCallCount(s.T(), 1)
+			imgRoute.RequireCallCount(s.T(), 1)
+			selfBeforeGen.RequireUnchanged(s.T())
+		})
+
+		fl.Step("04_update_own_profile_with_generated_avatar", func(s *flow.Step) {
+			updated := userdom.MustUpdateProfile(s, userdom.UpdateProfileRequest{
+				UserID:          createdUserID,
+				ExpectedVersion: initialVersion,
+				UserName:        "太空柴犬小明",
+				AvatarURL:       &generatedURL,
+			}, apicall.WithBearerToken(issuedToken))
+			updatedVersion = updated.Version
+		})
+
+		// [4. 最终产品可见态与跨库持久化核对]
+		fl.Step("05_verify_end_state_across_member_admin_and_storage", func(s *flow.Step) {
+			selfView := userdom.MustQueryProfileByUserID(s, createdUserID, apicall.WithBearerToken(issuedToken))
+			adminToken := env.Auth.IssueServiceAdminToken(s.T(), "ops-console")
+			adminPage := userdom.MustQueryProfilePage(s, userdom.QueryProfilePageRequest{
+				UserName: "太空柴犬小明", PageNumber: 1, PageSize: 10,
+			}, apicall.WithBearerToken(adminToken))
+			stored := userdom.QueryStoredProfile(s.T(), env, createdUserID)
+
+			if selfView.Version != updatedVersion || adminPage.TotalCount != 1 || stored.Version != 1 {
+				s.T().Fatalf("end-state mismatch across member/admin/storage views")
+			}
+			bystanderSnap.RequireUnchanged(s.T())
+		})
+	})
+}
+```
+
+---
+
+## 6. 已覆盖与待演进的产品流程清单
+
+### 6.1 当前已实现流程（`tests/business/user/`）
+
+1. **`TestRegisterAndSetGeneratedAvatar`**（[register_and_set_generated_avatar_test.go](../../tests/business/user/register_and_set_generated_avatar_test.go)）：
+   - `01_register_generate_and_apply_avatar`：新用户注册、真实凭证传递、AI 头像生成（含 Qwen→图片服务链路参数衔接及中间态零写库验证）、乐观锁资料更新及本人/后台/DB 三方终态核验；
+   - `02_preserve_registered_account_when_avatar_generation_fails`：生成阶段 Qwen 故障中断后，已注册账户保留初始状态且阻断下游图片调用；
+   - `03_reject_stale_version_replay_and_keep_latest_profile`：更新成功后重放旧版本被 `409` 拦截，确认线上最新资料不被覆盖；
+   - `04_forbid_applying_generated_avatar_to_other_user`：生成头像后试图越权修改存量他人资料被 `403` 拒绝，本人查询、后台批量查询与 DB 快照共同确认双方资料安全隔离；
+   - `05_isolate_company_image_timeout_without_polluting_next_flow`：使用 `suite.Isolated` 独立环境验证内部图片服务超时中断后的账户状态与资源安全回收。
+2. **`TestInspectCrossDomainMembershipLifecycle`**（[inspect_cross_domain_membership_lifecycle_test.go](../../tests/business/user/inspect_cross_domain_membership_lifecycle_test.go)）：
+   - `01_active_member_inspects_profile_benefits_and_paginates_order_history`：结合 `seed.Session` 与 `testdata/` 模板构造横跨 `order_service`、`user_service`、`post_service` 三库 6 表的复杂存量生态（含已履约首购/续费订单、待支付未履约订单、同毫秒多条变更流水及社区发帖点赞），验证本人资料核查 → 生效会员窗口核查 → 持真实不透明 `next_page_token` 连续翻页追溯全部订单关联流水及全链路零写副作用；
+   - `02_expired_member_retains_historical_ledger_and_admin_cross_check`：验证已过期会员快照保留、未支付订单不提前生效、历史变更记录完整可查及后台批量资料巡检一致性。
+
+### 6.2 后续随接口上线扩展方向
+
+- 当 `order` 域下单及支付回调履约 HTTP 接口实现后，在 `tests/business/order/` 增加从「创建订单 → 渠道支付回调 → 跨库验证订单状态、会员权益开通/续期与变更流水」的写链路闭环流程；
+- 当 `post` 域发帖、点赞与关注 HTTP 接口实现后，在 `tests/business/post/` 增加多角色社交互动与软删除可见性闭环流程。
+
+---
+
+## 7. 运行入口与维护要求
+
+| 运行目标 | 执行命令 |
 | --- | --- |
-| 用户及业务标识 | 使用创建或查询接口返回的标识，不猜测雪花 ID 或依赖固定执行顺序 |
-| 身份凭证 | 流程包含创建或签发时，后续使用实际返回的 Token；仅作为前置身份时，可由测试认证配置签发 |
-| 版本与游标 | 使用前序响应取得的版本或不透明游标，不自行计算或重新构造 |
-| 生成结果 | 将实际接口输出传给下一步，例如将生成头像返回的 URL 用于更新资料 |
-| 外部依赖结果 | 按用例预先声明协议模拟服务响应和 SDK Mock 返回值或错误，分别核对实际请求与方法调用；不得根据被测错误输出自动调整预期以使测试通过 |
+| **运行全部业务测试** | `go test -v -tags=business -count=1 -p 2 -timeout=15m ./tests/business/...` |
+| **运行指定产品流程** | `go test -v -tags=business -count=1 ./tests/business/user -run '^TestRegisterAndSetGeneratedAvatar$'` |
+| **运行单个流程分支变体** | `go test -v -tags=business -count=1 ./tests/business/user -run '^TestRegisterAndSetGeneratedAvatar/03_reject_stale_version_replay_and_keep_latest_profile$'` |
 
-取得前序输出后，先断言其符合契约，再交给后续步骤。关键前置步骤失败时，终止依赖该结果的步骤并保留诊断，不继续制造无意义的连锁失败。
-
-## 5. 断言范围
-
-每条业务测试必须验证关键步骤和产品最终状态，不能只检查所有请求都返回 `200`。
-
-| 对象 | 断言要求 |
-| --- | --- |
-| 步骤响应 | 核对该步骤的 HTTP 状态、错误码、关键数据及必要响应头；错误和空值语义遵守[接口返回规范](../application/api-response.md) |
-| 数据衔接 | 核对用户、身份、版本和生成结果在不同接口之间对应同一业务对象，并符合状态转换约定 |
-| 产品最终结果 | 从面向调用方的查询接口确认最终可见结果，同时通过独立数据库连接核对实际提交的数据 |
-| 外部交互 | 公司服务核对真实 Client 的协议请求，第三方 SDK 核对 Mock 收到的方法和参数；检查有产品意义的参数传递、次数、先后关系及结果处理，不绑定无关内部实现细节 |
-| 禁止的副作用 | 核对不应发生的写入、下游调用或重复处理，例如生成头像后用户资料尚未被修改 |
-| 失败后的状态 | 按各步骤的提交边界核对已完成操作、未执行操作及约定的补偿结果，不假定整个 HTTP 流程属于同一事务 |
-
-预期值应来自产品规则、接口契约或缺陷回归要求，不通过再次调用被测实现来计算。输入与预期中的可变对象应独立，避免一起被修改后错误通过。
-
-当前创建用户先持久化、再签发 Token；签发失败返回 `500`，不会撤销已完成的创建。当前 HTTP 等待超时返回 `503` 后，内部业务仍可能继续。业务测试必须分别判断响应、最终状态和后续步骤是否可执行，不能由失败状态码推断事务已经回滚。[创建与签发](../../app/domains/user/controller/v1/user_profile_controller.go) · [响应等待](../../app/http/middleware/response_timeout.go)
-
-## 6. 执行流程与隔离
-
-| 阶段 | 操作及完成条件 |
-| --- | --- |
-| 定义场景 | 写明产品目标、参与接口、前置状态、身份、依赖行为、步骤预期和最终状态 |
-| 创建环境 | 由共享设施启动本轮独立数据库、公司服务模拟端点和应用，在应用进程中装配 SDK Mock，执行正式 DDL，完成有上限的就绪检查 |
-| 准备流程 | 重置数据、协议模拟服务及 SDK Mock 的状态与调用记录，装载并提交最小 Fixture，配置预期请求、方法调用和返回结果 |
-| 顺序执行 | 按产品操作顺序调用真实接口，逐步断言并传递已验证的输出 |
-| 核对结果 | 检查最终接口可见结果、数据库提交结果、实际外部调用和禁止的副作用 |
-| 等待收尾 | 确认相关内部工作结束后，才允许清理数据、重置协议模拟服务及 SDK Mock，或执行下一条用例 |
-| 诊断与销毁 | 保存必要失败信息，停止应用，删除本轮容器、数据卷和网络；失败路径同样执行清理 |
-
-默认在同一套环境中串行执行独立业务用例。需要并行时，按测试执行进程分配独立的应用进程、数据库容器、协议模拟服务和 SDK Mock 状态；不能共享可变全局状态。当前固定库名和单次初始化约束的处理方式遵守集成测试方案。
-
-单条流程内部只有产品行为确实需要时才并发请求，并通过可观测的同步条件和有限等待构造竞争。异步结果、就绪和收尾使用有截止时间的条件检查，不以固定 `Sleep` 或无限轮询代替。不能依靠测试进程外层事务回滚清除应用通过其他连接提交的数据。
-
-超时用例若不能可靠确认业务已经排空，应使用独立环境，在核对可观察结果后停止并等待该应用进程退出，再销毁依赖；不能让未结束的任务污染下一条流程。环境缺失、启动失败和清理失败必须明确报告，不能静默跳过后宣称测试通过。
-
-## 7. 首批业务用例
-
-### 7.1 注册并设置生成头像
-
-产品目标：新用户注册后，能够使用服务签发的身份生成头像、更新自己的资料，并查询到已保存的新资料。使用当前已存在的[用户路由](../../app/domains/user/routers/router.go)，路径前缀为 `/api/v1/user/userProfile`。
-
-前置条件：目标外部账户尚不存在；Qwen 的第三方 SDK 依赖整体使用 Mock，返回确定的优化提示词；公司图片服务的真实 Client 连接协议模拟服务，取得确定的合法图片 URL。初始数据库不预置本流程要创建的用户。
-
-| 步骤 | 接口 | 关键验证及传递结果 |
-| --- | --- | --- |
-| 1. 注册用户 | `POST /createUser` | 创建成功，初始版本为 `0`，取得用户 ID、`access_token` 和 `token_type`；数据库中账户唯一 |
-| 2. 查询初始资料 | `GET /queryUserProfileByUserId` | 使用实际返回的身份和用户 ID 查询，核对初始资料，保存查询所得版本 |
-| 3. 生成头像 | `POST /generateUserAvatar` | 使用同一身份调用；核对 Qwen SDK Mock 的入参及返回结果确实传给图片服务；取得生成 URL，原用户资料仍未改变 |
-| 4. 更新本人资料 | `POST /updateUserProfile` | 使用前序用户 ID、版本和生成 URL，以及明确的新昵称；更新成功且版本只增加一次 |
-| 5. 查询最终资料 | `GET /queryUserProfileByUserId` | 昵称、头像、版本与步骤 4 一致；独立数据库查询确认相同持久化结果 |
-
-该流程不把 Token 视为固定字符串，也不预设用户 ID。预期新昵称、头像 URL 和版本变化必须由用例明确表达，不能只比较两个响应“彼此相等”。
-
-### 7.2 有独立产品结果的变体
-
-| 变体 | 产品结果与断言 |
-| --- | --- |
-| 注册后头像生成失败 | 已创建的用户仍存在，资料保持初始值；若优化阶段失败，图片服务不应被调用；不继续提交缺失的头像 URL |
-| 更新成功后再次提交旧版本 | 重复更新被拒绝，后续查询仍返回上次成功提交的资料和版本，不被旧内容覆盖 |
-| 生成头像后越权更新其他用户 | 使用另一位前置用户构造对象权限差异，更新被拒绝，两个用户的资料均符合各自应有状态 |
-
-上述变体用于验证接口组合后的结果。单接口的参数边界、全部错误映射和并发版本竞争由集成测试维护。尚无 HTTP 入口的支付、会员开通或续费，不作为已经可执行的业务流程列入覆盖记录。
-
-## 8. 运行入口与维护
-
-后续统一入口按以下约定建设，由共享设施自动完成环境启动、就绪、用例运行、诊断和销毁；无需人工先连接数据库装载数据。
-
-| 目的 | 规划命令 |
-| --- | --- |
-| 运行全部业务测试 | `go test -tags=business -count=1 ./tests/business/...` |
-| 运行用户领域指定流程 | `go test -tags=business -count=1 ./tests/business/user -run '^TestRegisterAndSetGeneratedAvatar$' -v` |
-
-**这些命令是待实现入口，当前不能作为已可运行的验证步骤。** 默认 `go test ./...` 继续只执行无需真实外部依赖的单元测试。集成测试与业务测试分别执行和报告，不以标签混用隐式启动另一类测试。
-
-失败报告应包含产品用例、失败步骤、请求关联标识、实际值与预期值、相关数据差异、协议模拟服务收到的请求及 SDK Mock 的方法调用记录，并对 Token、密钥和其他敏感值脱敏。清理失败应保留本轮资源标识，便于定向处理，不清理其他运行或宿主机的无关资源。
-
-产品流程或参与接口的契约变化时同步维护业务测试。评审确认流程能单独运行、前置状态最小、真实输出被传递、关键状态有独立断言、失败后状态按契约处理。验证记录应区分已执行场景、未覆盖场景和真实外部联调结果，不以单元测试或集成测试通过替代业务测试结论。
+**日常维护准则**：
+1. 默认 `go test -count=1 ./...` 仅运行无外部依赖的单元测试；集成测试（`-tags=integration`）与业务测试（`-tags=business`）独立执行与报告。
+2. 任何失败报告、步骤轨迹与进程日志摘要均严格对 `access_token`、数据库密码及 JWT 签名密钥脱敏。
+3. 当产品流程或参与接口契约变更时，同步更新对应领域原子积木与业务流程剧本，严禁通过弱化终态断言或跳过步骤使测试假性通过。
